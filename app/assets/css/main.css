@@ -1,0 +1,56 @@
+@import "tailwindcss" theme(static);
+@import "@nuxt/ui";
+
+/*v3 only*/
+/*@tailwind base;*/
+/*@tailwind components;*/
+/*@tailwind utilities;*/
+
+/*noinspection CssInvalidAtRule,CssUnresolvedCustomProperty*/
+@theme static {
+    /*--color-primary-50: var(--ui-color-primary-50);*/
+    /*--color-primary-100: var(--ui-color-primary-100);*/
+    /*--color-primary-200: var(--ui-color-primary-200);*/
+    /*--color-primary-300: var(--ui-color-primary-300);*/
+    /*--color-primary-400: var(--ui-color-primary-400);*/
+    /*--color-primary-500: var(--ui-color-primary-500);*/
+    /*--color-primary: var(--ui-color-primary-500);*/
+    /*--color-primary-600: var(--ui-color-primary-600);*/
+    /*--color-primary-700: var(--ui-color-primary-700);*/
+    /*--color-primary-800: var(--ui-color-primary-800);*/
+    /*--color-primary-900: var(--ui-color-primary-900);*/
+    /*--color-primary-950: var(--ui-color-primary-950);*/
+}
+
+
+html {
+    font-family: 'Roboto, JetBrains Mono', system-ui, sans-serif;
+    /*--background-shop: #ffffff;*/
+    /*--background-shop-opposite: #4f4f4f;*/
+    /*--color1-shop: #ff599c;*/
+    /*--color2-shop: #c776a2;*/
+    /*--color3-shop: #c18bca;*/
+    /*--primary-color: #673AB7;*/
+    /*--pic-bg: #EFEFEFA0;*/
+    /*--card-bg: var(--pic-bg);*/
+}
+
+@media (min-width: 640px) {
+
+}
+
+@media (min-width: 768px) {
+
+}
+
+@media (min-width: 1024px) {
+
+}
+
+@media (min-width: 1280px) {
+
+}
+
+@media (min-width: 1536px) {
+
+}
