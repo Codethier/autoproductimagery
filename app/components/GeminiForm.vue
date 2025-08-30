@@ -62,7 +62,7 @@ const form = reactive({
   model: props.defaultModel ?? ''
 })
 
-const model = computed(() => form.model || useRuntimeConfig().public.GeminiModel)
+const model = computed(() => form.model || useRuntimeConfig().public.GeminiModels.gemini25FlashIOImagePreview)
 const loading = ref(false)
 const error = ref<string | null>(null)
 const result = ref<{ text: string; images: Array<{ mimeType: string; data: string }> } | null>(null)

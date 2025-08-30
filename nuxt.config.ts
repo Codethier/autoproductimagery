@@ -8,7 +8,9 @@ export default defineNuxtConfig({
         GeminiApiKey: '',
         //     public
         public: {
-            GeminiModel: ''
+            GeminiModels: {
+                gemini25FlashIOImagePreview:'gemini-2.5-flash-image-preview'
+            }
         }
     },
     compatibilityDate: '2025-07-15',

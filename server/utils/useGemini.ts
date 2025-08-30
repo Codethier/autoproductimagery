@@ -8,7 +8,7 @@ export function useGemini() {
   if (!apiKey) {
     throw createError({ statusCode: 500, statusMessage: 'Gemini API key is missing in runtimeConfig.GeminiApiKey' })
   }
-  const defaultModel = runtimeConfig.public.GeminiModel || 'models/gemini-2.0-flash-exp'
+  const defaultModel = runtimeConfig.public.GeminiModels.gemini25FlashIOImagePreview || 'models/gemini-2.0-flash-exp'
 
   const ai = new GoogleGenAI({ apiKey })
 

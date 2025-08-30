@@ -14,8 +14,6 @@ export function useGeminiBatch() {
     if (!apiKey) {
         throw createError({statusCode: 500, statusMessage: 'Gemini API key is missing in runtimeConfig.GeminiApiKey'})
     }
-    const defaultModel = runtimeConfig.public.GeminiModel || 'models/gemini-2.0-flash-exp'
-
     function generateParts(generateOptions: GenerateOptions): Part[] {
         let parts = []
         parts.push({
@@ -42,7 +40,8 @@ export function useGeminiBatch() {
 
     function generateGenerateContentRequest(generateOptions: GenerateOptions): GenerateContentRequest {
         // proly need to do the actual batching here
-        return {model: `models/${runtimeConfig.public.GeminiModel}`, contents: [generateContent(generateOptions)]}
+        let model = generateOptions.model || runtimeConfig.public.GeminiModels.gemini25FlashIOImagePreview
+        return {model: `models/${model}`, contents: [generateContent(generateOptions)]}
     }
 
     function generateInputConfig(generateOptions: GenerateOptions,): InputConfig {
@@ -65,7 +64,8 @@ export function useGeminiBatch() {
 
     function generateFetchRequest(generateOptions: GenerateOptions, name: string) {
         let req = generateBatchRequestBody(generateOptions, name)
-        return $fetch(`https://generativelanguage.googleapis.com/v1beta/models/${runtimeConfig.public.GeminiModel}:${'batchGenerateContent'}`, {
+        let model = generateOptions.model || runtimeConfig.public.GeminiModels.gemini25FlashIOImagePreview
+        return $fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:${'batchGenerateContent'}`, {
             method: 'POST',
             body: req,
             headers: {
