@@ -11,10 +11,13 @@
   },
   "dependencies": {
     "@google/genai": "^1.16.0",
+    "@libsql/client": "^0.15.14",
     "@nuxt/image": "^1.11.0",
     "@nuxt/scripts": "^0.11.13",
     "@nuxt/ui": "^3.3.2",
     "@unhead/vue": "^2.0.14",
+    "dotenv": "^17.2.1",
+    "drizzle-orm": "^0.44.5",
     "mime": "^4.0.7",
     "mime-types": "^3.0.1",
     "nuxt": "^4.0.3",
@@ -24,6 +27,7 @@
   },
   "devDependencies": {
     "@types/mime-types": "^3.0.1",
-    "@types/node": "^24.3.0"
+    "@types/node": "^24.3.0",
+    "drizzle-kit": "^0.31.4"
   }
 }
