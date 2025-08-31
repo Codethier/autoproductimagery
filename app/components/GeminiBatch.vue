@@ -1,48 +1,50 @@
-<script setup lang="ts">
-import {useBase64FromFile} from "~/composables/useBase64FromFile";
-import type {GenerateOptions} from "~~/schemas/main.dto";
+<!--Therre is no batch for nano bana yet-->
 
-let runtimeConfig = useRuntimeConfig()
+<!--<script setup lang="ts">-->
+<!--import {useBase64FromFile} from "~/composables/useBase64FromFile";-->
+<!--import type {GenerateOptions} from "~~/schemas/main.dto";-->
 
-const img: Ref<File[]> = ref([])
-const prompt = ref('')
-const model = ref(runtimeConfig.public.GeminiModels.gemini25FlashIOImagePreview)
-const ref1 = ref()
+<!--let runtimeConfig = useRuntimeConfig()-->
 
-let Base64FromFile = useBase64FromFile()
+<!--const img: Ref<File[]> = ref([])-->
+<!--const prompt = ref('')-->
+<!--const model = ref(runtimeConfig.public.GeminiModels.gemini25FlashIOImagePreview)-->
+<!--const ref1 = ref()-->
 
-async function getFile(file: File) {
-  return await useBase64FromFile().fileToBase64Raw(file)
-}
+<!--let Base64FromFile = useBase64FromFile()-->
 
-async function submit() {
-  let images = await Promise.all(img.value.map(getFile))
-  let body: GenerateOptions = {
-    inputImages: images, prompt: prompt.value, responseModalities: ['IMAGE']
-  }
-  let res = await $fetch('/api/gemini-batch', {
-    method: 'POST',
-    body: body
-  })
+<!--async function getFile(file: File) {-->
+<!--  return await useBase64FromFile().fileToBase64Raw(file)-->
+<!--}-->
 
-}
+<!--async function submit() {-->
+<!--  let images = await Promise.all(img.value.map(getFile))-->
+<!--  let body: GenerateOptions = {-->
+<!--    inputImages: images, prompt: prompt.value, responseModalities: ['IMAGE']-->
+<!--  }-->
+<!--  let res = await $fetch('/api/gemini-batch', {-->
+<!--    method: 'POST',-->
+<!--    body: body-->
+<!--  })-->
 
-</script>
+<!--}-->
 
-<template>
-  <div>
-    <h2>Model</h2>
-    <UInput v-model="model"></UInput>
-    <h2>prompt</h2>
-    <UInput v-model="prompt"></UInput>
-    <UFileUpload v-model:model-value="img" multiple class="w-96 min-h-48"/>
-    <div v-if="img.length > 0" class="flex gap-2">
-      <UButton @click="submit">Read</UButton>
-    </div>
+<!--</script>-->
 
-  </div>
-</template>
+<!--<template>-->
+<!--  <div>-->
+<!--    <h2>Model</h2>-->
+<!--    <UInput v-model="model"></UInput>-->
+<!--    <h2>prompt</h2>-->
+<!--    <UInput v-model="prompt"></UInput>-->
+<!--    <UFileUpload v-model:model-value="img" multiple class="w-96 min-h-48"/>-->
+<!--    <div v-if="img.length > 0" class="flex gap-2">-->
+<!--      <UButton @click="submit">Read</UButton>-->
+<!--    </div>-->
 
-<style scoped>
+<!--  </div>-->
+<!--</template>-->
 
-</style>
+<!--<style scoped>-->
+
+<!--</style>-->
