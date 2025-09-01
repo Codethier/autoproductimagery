@@ -6,6 +6,8 @@ export default defineNuxtConfig({
     runtimeConfig: {
         //         private
         GeminiApiKey: '',
+        authUser: '',
+        authPassword: '',
         //     public
         public: {
             GeminiModels: {
