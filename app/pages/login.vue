@@ -27,7 +27,7 @@ async function onSubmit() {
 
     // test credentials
     let req = await useFetch('/api/testCredentials', {})
-    if (!req.data) {
+    if (req.data.value !== true || req.error.value) {
       throw new Error('Invalid credentials')
     }
 
