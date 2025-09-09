@@ -5,8 +5,7 @@ import { useRuntimeConfig } from '#imports'
  * Validates incoming request against credentials stored in env (runtimeConfig).
  *
  * Sources (checked in order):
- * - Cookie named "auth" with value "user:pass" (URL safe base64 also supported)
- * - Authorization header with Basic auth
+ * - Cookie named "auth" with value "user:pass"
  *
  * Throws 401 Unauthorized if validation fails. Returns void on success.
  */
