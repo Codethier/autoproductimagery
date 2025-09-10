@@ -2,6 +2,10 @@
 export default defineNuxtConfig({
     future: {
         compatibilityVersion: 4,
+
+    },
+    experimental: {
+        componentIslands: true
     },
     runtimeConfig: {
         //         private
@@ -11,14 +15,14 @@ export default defineNuxtConfig({
         //     public
         public: {
             GeminiModels: {
-                gemini25FlashIOImagePreview:'gemini-2.5-flash-image-preview'
+                gemini25FlashIOImagePreview: 'gemini-2.5-flash-image-preview'
             }
         }
     },
     compatibilityDate: '2025-07-15',
     devtools: {enabled: true},
-    modules: ['@nuxt/image', '@nuxt/scripts', '@nuxt/ui'],
-        css: [
+    modules: ['@nuxt/image', '@nuxt/scripts', '@nuxt/ui',],
+    css: [
         '~/assets/css/main.css',
         // 'vue-json-pretty/lib/styles.css'
     ],
