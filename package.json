@@ -24,7 +24,7 @@
     "@nuxt/image": "^1.11.0",
     "@nuxt/scripts": "^0.11.13",
     "@nuxt/ui": "^3.3.2",
-    "@prisma/client": "^6.15.0",
+    "@prisma/nuxt": "^0.3.0",
     "@unhead/vue": "^2.0.14",
     "dotenv": "^17.2.1",
     "mime": "^4.0.7",
@@ -37,7 +37,6 @@
   },
   "devDependencies": {
     "@types/mime-types": "^3.0.1",
-    "@types/node": "^24.3.0",
-    "prisma": "^6.15.0"
+    "@types/node": "^24.3.0"
   }
 }

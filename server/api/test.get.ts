@@ -1,7 +1,7 @@
+import prisma from "~~/lib/prisma";
 
 
 export default defineEventHandler(async (event) => {
     let auth= useAuth(event)
-
-    return true
+    return prisma.test.findMany()
 })

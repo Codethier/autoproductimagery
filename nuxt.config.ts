@@ -21,7 +21,7 @@ export default defineNuxtConfig({
     },
     compatibilityDate: '2025-07-15',
     devtools: {enabled: true},
-    modules: ['@nuxt/image', '@nuxt/scripts', '@nuxt/ui',],
+    modules: ['@nuxt/image', '@nuxt/scripts', '@nuxt/ui', '@prisma/nuxt'],
     css: [
         '~/assets/css/main.css',
         // 'vue-json-pretty/lib/styles.css'
