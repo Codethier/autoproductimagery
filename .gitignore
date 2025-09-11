@@ -28,3 +28,5 @@ logs
 /app/generated/prisma
 
 /app/generated/prisma
+/public/images/
+/prisma.db

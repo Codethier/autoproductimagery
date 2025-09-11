@@ -2,9 +2,11 @@
 
 
 let tests = await useFetch('/api/test', {})
+let data = ref()
+let path = ref('/')
 
 async function addTest() {
-  await $fetch('/api/test', {method: 'post',})
+  data.value = await $fetch('/api/test', {method: 'post',body:{path:path.value}})
   await tests.refresh()
 }
 
@@ -15,7 +17,9 @@ async function addTest() {
 <div>
 
   {{tests}}
+  <UInput v-model="path" />
     <UButton nuxt-client @click="addTest">asd</UButton>
+  {{data}}
 </div>
 </template>
 
