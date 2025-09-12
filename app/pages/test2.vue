@@ -20,6 +20,8 @@ async function addTest() {
   <UInput v-model="path" />
     <UButton nuxt-client @click="addTest">asd</UButton>
   {{data}}
+
+  <files></files>
 </div>
 </template>
 
