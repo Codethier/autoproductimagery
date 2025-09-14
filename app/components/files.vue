@@ -58,10 +58,10 @@ let items = await useFetch('/api/files', {
   }
 })
 
-function syncSelectToStore(file: SelectableFile){
+function syncSelectToStore(file: SelectableFile) {
   // Sync selected images
   const imgIdx = dataStore.inputImages.indexOf(file.url)
-  if (file.selectedImage){
+  if (file.selectedImage) {
     if (imgIdx === -1) dataStore.inputImages.push(file.url)
   } else {
     if (imgIdx !== -1) dataStore.inputImages.splice(imgIdx, 1)
@@ -69,7 +69,7 @@ function syncSelectToStore(file: SelectableFile){
 
   // Sync selected models
   const modelIdx = dataStore.models.indexOf(file.url)
-  if (file.selectedModel){
+  if (file.selectedModel) {
     if (modelIdx === -1) dataStore.models.push(file.url)
   } else {
     if (modelIdx !== -1) dataStore.models.splice(modelIdx, 1)
@@ -89,11 +89,25 @@ function syncSelectToStore(file: SelectableFile){
         <UIcon name="material-symbols-create-new-folder" class="size-30"></UIcon>
         {{ dir.name }}
       </div>
-      <div v-for="file of items.data.value?.files" class="text-center text-balance flex flex-col gap-2 justify-center items-center">
+      <div v-for="file of items.data.value?.files"
+           class="text-center text-balance flex flex-col gap-2 justify-center items-center">
         <img :src="file.url">
         <p class="truncate">{{ file.name }}</p>
         <UCheckbox v-model="file.selectedModel" @change="syncSelectToStore(file)"></UCheckbox>
         <UCheckbox v-model="file.selectedImage" @change="syncSelectToStore(file)"></UCheckbox>
+      </div>
+
+    </div>
+    <div>
+      <h1>Models</h1>
+      <div v-for="model in dataStore.models"
+           class="flex justify-center items-center gap-2 flex-col  cursor-pointer hover:text-primary-500">
+        <img :src="model">
+      </div>
+      <h1>Input Images</h1>
+      <div v-for="inputImage in dataStore.inputImages"
+           class="flex justify-center items-center gap-2 flex-col  cursor-pointer hover:text-primary-500">
+        <img :src="inputImage">
       </div>
     </div>
   </div>
