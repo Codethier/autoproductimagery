@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import type {BreadcrumbItem} from "#ui/components/Breadcrumb.vue";
 import {useDataStore} from "~/stores/data.store";
+import type {SelectableFile} from "~~/schemas/main.dto";
 
 const route = useRoute()
 const router = useRouter()
@@ -57,6 +58,24 @@ let items = await useFetch('/api/files', {
   }
 })
 
+function syncSelectToStore(file: SelectableFile){
+  // Sync selected images
+  const imgIdx = dataStore.inputImages.indexOf(file.url)
+  if (file.selectedImage){
+    if (imgIdx === -1) dataStore.inputImages.push(file.url)
+  } else {
+    if (imgIdx !== -1) dataStore.inputImages.splice(imgIdx, 1)
+  }
+
+  // Sync selected models
+  const modelIdx = dataStore.models.indexOf(file.url)
+  if (file.selectedModel){
+    if (modelIdx === -1) dataStore.models.push(file.url)
+  } else {
+    if (modelIdx !== -1) dataStore.models.splice(modelIdx, 1)
+  }
+}
+
 </script>
 
 <template>
@@ -70,9 +89,11 @@ let items = await useFetch('/api/files', {
         <UIcon name="material-symbols-create-new-folder" class="size-30"></UIcon>
         {{ dir.name }}
       </div>
-      <div v-for="file of items.data.value?.files" class="text-center text-balance">
+      <div v-for="file of items.data.value?.files" class="text-center text-balance flex flex-col gap-2 justify-center items-center">
         <img :src="file.url">
         <p class="truncate">{{ file.name }}</p>
+        <UCheckbox v-model="file.selectedModel" @change="syncSelectToStore(file)"></UCheckbox>
+        <UCheckbox v-model="file.selectedImage" @change="syncSelectToStore(file)"></UCheckbox>
       </div>
     </div>
   </div>
