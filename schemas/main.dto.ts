@@ -22,3 +22,7 @@ export type SelectableFile = {
     selectedModel: boolean
     selectedImage: boolean
 }
+
+export type  typeFileUploadDTO = {
+    files: Array<File>
+}

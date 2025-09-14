@@ -2,10 +2,13 @@
 import type {BreadcrumbItem} from "#ui/components/Breadcrumb.vue";
 import {useDataStore} from "~/stores/data.store";
 import type {SelectableFile} from "~~/schemas/main.dto";
+import type {FormSubmitEvent} from "#ui/types";
 
 const route = useRoute()
 const router = useRouter()
 let dataStore = useDataStore()
+
+let images: Ref<File[]> = ref([])
 
 let currentQuery = router.currentRoute.value.query.path
 let path = ref('')
@@ -76,10 +79,36 @@ function syncSelectToStore(file: SelectableFile) {
   }
 }
 
+let formSubmitBody = computed(() => {
+  let files: FormData = new FormData()
+  for (const file of images.value) {
+    files.append('files', file)
+  }
+  return files
+})
+
+async function formSubmit() {
+  let sumBytes = 0
+  for (const file of images.value) {
+    sumBytes += file.size
+  }
+  let response = await useFetch('/api/files', {method: 'POST', body: formSubmitBody})
+  if (response.error.value) {
+    console.error(response.error.value)
+  }
+  console.log(response.data.value)
+}
+
 </script>
 
 <template>
   <div>
+    <div>
+          <UFileUpload v-model="images" label="Drop your image here" accept="image/*" multiple class="w-96 min-h-48"
+                       description="WEBP, PNG, JPG" icon="i-lucide-image"/>
+        <UButton :disabled="images.length === 0" @click="formSubmit" type="submit" label="Submit"/>
+
+    </div>
     <div
         class=" grid grid-cols-4 justify-items-center justify-center  gap-2 m-12 border-2 border-dashed border-gray-300 rounded-lg p-12">
       <UBreadcrumb :items="bradCrumbItems" class="col-span-4"/>

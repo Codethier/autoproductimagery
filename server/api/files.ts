@@ -1,17 +1,26 @@
-import type {SelectableFile} from "~~/schemas/main.dto";
+import type {SelectableFile, typeFileUploadDTO} from "~~/schemas/main.dto";
 
 
 export default defineEventHandler(async (event) => {
+    useAuth(event)
+    let fs = await useFS()
     if (event.method === 'GET') {
         let queries = getQuery(event)
-        useAuth(event)
-        let fs = await useFS()
         let path = String(queries.path ?? '/')
         let directory = await fs.readDir(path)
         let selectableFiles = fs.parseFileDirEntToSelectableFile(directory.files)
-        return {dirs:directory.dirs,files:selectableFiles}
+        return {dirs: directory.dirs, files: selectableFiles}
     }
     if (event.method === 'POST') {
+        let formData = await readMultipartFormData(event)
+        if (!formData) {
+            return false
+        }
+        let files = []
+        for (let part of formData) {
+            console.log(part)
+        }
+        return true
 
     }
 });
