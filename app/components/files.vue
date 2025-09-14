@@ -80,11 +80,12 @@ function syncSelectToStore(file: SelectableFile) {
 }
 
 let formSubmitBody = computed(() => {
-  let files: FormData = new FormData()
+  let form: FormData = new FormData()
   for (const file of images.value) {
-    files.append('files', file)
+    form.append('files', file)
   }
-  return files
+  form.append('path', path.value)
+  return form
 })
 
 async function formSubmit() {

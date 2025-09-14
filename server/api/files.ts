@@ -17,8 +17,10 @@ export default defineEventHandler(async (event) => {
             return false
         }
         let files = []
-        for (let part of formData) {
-            console.log(part)
+        let path = formData.filter((part)=> part.name === 'path')[0].data.toString('utf-8')
+        let filesForm = formData.filter((part)=> part.name === 'files')
+        for (let file of filesForm) {
+
         }
         return true
 
