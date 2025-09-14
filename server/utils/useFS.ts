@@ -1,11 +1,13 @@
 import {promises as fs} from "fs";
+import type {Dirent} from "node:fs";
+import type {SelectableFile} from "~~/schemas/main.dto";
 
 export async function useFS() {
 
     let basePath = './public/images'
 
     function getRelativePath(path: string) {
-        path = path.replaceAll('..','')
+        path = path.replaceAll('..', '')
         if (path.startsWith('/')) {
             return basePath + path
         }
@@ -14,24 +16,37 @@ export async function useFS() {
 
     async function listDirs(path: string) {
         path = getRelativePath(path)
-        let dirs = await fs.readdir(path,{withFileTypes:true})
+        let dirs = await fs.readdir(path, {withFileTypes: true})
         return dirs.filter(dirent => dirent.isDirectory())
 
     }
 
     async function listFiles(path: string) {
         path = getRelativePath(path)
-        let files = await fs.readdir(path,{withFileTypes:true})
+        let files = await fs.readdir(path, {withFileTypes: true})
         return files.filter(dirent => dirent.isFile())
     }
 
-    async function readDir(path:string){
+    async function readDir(path: string) {
         path = getRelativePath(path)
-        let dirents = await fs.readdir(path,{withFileTypes:true})
-        let files  = dirents.filter(dirent => dirent.isFile())
+        let dirents = await fs.readdir(path, {withFileTypes: true})
+        let files = dirents.filter(dirent => dirent.isFile())
         let dirs = dirents.filter(dirent => dirent.isDirectory())
-        return {files,dirs}
+        return {files, dirs}
     }
 
-    return {listDirs, listFiles,readDir}
+    function parseFileDirEntToSelectableFile(dirents: Dirent[]){
+        let l: SelectableFile[] = []
+        for (let i of dirents) {
+            let o: SelectableFile = {parentPath: i.parentPath,name:i.name,selectedModel:false,selectedImage:false,url:parentPathToUrl(i.parentPath,i.name)}
+            l.push(o)
+        }
+        return l
+    }
+
+    function parentPathToUrl(parentPath: string, name: string) {
+        return `${parentPath.replace('./public', '')}/${name}`
+    }
+
+    return {listDirs, listFiles, readDir,parentPathToUrl,parseFileDirEntToSelectableFile}
 }

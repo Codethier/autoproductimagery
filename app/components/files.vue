@@ -1,8 +1,10 @@
 <script setup lang="ts">
 import type {BreadcrumbItem} from "#ui/components/Breadcrumb.vue";
+import {useDataStore} from "~/stores/data.store";
 
 const route = useRoute()
 const router = useRouter()
+let dataStore = useDataStore()
 
 let currentQuery = router.currentRoute.value.query.path
 let path = ref('')
@@ -47,24 +49,30 @@ async function enterFolder(folder: string) {
   path.value = path.value + '/' + folder
 }
 
-let items = await useFetch('/api/files', {deep: true, query: {path}, key: () => `files:${path.value}`})
+let items = await useFetch('/api/files', {
+  deep: true, query: {path}, key: () => `files:${path.value}`, transform: (input) => {
 
+
+    return input
+  }
+})
 
 </script>
 
 <template>
   <div>
-    <div class=" grid grid-cols-9 justify-items-center justify-center  gap-2 m-12 border-2 border-dashed border-gray-300 rounded-lg p-12">
-      <UBreadcrumb :items="bradCrumbItems" class="col-span-9"/>
+    <div
+        class=" grid grid-cols-4 justify-items-center justify-center  gap-2 m-12 border-2 border-dashed border-gray-300 rounded-lg p-12">
+      <UBreadcrumb :items="bradCrumbItems" class="col-span-4"/>
       <div v-for="dir of items.data.value?.dirs"
-           class="flex items-center gap-2 flex-col  cursor-pointer hover:text-primary-500"
+           class="flex justify-center items-center gap-2 flex-col  cursor-pointer hover:text-primary-500"
            @click="enterFolder(dir.name)">
         <UIcon name="material-symbols-create-new-folder" class="size-30"></UIcon>
         {{ dir.name }}
       </div>
-      <div v-for="file of items.data.value?.files" class="cursor-pointer flex items-center gap-2 flex-col">
-        <img :src="`${file.parentPath.replace('./public','')}/${file.name}`">
-        <p>{{ file.name }}</p>
+      <div v-for="file of items.data.value?.files" class="text-center text-balance">
+        <img :src="file.url">
+        <p class="truncate">{{ file.name }}</p>
       </div>
     </div>
   </div>

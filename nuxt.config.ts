@@ -7,6 +7,7 @@ export default defineNuxtConfig({
     experimental: {
         componentIslands: true
     },
+    // debug: true,
     runtimeConfig: {
         //         private
         GeminiApiKey: '',
@@ -26,7 +27,7 @@ export default defineNuxtConfig({
             enabled: true,
         },
     },
-    modules: ['@nuxt/image', '@nuxt/scripts', '@nuxt/ui', '@prisma/nuxt'],
+    modules: ['@nuxt/image', '@nuxt/scripts', '@nuxt/ui', '@prisma/nuxt', '@pinia/nuxt'],
     css: [
         '~/assets/css/main.css',
         // 'vue-json-pretty/lib/styles.css'

@@ -37,6 +37,7 @@
     "yup": "^1.7.0"
   },
   "devDependencies": {
+    "@pinia/nuxt": "^0.11.2",
     "@types/mime-types": "^3.0.1",
     "@types/node": "^24.3.0"
   }
