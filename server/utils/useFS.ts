@@ -1,6 +1,7 @@
 import {promises as fs} from "fs";
-import type {Dirent} from "node:fs";
+import {createWriteStream, type Dirent} from "node:fs";
 import type {SelectableFile} from "~~/schemas/main.dto";
+import {MultiPartData} from 'h3'
 
 export async function useFS() {
 
@@ -35,18 +36,41 @@ export async function useFS() {
         return {files, dirs}
     }
 
-    function parseFileDirEntToSelectableFile(dirents: Dirent[]){
+    function parseFileDirEntToSelectableFile(dirents: Dirent[]) {
         let l: SelectableFile[] = []
         for (let i of dirents) {
-            let o: SelectableFile = {parentPath: i.parentPath,name:i.name,selectedModel:false,selectedImage:false,url:parentPathToUrl(i.parentPath,i.name)}
+            let o: SelectableFile = {
+                parentPath: i.parentPath,
+                name: i.name,
+                selectedModel: false,
+                selectedImage: false,
+                url: parentPathToUrl(i.parentPath, i.name)
+            }
             l.push(o)
         }
         return l
+    }
+
+    function createFolder(path: string, folderName: string) {
+        path = getRelativePath(path)
+        fs.mkdir(path + '/' + folderName)
+    }
+
+    async function saveFile(path: string, file: MultiPartData) {
+        path = getRelativePath(path)
+        let savedFile = await fs.writeFile(path + '/' + file.filename, file.data,)
+        return savedFile
+    }
+
+    async function deleteFileOrFolder(path: string) {
+        path = getRelativePath(path)
+        await fs.rm(path, {recursive: true})
+        return true
     }
 
     function parentPathToUrl(parentPath: string, name: string) {
         return `${parentPath.replace('./public', '')}/${name}`
     }
 
-    return {listDirs, listFiles, readDir,parentPathToUrl,parseFileDirEntToSelectableFile}
+    return {listDirs, listFiles, readDir, parentPathToUrl, parseFileDirEntToSelectableFile, createFolder, saveFile, deleteFileOrFolder}
 }

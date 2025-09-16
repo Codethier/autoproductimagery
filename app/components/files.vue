@@ -55,8 +55,6 @@ async function enterFolder(folder: string) {
 
 let items = await useFetch('/api/files', {
   deep: true, query: {path}, key: () => `files:${path.value}`, transform: (input) => {
-
-
     return input
   }
 })
@@ -88,36 +86,65 @@ let formSubmitBody = computed(() => {
   return form
 })
 
-async function formSubmit() {
+async function fileFormSubmit() {
   let sumBytes = 0
   for (const file of images.value) {
     sumBytes += file.size
   }
-  let response = await useFetch('/api/files', {method: 'POST', body: formSubmitBody})
+  let response = await useFetch('/api/upload', {method: 'POST', body: formSubmitBody})
   if (response.error.value) {
     console.error(response.error.value)
   }
   console.log(response.data.value)
+  await items.refresh()
 }
 
+let newFolderName = ref('')
+
+async function createFolder() {
+  console.log('call')
+  let response = await useFetch('/api/createFolder', {method: 'POST', body: {path: path.value, name: newFolderName.value }})
+  await items.refresh()
+  newFolderName.value = ''
+  return true
+}
+
+async function deleteFileOrFolder(filename:string) {
+  let pathToSubmit = String(path.value)
+  pathToSubmit = pathToSubmit + '/' + filename
+  let response = await useFetch('/api/deleteFileOrFolder', {method: 'DELETE', body: {path: pathToSubmit}, key: `/deleteFile${pathToSubmit}`})
+  await items.refresh()
+  return true
+}
 </script>
 
 <template>
   <div>
-    <div>
-          <UFileUpload v-model="images" label="Drop your image here" accept="image/*" multiple class="w-96 min-h-48"
-                       description="WEBP, PNG, JPG" icon="i-lucide-image"/>
-        <UButton :disabled="images.length === 0" @click="formSubmit" type="submit" label="Submit"/>
 
-    </div>
     <div
         class=" grid grid-cols-4 justify-items-center justify-center  gap-2 m-12 border-2 border-dashed border-gray-300 rounded-lg p-12">
       <UBreadcrumb :items="bradCrumbItems" class="col-span-4"/>
+      <div class="col-span-4 flex flex-col gap-2">
+        <UFileUpload v-model="images" label="Drop your image here" accept="image/*" multiple class="w-96 min-h-48"
+                     description="WEBP, PNG, JPG" icon="i-lucide-image"/>
+        <UButton :disabled="images.length === 0" @click="fileFormSubmit" type="submit" label="Upload"/>
+        <UPopover>
+          <UButton label="Create New Folder" color="neutral" variant="subtle"/>
+
+          <template #content>
+            <div class="inline-flex m-4 gap-2">
+              <UInput v-model="newFolderName" placeholder="Folder Name" class="w-full"/>
+              <UButton @click="createFolder()" label="Save"/>
+            </div>
+          </template>
+        </UPopover>
+
+      </div>
       <div v-for="dir of items.data.value?.dirs"
-           class="flex justify-center items-center gap-2 flex-col  cursor-pointer hover:text-primary-500"
-           @click="enterFolder(dir.name)">
-        <UIcon name="material-symbols-create-new-folder" class="size-30"></UIcon>
+           class="flex justify-center items-center gap-2 flex-col  cursor-pointer hover:text-primary-500">
+        <UIcon @click="enterFolder(dir.name)" name="material-symbols-create-new-folder" class="size-30"></UIcon>
         {{ dir.name }}
+        <UIcon name="i-heroicons-trash" class="size-6 text-red-500 cursor-pointer" @click="deleteFileOrFolder(dir.name)"></UIcon>
       </div>
       <div v-for="file of items.data.value?.files"
            class="text-center text-balance flex flex-col gap-2 justify-center items-center">
@@ -125,6 +152,7 @@ async function formSubmit() {
         <p class="truncate">{{ file.name }}</p>
         <UCheckbox v-model="file.selectedModel" @change="syncSelectToStore(file)"></UCheckbox>
         <UCheckbox v-model="file.selectedImage" @change="syncSelectToStore(file)"></UCheckbox>
+        <UIcon name="i-heroicons-trash" class="size-6 text-red-500 cursor-pointer" @click="deleteFileOrFolder(file.name)"></UIcon>
       </div>
 
     </div>
