@@ -4,11 +4,17 @@ import {useDataStore} from "~/stores/data.store";
 import type {SelectableFile} from "~~/schemas/main.dto";
 import type {FormSubmitEvent} from "#ui/types";
 
+const props = defineProps<{
+  isModelSelect?: boolean
+  isImageSelect?: boolean
+}>()
+
 const route = useRoute()
 const router = useRouter()
 let dataStore = useDataStore()
 
 let images: Ref<File[]> = ref([])
+
 
 let currentQuery = router.currentRoute.value.query.path
 let path = ref('')
@@ -103,16 +109,23 @@ let newFolderName = ref('')
 
 async function createFolder() {
   console.log('call')
-  let response = await useFetch('/api/createFolder', {method: 'POST', body: {path: path.value, name: newFolderName.value }})
+  let response = await useFetch('/api/createFolder', {
+    method: 'POST',
+    body: {path: path.value, name: newFolderName.value}
+  })
   await items.refresh()
   newFolderName.value = ''
   return true
 }
 
-async function deleteFileOrFolder(filename:string) {
+async function deleteFileOrFolder(filename: string) {
   let pathToSubmit = String(path.value)
   pathToSubmit = pathToSubmit + '/' + filename
-  let response = await useFetch('/api/deleteFileOrFolder', {method: 'DELETE', body: {path: pathToSubmit}, key: `/deleteFile${pathToSubmit}`})
+  let response = await useFetch('/api/deleteFileOrFolder', {
+    method: 'DELETE',
+    body: {path: pathToSubmit},
+    key: `/deleteFile${pathToSubmit}`
+  })
   await items.refresh()
   return true
 }
@@ -141,31 +154,39 @@ async function deleteFileOrFolder(filename:string) {
 
       </div>
       <div v-for="dir of items.data.value?.dirs"
-           class="flex justify-center items-center gap-2 flex-col  cursor-pointer hover:text-primary-500">
-        <UIcon @click="enterFolder(dir.name)" name="material-symbols-create-new-folder" class="size-30"></UIcon>
-        {{ dir.name }}
-        <UIcon name="i-heroicons-trash" class="size-6 text-red-500 cursor-pointer" @click="deleteFileOrFolder(dir.name)"></UIcon>
+           class="flex justify-center items-center gap-2 flex-col  cursor-pointer hover:text-primary-500 w-full h-full">
+        <UIcon @click="enterFolder(dir.name)" name="material-symbols-create-new-folder" class="size-16"></UIcon>
+        <p class="w-full truncate text-center">{{ dir.name }}</p>
+        <UIcon name="i-heroicons-trash" class="size-6 text-red-500 cursor-pointer"
+               @click="deleteFileOrFolder(dir.name)"></UIcon>
       </div>
       <div v-for="file of items.data.value?.files"
-           class="text-center text-balance flex flex-col gap-2 justify-center items-center">
-        <img :src="file.url">
-        <p class="truncate">{{ file.name }}</p>
-        <UCheckbox v-model="file.selectedModel" @change="syncSelectToStore(file)"></UCheckbox>
-        <UCheckbox v-model="file.selectedImage" @change="syncSelectToStore(file)"></UCheckbox>
-        <UIcon name="i-heroicons-trash" class="size-6 text-red-500 cursor-pointer" @click="deleteFileOrFolder(file.name)"></UIcon>
+           class="text-center text-balance flex flex-col gap-2 justify-center items-center w-full h-full">
+        <img :src="file.url" class="w-full object-contain">
+        <p class="w-full truncate text-center">{{ file.name }}</p>
+        <UCheckbox v-if="props.isModelSelect" v-model="file.selectedModel"
+                   @change="syncSelectToStore(file)"></UCheckbox>
+        <UCheckbox v-if="props.isImageSelect" v-model="file.selectedImage"
+                   @change="syncSelectToStore(file)"></UCheckbox>
+        <UIcon name="i-heroicons-trash" class="size-6 text-red-500 cursor-pointer"
+               @click="deleteFileOrFolder(file.name)"></UIcon>
       </div>
 
     </div>
     <div>
-      <h1>Models</h1>
-      <div v-for="model in dataStore.models"
-           class="flex justify-center items-center gap-2 flex-col  cursor-pointer hover:text-primary-500">
-        <img :src="model">
+      <div v-if="props.isModelSelect">
+        <h1>Models</h1>
+        <div v-for="model in dataStore.models"
+             class="flex justify-center items-center gap-2 flex-col  cursor-pointer hover:text-primary-500">
+          <img :src="model">
+        </div>
       </div>
-      <h1>Input Images</h1>
-      <div v-for="inputImage in dataStore.inputImages"
-           class="flex justify-center items-center gap-2 flex-col  cursor-pointer hover:text-primary-500">
-        <img :src="inputImage">
+      <div v-if="props.isImageSelect">
+        <h1>Input Images</h1>
+        <div v-for="inputImage in dataStore.inputImages"
+             class="flex justify-center items-center gap-2 flex-col  cursor-pointer hover:text-primary-500">
+          <img :src="inputImage">
+        </div>
       </div>
     </div>
   </div>
