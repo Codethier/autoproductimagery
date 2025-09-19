@@ -11,11 +11,12 @@ datasource db {
 }
 
 model systemPrompt {
-  id           Int        @id @default(autoincrement())
-  textPrompt String
+  id           Int      @id @default(autoincrement())
+  TextPrompt   String
   serverImages Json
+  modelImages  Json
   // an a array of urls, if deleted it is replaced with "deleted" in the array, should render some broken icon
   outputImage  String
-  createdAt    DateTime   @default(now())
-  updatedAt    DateTime   @updatedAt
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
 }
