@@ -61,6 +61,10 @@ async function enterFolder(folder: string) {
 
 let items = await useFetch('/api/files', {
   deep: true, query: {path}, key: () => `files:${path.value}`, transform: (input) => {
+    input!.files.forEach((file) => {
+      file.selectedImage = dataStore.inputImages.includes(file.url)
+      file.selectedModel = dataStore.models.includes(file.url)
+    })
     return input
   }
 })
