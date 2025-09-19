@@ -177,22 +177,22 @@ async function deleteFileOrFolder(filename: string) {
       </div>
 
     </div>
-    <div>
-      <div v-if="props.isModelSelect">
-        <h1>Models</h1>
-        <div v-for="model in dataStore.models"
-             class="flex justify-center items-center gap-2 flex-col  cursor-pointer hover:text-primary-500">
-          <img :src="model">
-        </div>
-      </div>
-      <div v-if="props.isImageSelect">
-        <h1>Input Images</h1>
-        <div v-for="inputImage in dataStore.inputImages"
-             class="flex justify-center items-center gap-2 flex-col  cursor-pointer hover:text-primary-500">
-          <img :src="inputImage">
-        </div>
-      </div>
-    </div>
+<!--    <div>-->
+<!--      <div v-if="props.isModelSelect">-->
+<!--        <h1>Models</h1>-->
+<!--        <div v-for="model in dataStore.models"-->
+<!--             class="flex justify-center items-center gap-2 flex-col  cursor-pointer hover:text-primary-500">-->
+<!--          <img :src="model">-->
+<!--        </div>-->
+<!--      </div>-->
+<!--      <div v-if="props.isImageSelect">-->
+<!--        <h1>Input Images</h1>-->
+<!--        <div v-for="inputImage in dataStore.inputImages"-->
+<!--             class="flex justify-center items-center gap-2 flex-col  cursor-pointer hover:text-primary-500">-->
+<!--          <img :src="inputImage">-->
+<!--        </div>-->
+<!--      </div>-->
+<!--    </div>-->
   </div>
 </template>
 

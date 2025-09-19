@@ -1,4 +1,4 @@
-import prisma from "~~/lib/prisma";
+import prisma from "~~/server/utils/lib/prisma";
 import type {GenerateOptions} from "~~/schemas/main.dto";
 
 export async function useDB() {
@@ -18,5 +18,15 @@ export async function useDB() {
         return created
     }
 
-    return {createSystemPrompt}
+    async function getSystemPrompts(opts?: { take?: number; skip?: number }) {
+        const { take = 50, skip = 0 } = opts || {}
+        const rows = await prisma.systemPrompt.findMany({
+            orderBy: { createdAt: 'desc' },
+            take,
+            skip,
+        })
+        return rows
+    }
+
+    return {createSystemPrompt, getSystemPrompts}
 }
