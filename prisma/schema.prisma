@@ -12,26 +12,10 @@ datasource db {
 
 model systemPrompt {
   id           Int        @id @default(autoincrement())
-  textPromptID Int
-  textPrompt   textPrompt @relation(fields: [textPromptID], references: [id])
+  textPrompt String
   serverImages Json
-  // an a rray of urls, if deleted it is replaced with "deleted" in the array, should render some broken icon
+  // an a array of urls, if deleted it is replaced with "deleted" in the array, should render some broken icon
   outputImage  String
   createdAt    DateTime   @default(now())
   updatedAt    DateTime   @updatedAt
-}
-
-model textPrompt {
-  id            Int            @id @default(autoincrement())
-  text          String
-  systemPrompts systemPrompt[]
-  createdAt     DateTime       @default(now())
-  updatedAt     DateTime       @updatedAt
-}
-
-model Test {
-  id        Int      @id @default(autoincrement())
-  name      String
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
 }
