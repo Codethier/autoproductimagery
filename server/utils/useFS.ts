@@ -72,5 +72,22 @@ export async function useFS() {
         return `${parentPath.replace('./public', '')}/${name}`
     }
 
-    return {listDirs, listFiles, readDir, parentPathToUrl, parseFileDirEntToSelectableFile, createFolder, saveFile, deleteFileOrFolder}
+    async function getFile(path:string){
+        // image arrays have image in the already
+        path = './public'+ path
+        return await fs.readFile(path)
+    }
+
+    return {
+        listDirs,
+        listFiles,
+        readDir,
+        parentPathToUrl,
+        parseFileDirEntToSelectableFile,
+        createFolder,
+        saveFile,
+        deleteFileOrFolder,
+        rootFS: fs,
+        getFile
+    }
 }

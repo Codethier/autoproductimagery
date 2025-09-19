@@ -4,7 +4,8 @@ export type GenerateOptions = {
     prompt: string
     model?: string
     responseModalities?: Array<'IMAGE' | 'TEXT'>
-    inputImages?: Array<inputImages>
+    inputImages: Array<string>
+    modelImages?: Array<string>
 }
 
 export type inputImages = { mimeType: string; dataBase64: string }
