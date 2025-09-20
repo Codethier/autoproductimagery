@@ -28,3 +28,4 @@ logs
 /prisma.db
 /drizzle.db
 /data/
+/drizzle/sqlite/drizzle.db
