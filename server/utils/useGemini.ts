@@ -1,6 +1,6 @@
 import { GoogleGenAI } from '@google/genai'
 import * as mainSchema from '../../schemas/main.dto'
-
+import mime from 'mime'
 
 export async function useGemini() {
   const runtimeConfig = useRuntimeConfig()
@@ -13,27 +13,10 @@ export async function useGemini() {
   const ai = new GoogleGenAI({ apiKey })
   const fs = await useFS()
 
-  function guessMimeType(path: string): string {
-    const ext = (path.split('.').pop() || '').toLowerCase()
-    switch (ext) {
-      case 'png': return 'image/png'
-      case 'jpg':
-      case 'jpeg': return 'image/jpeg'
-      case 'webp': return 'image/webp'
-      case 'gif': return 'image/gif'
-      case 'svg':
-      case 'svgz': return 'image/svg+xml'
-      case 'bmp': return 'image/bmp'
-      case 'tif':
-      case 'tiff': return 'image/tiff'
-      default: return 'application/octet-stream'
-    }
-  }
-
   async function generateStream(opts: mainSchema.GenerateOptions) {
     const model = opts.model || defaultModel
     const config = {
-      responseModalities: opts.responseModalities || ['IMAGE', 'TEXT'],
+      responseModalities: ['IMAGE', 'TEXT'],
     } as any
 
     const userPromptPart = { text: opts.prompt }
@@ -47,7 +30,7 @@ export async function useGemini() {
       const fileBuf = await fs.getFile(i)
       const inlineData = {
         inlineData: {
-          mimeType: guessMimeType(i),
+          mimeType: mime.getType(i) || 'application/octet-stream',
           data: Buffer.from(fileBuf).toString('base64'),
         },
       }
@@ -63,7 +46,7 @@ export async function useGemini() {
 
     // Use non-streaming response since we only care about images and will
     // return the first image buffer directly.
-    const response = await (ai as any).models.generateContent({ model, config, contents })
+    const response = await ai.models.generateContent({ model, config, contents })
 
     // Try to extract the first inlineData part (image) and return it as a Buffer
     const parts = response?.candidates?.[0]?.content?.parts as any[] | undefined
@@ -88,7 +71,7 @@ export async function useGemini() {
       throw createError({ statusCode: 500, statusMessage: `Expected image output but got text: ${text.slice(0, 200)}` })
     }
 
-    throw createError({ statusCode: 500, statusMessage: 'No image returned from Gemini' })
+    throw createError({ statusCode: 500, statusMessage: 'No image returned from Gemini'  + response.promptFeedback?.blockReason })
   }
 
   return { generateStream }
