@@ -114,7 +114,7 @@ function onKeydown(e: KeyboardEvent) {
     @keydown="onKeydown"
   >
     <!-- Actual image behaves like a normal <img> via $attrs forwarding -->
-    <img :src="actualSrc" :alt="alt" v-bind="$attrs" />
+    <img loading="lazy" :src="actualSrc" :alt="alt" v-bind="$attrs" />
 
     <!-- Hover overlay with transparent black gradient and download icon -->
     <span v-if="showHoverIcon"
