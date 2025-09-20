@@ -27,7 +27,7 @@ export default defineNuxtConfig({
             enabled: true,
         },
     },
-    modules: ['@nuxt/image', '@nuxt/scripts', '@nuxt/ui', '@prisma/nuxt', '@pinia/nuxt'],
+    modules: ['@nuxt/image', '@nuxt/scripts', '@nuxt/ui', '@pinia/nuxt'],
     css: [
         '~/assets/css/main.css',
         // 'vue-json-pretty/lib/styles.css'

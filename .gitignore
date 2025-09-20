@@ -26,3 +26,4 @@ logs
 /app/generated/prisma
 /public/images/
 /prisma.db
+/drizzle.db

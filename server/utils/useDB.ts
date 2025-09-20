@@ -1,30 +1,34 @@
-import prisma from "~~/server/utils/lib/prisma";
-import type {GenerateOptions} from "~~/schemas/main.dto";
+import { db } from "~~/server/utils/lib/db";
+import { systemPrompt } from "~~/server/db/schema";
+import { desc, eq } from "drizzle-orm";
+import type { GenerateOptions } from "~~/schemas/main.dto";
 
 export async function useDB() {
     async function createSystemPrompt(data: GenerateOptions, outputImage: string){
         const modelImages = Array.isArray(data.modelImages) ? data.modelImages : []
         const serverImages = Array.isArray(data.inputImages) ? data.inputImages : []
 
-        const created = await prisma.systemPrompt.create({
-            data: {
-                TextPrompt: data.prompt,
-                serverImages: serverImages as any,
-                modelImages: modelImages as any,
-                outputImage: outputImage,
-            }
-        })
+        const result = await db.insert(systemPrompt).values({
+            TextPrompt: data.prompt,
+            serverImages: serverImages as any,
+            modelImages: modelImages as any,
+            outputImage: outputImage,
+            // createdAt and updatedAt will default in DB
+        }).run();
 
-        return created
+        const id = Number((result as any)?.lastInsertRowid ?? 0);
+        if (id) {
+            const [row] = await db.select().from(systemPrompt).where(eq(systemPrompt.id, id));
+            return row;
+        }
+        // fallback: return last row
+        const [row] = await db.select().from(systemPrompt).orderBy(desc(systemPrompt.id)).limit(1);
+        return row;
     }
 
-    async function getSystemPrompts(opts?: { take?: number; skip?: number }) {
-        const { take = 50, skip = 0 } = opts || {}
-        const rows = await prisma.systemPrompt.findMany({
-            orderBy: { createdAt: 'desc' },
-            take,
-            skip,
-        })
+    async function getSystemPrompts() {
+        const rows = await db.select().from(systemPrompt)
+            .orderBy(desc(systemPrompt.createdAt))
         return rows
     }
 

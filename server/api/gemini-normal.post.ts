@@ -1,6 +1,5 @@
 import type {GenerateOptions} from "~~/schemas/main.dto";
 import {useDB} from "~~/server/utils/useDB";
-import type { systemPrompt } from "@prisma/client";
 
 export default defineEventHandler(async (event) => {
     useAuth(event)
@@ -16,7 +15,7 @@ export default defineEventHandler(async (event) => {
     }
 
     // Ensure output directory exists under public so the file is web-accessible
-    const outDir = './public/output'
+    const outDir = './public/images/output'
     const fs = await import('node:fs/promises')
     await fs.mkdir(outDir, {recursive: true})
 
@@ -42,7 +41,7 @@ export default defineEventHandler(async (event) => {
     }
 
 
-    let objects: systemPrompt[] = []
+    let objects = []
     for (let stream of streams) {
         let savedUrl: string = ''
         for await (const chunk of stream) {
@@ -52,7 +51,7 @@ export default defineEventHandler(async (event) => {
                 const fullPath = `${outDir}/${fname}`
                 await fs.writeFile(fullPath, chunk.data)
                 // Public URL relative to site root
-                savedUrl = `/output/${fname}`
+                savedUrl = `/images/output/${fname}`
                 break
             }
         }

@@ -8,25 +8,19 @@
     "generate": "nuxt generate",
     "preview": "nuxt preview",
     "postinstall": "nuxt prepare",
-    "prisma:generate": "prisma generate",
-    "migrate:dev": "prisma migrate dev",
-    "migrate:create": "prisma migrate dev --create-only",
-    "migrate:deploy": "prisma migrate deploy",
-    "migrate:reset": "prisma migrate reset --force",
-    "db:push": "prisma db push",
-    "prisma:format": "prisma format",
-    "prisma:validate": "prisma validate",
-    "studio": "prisma studio"
+    "drizzle:generate": "drizzle-kit generate",
+    "drizzle:push": "drizzle-kit push",
+    "drizzle:studio": "drizzle-kit studio"
   },
   "dependencies": {
     "@google/genai": "^1.16.0",
-    "@libsql/client": "^0.15.14",
+    "@libsql/client": "^0.15.15",
     "@nuxt/image": "^1.11.0",
     "@nuxt/scripts": "^0.11.13",
     "@nuxt/ui": "^3.3.2",
-    "@prisma/nuxt": "^0.3.0",
     "@unhead/vue": "^2.0.14",
     "dotenv": "^17.2.1",
+    "drizzle-orm": "^0.44.5",
     "mime": "^4.0.7",
     "mime-types": "^3.0.1",
     "nuxt": "^4.0.3",
@@ -39,6 +33,7 @@
   "devDependencies": {
     "@pinia/nuxt": "^0.11.2",
     "@types/mime-types": "^3.0.1",
-    "@types/node": "^24.3.0"
+    "@types/node": "^24.3.0",
+    "drizzle-kit": "^0.31.4"
   }
 }
