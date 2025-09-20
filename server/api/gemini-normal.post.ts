@@ -11,8 +11,15 @@ export default defineEventHandler(async (event) => {
     const results = await Promise.all(
         body.inputImages.map(async (i) => {
             const geminiJob: GenerateOptions = { ...body, inputImages: [i] }
-            const result = await gemini.generateStream(geminiJob)
-            return { result, inputImage: i }
+            try {
+                const result = await gemini.generateStream(geminiJob)
+                return { ok: true, result, inputImage: i }
+            } catch (e: any) {
+                // Capture refused images info from error data if provided
+                const refusedImages = e?.data?.refusedImages || [i]
+                const reason = e?.data?.reason || e?.statusMessage || e?.message || 'unknown'
+                return { ok: false, inputImage: i, refusedImages, reason }
+            }
         })
     )
 
@@ -44,10 +51,10 @@ export default defineEventHandler(async (event) => {
 
 
     let objects = []
-    for (let r of results) {
+    for (let r of results as any[]) {
         let savedUrl: string = ''
-        const { result } = r as any
-        if (result?.buffer && Buffer.isBuffer(result.buffer)) {
+        const result = r?.result
+        if (r?.ok && result?.buffer && Buffer.isBuffer(result.buffer)) {
             const ext = extFromMime(result.mimeType)
             const fname = `gemini-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`
             const fullPath = `${outDir}/${fname}`
@@ -55,9 +62,15 @@ export default defineEventHandler(async (event) => {
             // Public URL relative to site root
             savedUrl = `/images/output/${fname}`
         }
-        body.inputImages = [r.inputImage]
-        let q = await db.createSystemPrompt(body, savedUrl)
+        // Prepare record data per item to avoid mutating the original body
+        const recordData: GenerateOptions = { ...body, inputImages: [r.inputImage] }
+        let errMsg: string | undefined = undefined
+        if (!r?.ok) {
+            recordData.prompt = 'GEMINI API refused these images' + (r?.reason ? ` (${r.reason})` : '')
+            errMsg = r?.reason || 'unknown'
+        }
+        let q = await db.createSystemPrompt(recordData, savedUrl, errMsg)
         objects.push(q)
     }
-    return {ok: true,obj: objects}
+    return { ok: true, obj: objects }
 });

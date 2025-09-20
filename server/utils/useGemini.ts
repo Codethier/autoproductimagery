@@ -93,8 +93,13 @@ export async function useGemini() {
         }
 
         throw createError({
-            statusCode: 500,
-            statusMessage: 'No image returned from Gemini ' + response.promptFeedback?.blockReason + ' | ' + opts.inputImages
+            statusCode: 422,
+            statusMessage: 'GEMINI API refused these images' + (response?.promptFeedback?.blockReason ? ': ' + response.promptFeedback.blockReason : ''),
+            data: {
+                refusedImages: opts.inputImages,
+                reason: response?.promptFeedback?.blockReason || 'unknown',
+                prompt: opts.prompt
+            }
         })
     }
 

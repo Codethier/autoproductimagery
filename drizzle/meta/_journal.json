@@ -8,6 +8,13 @@
       "when": 1758325349854,
       "tag": "0000_light_maverick",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1758363858680,
+      "tag": "0001_simple_rafael_vega",
+      "breakpoints": true
     }
   ]
 }

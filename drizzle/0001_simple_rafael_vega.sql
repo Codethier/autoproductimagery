@@ -1,0 +1,1 @@
+ALTER TABLE `systemPrompt` ADD `errors` text;

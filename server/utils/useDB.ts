@@ -4,7 +4,7 @@ import { desc, eq } from "drizzle-orm";
 import type { GenerateOptions } from "~~/schemas/main.dto";
 
 export async function useDB() {
-    async function createSystemPrompt(data: GenerateOptions, outputImage: string){
+    async function createSystemPrompt(data: GenerateOptions, outputImage: string, errors?: string){
         const modelImages = Array.isArray(data.modelImages) ? data.modelImages : []
         const serverImages = Array.isArray(data.inputImages) ? data.inputImages : []
 
@@ -13,6 +13,7 @@ export async function useDB() {
             serverImages: serverImages as any,
             modelImages: modelImages as any,
             outputImage: outputImage,
+            errors: errors ?? null as any,
             // createdAt and updatedAt will default in DB
         }).run();
 
