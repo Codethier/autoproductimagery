@@ -5,7 +5,7 @@ import {MultiPartData} from 'h3'
 
 export async function useFS() {
 
-    let basePath = './public/images'
+    let basePath = './data/images'
     // Ensure base path exists so other operations (readDir, readdir, writeFile) don't fail
     try {
         await fs.mkdir(basePath, { recursive: true })
@@ -77,12 +77,12 @@ export async function useFS() {
     }
 
     function parentPathToUrl(parentPath: string, name: string) {
-        return `${parentPath.replace('./public', '')}/${name}`
+        return `${parentPath.replace('./data', '')}/${name}`
     }
 
     async function getFile(path:string){
         // image arrays have image in the already
-        path = './public'+ path
+        path = './data'+ path
         return await fs.readFile(path)
     }
 

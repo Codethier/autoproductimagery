@@ -24,7 +24,7 @@ export default defineEventHandler(async (event) => {
     )
 
     // Ensure output directory exists under public so the file is web-accessible
-    const outDir = './public/images/output'
+    const outDir = './data/images/output'
     const fs = await import('node:fs/promises')
     await fs.mkdir(outDir, {recursive: true})
 
