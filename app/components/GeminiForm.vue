@@ -3,7 +3,8 @@ const data = useDataStore()
 const prompt = ref('')
 const loading = ref(false)
 const errorMsg = ref<string | null>(null)
-let systemPrompts = ref()
+
+let pastPrompts = useFetch('/api/systemprompts', {deep:true, key: () => 'systemPrompts',})
 
 async function submit() {
   if (loading.value) return
@@ -72,8 +73,15 @@ async function submit() {
       </div>
 
     </div>
-    <div>
-      <!--  past prompts here-->
+    <div class="mt-6">
+      <div v-if="pastPrompts.data?.value?.items?.length" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+        <system-promp
+          v-for="item in pastPrompts.data.value.items"
+          :key="item.id"
+          :data="item"
+        />
+      </div>
+      <div v-else class="text-sm text-gray-500">No system prompts yet.</div>
     </div>
   </div>
 </template>

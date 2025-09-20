@@ -1,46 +1,71 @@
 <script setup lang="ts">
-interface SystemPromptItem {
-  id: number
-  TextPrompt: string
-  serverImages: string[]
-  modelImages: string[]
-  outputImage: string
-  createdAt: string
-  updatedAt: string
-}
+import type { SystemPrompt } from '~/server/db/schema'
 
-interface SystemPromptsResponse {
-  ok: boolean
-  count: number
-  items: SystemPromptItem[]
-}
+const props = defineProps<{ data: SystemPrompt }>()
 
-const props = defineProps<{ data?: SystemPromptsResponse }>()
+const createdAt = computed(() => {
+  const d = props.data?.createdAt ? new Date(props.data.createdAt) : null
+  return d ? d.toLocaleString() : ''
+})
 </script>
 
 <template>
-  <div class="flex flex-col gap-4">
-    <div class="flex items-center justify-between">
-      <h2 class="text-lg font-semibold">Recent System Prompts</h2>
+  <div
+    class="group relative overflow-hidden rounded-xl border border-gray-200 dark:border-gray-800 bg-white/70 dark:bg-gray-900/50 shadow-sm hover:shadow-lg transition-all duration-200"
+  >
+    <div v-if="props.data?.outputImage" class="relative">
+      <DownloadableImage
+        :src="props.data.outputImage"
+        :alt="props.data?.TextPrompt || 'Output image'"
+        class="w-full aspect-square object-cover bg-gray-50 dark:bg-gray-800"
+      />
+      <span class="absolute top-2 left-2 px-2 py-0.5 text-[10px] font-medium rounded bg-white/80 dark:bg-gray-900/70 text-gray-800 dark:text-gray-200 border border-gray-200 dark:border-gray-700">
+        Output
+      </span>
     </div>
 
-    <div v-if="props.data?.items?.length" class="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-6 gap-3">
-      <div v-for="item in props.data!.items" :key="item.id" class="border rounded p-2 flex flex-col gap-2">
-        <DownloadableImage :src="item.outputImage" :alt="item.TextPrompt" class="w-full aspect-square object-contain rounded" />
-        <p class="text-xs line-clamp-2" :title="item.TextPrompt">{{ item.TextPrompt }}</p>
-        <div class="flex gap-1 overflow-x-auto">
-          <img v-for="m in (item.modelImages || [])" :key="m" :src="m" alt="model" class="h-8 w-8 object-cover rounded border" />
+    <div class="p-3 flex flex-col gap-3">
+      <p class="text-sm font-medium text-gray-900 dark:text-gray-100 line-clamp-3" :title="props.data?.TextPrompt">
+        {{ props.data?.TextPrompt }}
+      </p>
+
+      <div v-if="props.data?.serverImages?.length" class="mt-1">
+        <div class="text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Input image(s)</div>
+        <div class="grid grid-cols-5 gap-1">
+          <DownloadableImage
+            v-for="s in props.data.serverImages"
+            :key="s"
+            :src="s"
+            :alt="'Input ' + s"
+            class="h-16 w-full object-cover rounded bg-gray-50 dark:bg-gray-800"
+          />
         </div>
       </div>
+
+      <div v-if="props.data?.modelImages?.length" class="mt-1">
+        <div class="text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Model image(s)</div>
+        <div class="grid grid-cols-5 gap-1">
+          <DownloadableImage
+            v-for="m in props.data.modelImages"
+            :key="m"
+            :src="m"
+            :alt="'Model ' + m"
+            class="h-16 w-full object-cover rounded bg-gray-50 dark:bg-gray-800"
+          />
+        </div>
+      </div>
+
+      <div class="flex items-center justify-end">
+        <span class="text-[11px] text-gray-500 dark:text-gray-400">{{ createdAt }}</span>
+      </div>
     </div>
-    <div v-else class="text-sm text-gray-500">No system prompts yet.</div>
   </div>
 </template>
 
 <style scoped>
-.line-clamp-2 {
+.line-clamp-3 {
   display: -webkit-box;
-  -webkit-line-clamp: 2;
+  -webkit-line-clamp: 3;
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
