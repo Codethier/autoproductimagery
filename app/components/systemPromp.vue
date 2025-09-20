@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import type { SystemPrompt } from '~/server/db/schema'
+import { refreshNuxtData } from '#app'
 
 const props = defineProps<{ data: SystemPrompt }>()
 
@@ -7,6 +8,55 @@ const createdAt = computed(() => {
   const d = props.data?.createdAt ? new Date(props.data.createdAt) : null
   return d ? d.toLocaleString() : ''
 })
+
+const regenLoading = ref(false)
+const regenCount = ref<number>(1)
+const toast = useToast()
+
+async function regenerate() {
+  if (regenLoading.value) return
+  try {
+    regenLoading.value = true
+    const inputImages = Array.isArray(props.data?.serverImages) ? props.data.serverImages : []
+    const modelImages = Array.isArray(props.data?.modelImages) ? props.data.modelImages : []
+
+    if (inputImages.length === 0) {
+      toast.add({ title: 'Cannot regenerate', description: 'No input images stored for this item.', color: 'warning' })
+      return
+    }
+
+    // Ask the user to edit/confirm the prompt before regenerating
+    const currentPrompt = props.data?.TextPrompt || ''
+    const editedPrompt = typeof window !== 'undefined' ? window.prompt('Edit prompt before regenerating:', currentPrompt) : currentPrompt
+    if (editedPrompt === null) {
+      // User cancelled
+      return
+    }
+
+    const count = Math.max(1, Math.min(50, Number(regenCount.value) || 1))
+
+    // Run the job count times
+    for (let i = 0; i < count; i++) {
+      await $fetch('/api/gemini-normal', {
+        method: 'POST',
+        body: {
+          prompt: editedPrompt,
+          inputImages,
+          modelImages,
+          responseModalities: ['IMAGE']
+        }
+      })
+    }
+
+    toast.add({ title: 'Regeneration started', description: `Created ${count} job${count > 1 ? 's' : ''}.` })
+  } catch (e: any) {
+    console.error(e)
+    toast.add({ title: 'Regeneration failed', color: 'warning' })
+  } finally {
+    await refreshNuxtData('systemPrompts')
+    regenLoading.value = false
+  }
+}
 </script>
 
 <template>
@@ -68,7 +118,17 @@ const createdAt = computed(() => {
         </div>
       </div>
 
-      <div class="flex items-center justify-end">
+      <div class="flex items-center justify-between">
+        <div class="flex items-center gap-2">
+          <UButton size="xs" :loading="regenLoading" :disabled="regenLoading || !(props.data?.serverImages?.length)" @click="regenerate">
+            Regenerate
+          </UButton>
+          <div class="flex items-center gap-1 text-[11px] text-gray-600 dark:text-gray-300">
+            <span>×</span>
+            <UInput v-model.number="regenCount" type="number" size="xs" class="w-14" :ui="{ size: { xs: 'text-xs' } }" min="1" :disabled="regenLoading" />
+            <span>times</span>
+          </div>
+        </div>
         <span class="text-[11px] text-gray-500 dark:text-gray-400">{{ createdAt }}</span>
       </div>
     </div>

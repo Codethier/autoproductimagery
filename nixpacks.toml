@@ -1,0 +1,5 @@
+[variables]
+NIXPACKS_NODE_VERSION = "22"
+#more build ram
+NODE_OPTIONS = "--max-old-space-size=4096"
+
