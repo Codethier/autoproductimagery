@@ -9,3 +9,6 @@ GEMINI_API_KEY="AIza"
 NUXT_AUTH_USER="admin"
 NUXT_AUTH_PASSWORD="secret"
 DATABASE_URL="file:./dev.db"
+
+
+The gemini api is currently a mess, and gives 

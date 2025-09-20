@@ -10,7 +10,8 @@
     "postinstall": "nuxt prepare",
     "drizzle:generate": "drizzle-kit generate",
     "drizzle:push": "drizzle-kit push",
-    "drizzle:studio": "drizzle-kit studio"
+    "drizzle:studio": "drizzle-kit studio",
+    "drizzle:migrate": "drizzle-kit migrate"
   },
   "dependencies": {
     "@google/genai": "^1.16.0",

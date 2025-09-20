@@ -1,4 +1,5 @@
 import {Dirent} from "node:fs";
+import {number} from "yup";
 
 export type GenerateOptions = {
     prompt: string
@@ -6,6 +7,10 @@ export type GenerateOptions = {
     responseModalities?: Array<'IMAGE' | 'TEXT'>
     inputImages: Array<string>
     modelImages?: Array<string>
+    safetySettings : any
+    topP?: number
+    temperature?: number
+    maxOutputTokens?: number
 }
 
 export type inputImages = { mimeType: string; dataBase64: string }
