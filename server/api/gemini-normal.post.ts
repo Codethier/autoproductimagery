@@ -7,12 +7,14 @@ export default defineEventHandler(async (event) => {
     const gemini = await useGemini()
     const body = await readBody<GenerateOptions>(event)
 
-    let streams = []
-    for (let i of body.inputImages) {
-        let geminiJob: GenerateOptions = {...body}
-        geminiJob.inputImages = [i]
-        streams.push(await gemini.generateStream(geminiJob))
-    }
+    // Generate all streams concurrently using Promise.all
+    const streams = await Promise.all(
+        body.inputImages.map(async (i) => {
+            const geminiJob: GenerateOptions = { ...body, inputImages: [i] }
+            const stream = await gemini.generateStream(geminiJob)
+            return { stream, inputImage: i }
+        })
+    )
 
     // Ensure output directory exists under public so the file is web-accessible
     const outDir = './public/images/output'
@@ -42,9 +44,9 @@ export default defineEventHandler(async (event) => {
 
 
     let objects = []
-    for (let stream of streams) {
+    for (let streamObj of streams) {
         let savedUrl: string = ''
-        for await (const chunk of stream) {
+        for await (const chunk of streamObj.stream) {
             if (chunk.type === 'image' && Buffer.isBuffer(chunk.data)) {
                 const ext = extFromMime(chunk.mimeType)
                 const fname = `gemini-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`
@@ -55,6 +57,7 @@ export default defineEventHandler(async (event) => {
                 break
             }
         }
+        body.inputImages = [streamObj.inputImage]
         let q = await db.createSystemPrompt(body, savedUrl)
         objects.push(q)
     }

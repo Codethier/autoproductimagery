@@ -123,6 +123,8 @@ async function createFolder() {
 }
 
 async function deleteFileOrFolder(filename: string) {
+  const isConfirmed = window.confirm(`Are you sure you want to delete "${filename}"? This cannot be undone.`)
+  if (!isConfirmed) return false
   let pathToSubmit = String(path.value)
   pathToSubmit = pathToSubmit + '/' + filename
   let response = await useFetch('/api/deleteFileOrFolder', {
@@ -132,6 +134,26 @@ async function deleteFileOrFolder(filename: string) {
   })
   await items.refresh()
   return true
+}
+
+function clearModelSelection() {
+  try {
+    ;(dataStore.models as any).splice(0)
+  } catch { /* no-op */ }
+  const files = items.data.value?.files
+  if (files) {
+    for (const f of files) f.selectedModel = false
+  }
+}
+
+function clearImageSelection() {
+  try {
+    ;(dataStore.inputImages as any).splice(0)
+  } catch { /* no-op */ }
+  const files = items.data.value?.files
+  if (files) {
+    for (const f of files) f.selectedImage = false
+  }
 }
 </script>
 
@@ -155,6 +177,10 @@ async function deleteFileOrFolder(filename: string) {
             </div>
           </template>
         </UPopover>
+        <div class="flex gap-2">
+          <UButton v-if="props.isModelSelect" size="xs" variant="subtle" color="neutral" @click="clearModelSelection" :disabled="dataStore.models.length === 0">Clear model selection</UButton>
+          <UButton v-if="props.isImageSelect" size="xs" variant="subtle" color="neutral" @click="clearImageSelection" :disabled="dataStore.inputImages.length === 0">Clear image selection</UButton>
+        </div>
 
       </div>
       <div v-for="dir of items.data.value?.dirs"

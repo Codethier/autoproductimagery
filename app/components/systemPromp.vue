@@ -17,7 +17,7 @@ const createdAt = computed(() => {
       <DownloadableImage
         :src="props.data.outputImage"
         :alt="props.data?.TextPrompt || 'Output image'"
-        class="w-full aspect-square object-cover bg-gray-50 dark:bg-gray-800"
+        class="w-full h-auto object-contain bg-gray-50 dark:bg-gray-800"
       />
       <span class="absolute top-2 left-2 px-2 py-0.5 text-[10px] font-medium rounded bg-white/80 dark:bg-gray-900/70 text-gray-800 dark:text-gray-200 border border-gray-200 dark:border-gray-700">
         Output
