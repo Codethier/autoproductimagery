@@ -6,6 +6,12 @@ import {MultiPartData} from 'h3'
 export async function useFS() {
 
     let basePath = './public/images'
+    // Ensure base path exists so other operations (readDir, readdir, writeFile) don't fail
+    try {
+        await fs.mkdir(basePath, { recursive: true })
+    } catch {
+        // ignore errors here; subsequent ops will surface meaningful errors if any
+    }
 
     function getRelativePath(path: string) {
         path = path.replaceAll('..', '')
@@ -58,6 +64,8 @@ export async function useFS() {
 
     async function saveFile(path: string, file: MultiPartData) {
         path = getRelativePath(path)
+        // Ensure destination directory exists
+        await fs.mkdir(path, { recursive: true })
         let savedFile = await fs.writeFile(path + '/' + file.filename, file.data,)
         return savedFile
     }
