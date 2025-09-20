@@ -7,12 +7,12 @@ export default defineEventHandler(async (event) => {
     const gemini = await useGemini()
     const body = await readBody<GenerateOptions>(event)
 
-    // Generate all streams concurrently using Promise.all
-    const streams = await Promise.all(
+    // Generate all images concurrently using Promise.all
+    const results = await Promise.all(
         body.inputImages.map(async (i) => {
             const geminiJob: GenerateOptions = { ...body, inputImages: [i] }
-            const stream = await gemini.generateStream(geminiJob)
-            return { stream, inputImage: i }
+            const result = await gemini.generateStream(geminiJob)
+            return { result, inputImage: i }
         })
     )
 
@@ -44,20 +44,18 @@ export default defineEventHandler(async (event) => {
 
 
     let objects = []
-    for (let streamObj of streams) {
+    for (let r of results) {
         let savedUrl: string = ''
-        for await (const chunk of streamObj.stream) {
-            if (chunk.type === 'image' && Buffer.isBuffer(chunk.data)) {
-                const ext = extFromMime(chunk.mimeType)
-                const fname = `gemini-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`
-                const fullPath = `${outDir}/${fname}`
-                await fs.writeFile(fullPath, chunk.data)
-                // Public URL relative to site root
-                savedUrl = `/images/output/${fname}`
-                break
-            }
+        const { result } = r as any
+        if (result?.buffer && Buffer.isBuffer(result.buffer)) {
+            const ext = extFromMime(result.mimeType)
+            const fname = `gemini-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`
+            const fullPath = `${outDir}/${fname}`
+            await fs.writeFile(fullPath, result.buffer)
+            // Public URL relative to site root
+            savedUrl = `/images/output/${fname}`
         }
-        body.inputImages = [streamObj.inputImage]
+        body.inputImages = [r.inputImage]
         let q = await db.createSystemPrompt(body, savedUrl)
         objects.push(q)
     }
