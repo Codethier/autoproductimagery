@@ -2,12 +2,10 @@ FROM node:latest
 WORKDIR /app
 COPY . .
 RUN npm install
-RUN npx prisma generate
 RUN npm run build
-RUN npm migrate:deploy
-ENV NUXT_GEMINI_API_KEY=ALZA \
+ENV NUXT_GEMINI_API_KEY=ALZAXXXXXXXXXXXXX \
     NUXT_AUTH_USER=admin \
-    NUXT_AUTH_PASSWORD=secret \
-    DATABASE_URL="file:./prisma.db"
+    NUXT_AUTH_PASSWORD=secretMakeItVeryLongAndSecure \
+    DATABASE_URL="file:./sqlite/drizzle.db"
 EXPOSE 3000
-CMD ["node","/app/output/server/index.mjs"]
+CMD ["/bin/sh", "-c", "npm run drizzle:migrate && node .output/server/index.mjs"]

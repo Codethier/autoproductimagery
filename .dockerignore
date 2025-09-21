@@ -27,3 +27,6 @@ logs
 /public/images/
 /prisma.db
 /drizzle.db
+/data/
+/drizzle/sqlite/drizzle.db
+/sqlite/drizzle.db
