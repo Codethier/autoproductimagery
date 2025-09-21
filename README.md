@@ -1,14 +1,14 @@
 # Auto Product Imagery
 
-Generate product imagery with a simple web app. Below are quick-start instructions and an example output image.
-You may use it for other things aswell, models are images that get submitted with the same prompt for every input image selected, making workflows a lot faster with big batches.
+Generate product imagery with gemini 2.5 flash image (nano banana). You may use it for other things as well; models are images that get submitted with the same prompt for every input image selected, making workflows a lot faster with big batches. Below are quick-start instructions and an example output image.
+
 
 ## Run with Docker
 
 ```bash
 docker run -p 3000:3000 \
   --env-file .env \
-  ghcr.io/your-org-or-user/autoproductimagery:latest 
+   codethier/autoproductimagery:latest
 -v /folderOnYourMachine/data:/app/data 
 -v /folderOnYourMachine/sqlite:/app/sqlite
 ```
