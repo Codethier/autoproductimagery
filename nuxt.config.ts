@@ -16,7 +16,8 @@ export default defineNuxtConfig({
         //     public
         public: {
             GeminiModels: {
-                gemini25FlashIOImagePreview: 'gemini-2.5-flash-image-preview'
+                gemini25FlashIOImagePreview: 'gemini-2.5-flash-image-preview',
+                nanoBananaPro: 'gemini-3-pro-image-preview'
             }
         }
     },

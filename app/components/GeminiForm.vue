@@ -5,6 +5,41 @@ const loading = ref(false)
 const errorMsg = ref<string | null>(null)
 const temperature = ref(1)
 const topP = ref(0.95)
+const runtimeConfig = useRuntimeConfig()
+
+// Build model options from public runtime config
+type ModelOption = { label: string; value: string }
+const modelOptions = computed<ModelOption[]>(() => {
+  const models = runtimeConfig.public?.GeminiModels || {}
+  return Object.entries(models).map(([key, value]) => ({
+    label: beautifyKey(key) + ` (${value})`,
+    value: value as string
+  }))
+})
+
+// Try to pick the configured default
+const defaultModel = computed(() =>
+    runtimeConfig.public?.GeminiModels?.nanoBananaPro
+)
+
+function beautifyKey(key: string) {
+  // Turn camelCase or mixed into spaced words, e.g., gemini25FlashIOImagePreview -> Gemini 2.5 Flash IO Image Preview
+  try {
+    const spaced = key
+        .replace(/([a-z])([A-Z0-9])/g, '$1 $2')
+        .replace(/([0-9])(\D)/g, '$1 $2')
+        .replace(/([a-zA-Z])(\d)/g, '$1 $2')
+        .replace(/\s+/g, ' ')
+        .trim()
+    return spaced.charAt(0).toUpperCase() + spaced.slice(1)
+  } catch {
+    return key
+  }
+}
+
+if (!data.selectedModel) {
+  data.selectedModel = defaultModel.value
+}
 
 let pastPrompts = useFetch('/api/systemprompts', {deep: true, key: () => 'systemPrompts',})
 
@@ -71,6 +106,7 @@ async function submit() {
             prompt: prompt.value,
             inputImages: data.inputImages,
             modelImages: data.models,
+            model: data.selectedModel || undefined,
             responseModalities: ['IMAGE'],
             temperature: temperature.value,
             topP: topP.value
@@ -140,6 +176,15 @@ async function submit() {
                            class="w-full object-contain rounded-md border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800"/>
       </div>
       <div class="grid grid-cols-2 gap-8">
+        <div>
+          <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Model</label>
+          <USelect
+              v-model="data.selectedModel"
+              :items="modelOptions"
+              placeholder="Select a Gemini model"
+          />
+          <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">Using: {{ data.selectedModel }}</p>
+        </div>
         <div>
           <p>Temperature: {{temperature}}</p>
           <p class="text-sm">Creativity allowed in the responses</p>
