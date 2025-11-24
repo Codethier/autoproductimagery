@@ -1,5 +1,5 @@
 import {Dirent} from "node:fs";
-import {number} from "yup";
+import {number, string} from "yup";
 
 export type GenerateOptions = {
     prompt: string
@@ -8,6 +8,7 @@ export type GenerateOptions = {
     inputImages: Array<string>
     modelImages?: Array<string>
     safetySettings: any
+    imageConfig?: imageConfig
 
     topP?: number
     // Probability threshold for top-p sampling , 0.00 --> 1.00
@@ -16,6 +17,11 @@ export type GenerateOptions = {
     maxOutputTokens?: number
 }
 
+type imageConfig= {
+    aspectRatio?: string
+    // default is 1K in API
+    imageSize?: '1K' | '2K' | '4K'
+}
 export type inputImages = { mimeType: string; dataBase64: string }
 
 export type StreamChunk = {

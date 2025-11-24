@@ -15,7 +15,7 @@ export async function useGemini() {
 
     async function generateStream(opts: mainSchema.GenerateOptions) {
         const model = opts.model || defaultModel
-        const config = {
+        const config: mainSchema.GenerateOptions = {
             responseModalities: ['IMAGE', 'TEXT'],
             safetySettings: [
                 {
@@ -35,6 +35,7 @@ export async function useGemini() {
                     threshold: 'OFF',
                 }
             ],
+            imageConfig: opts.imageConfig
         } as any
 
         const userPromptPart = {text: opts.prompt}

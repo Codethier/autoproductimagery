@@ -41,6 +41,43 @@ if (!data.selectedModel) {
   data.selectedModel = defaultModel.value
 }
 
+// nanoBananaPro specific UI controls
+const nanoBananaModelId = computed(() => runtimeConfig.public?.GeminiModels?.nanoBananaPro)
+const isNanoBananaSelected = computed(() => data.selectedModel === nanoBananaModelId.value)
+
+type Option = { label: string; value: string }
+// Radix Select (used by USelect) does not allow an empty string as an item value.
+// Use a non-empty sentinel to represent "model default" and map it to undefined on submit.
+const DEFAULT_ASPECT_RATIO = '__DEFAULT__'
+const aspectRatioOptions: Option[] = [
+  { label: 'Default (model decides)', value: DEFAULT_ASPECT_RATIO },
+  { label: '1:1 (Square)', value: '1:1' },
+  { label: '16:9 (Widescreen)', value: '16:9' },
+  { label: '4:3', value: '4:3' },
+  { label: '9:16 (Portrait)', value: '9:16' },
+  { label: '3:2', value: '3:2' },
+  { label: '2:3', value: '2:3' }
+]
+const imageSizeOptions: Option[] = [
+  { label: '1K', value: '1K' },
+  { label: '2K', value: '2K' },
+  { label: '4K', value: '4K' }
+]
+
+// Clear or set sensible defaults when switching models
+watch(
+  () => data.selectedModel,
+  (newVal) => {
+    if (newVal !== nanoBananaModelId.value) {
+      // Do not send nano-only config for other models
+      data.imageConfig.aspectRatio = undefined
+      data.imageConfig.imageSize = undefined
+    } else {
+      // If not set, keep them undefined so API defaults apply; user can override
+    }
+  }
+)
+
 let pastPrompts = useFetch('/api/systemprompts', {deep: true, key: () => 'systemPrompts',})
 
 function clearModels() {
@@ -109,7 +146,15 @@ async function submit() {
             model: data.selectedModel || undefined,
             responseModalities: ['IMAGE'],
             temperature: temperature.value,
-            topP: topP.value
+            topP: topP.value,
+            // Only include imageConfig if nanoBananaPro is selected
+            imageConfig: isNanoBananaSelected.value ? {
+              // Map sentinel or cleared value to undefined so the model decides
+              aspectRatio: (!data.imageConfig.aspectRatio || data.imageConfig.aspectRatio === DEFAULT_ASPECT_RATIO)
+                  ? undefined
+                  : data.imageConfig.aspectRatio,
+              imageSize: (data.imageConfig.imageSize as any) || undefined
+            } : undefined
           }
         }
     )
@@ -184,6 +229,27 @@ async function submit() {
               placeholder="Select a Gemini model"
           />
           <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">Using: {{ data.selectedModel }}</p>
+        </div>
+        <!-- nanoBananaPro-only options -->
+        <div v-if="isNanoBananaSelected" class="col-span-1">
+          <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Aspect ratio</label>
+          <USelect
+              v-model="data.imageConfig.aspectRatio"
+              :items="aspectRatioOptions"
+              placeholder="Default (model decides)"
+              clearable
+          />
+          <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">Optional. Choose image aspect ratio.</p>
+        </div>
+        <div v-if="isNanoBananaSelected" class="col-span-1">
+          <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Image size</label>
+          <USelect
+              v-model="data.imageConfig.imageSize"
+              :items="imageSizeOptions"
+              placeholder="Default (1K)"
+              clearable
+          />
+          <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">Optional. Higher values take longer.</p>
         </div>
         <div>
           <p>Temperature: {{temperature}}</p>
