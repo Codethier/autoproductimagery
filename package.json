@@ -36,5 +36,8 @@
     "@types/mime-types": "^3.0.1",
     "@types/node": "^24.3.0",
     "drizzle-kit": "^0.31.4"
+  },
+  "engines": {
+    "node": "24.x"
   }
 }
