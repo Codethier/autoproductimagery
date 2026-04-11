@@ -5,45 +5,43 @@ const loading = ref(false)
 const errorMsg = ref<string | null>(null)
 const temperature = ref(1)
 const topP = ref(0.95)
-const runtimeConfig = useRuntimeConfig()
 
-// Build model options from public runtime config
+// Fetch image-capable Gemini models from the server (listed via the SDK).
+type GeminiModelInfo = { id: string; name: string; displayName: string; description?: string }
+const modelsFetch = useFetch<{ ok: boolean; items: GeminiModelInfo[] }>('/api/gemini-models', {
+  key: 'gemini-models',
+  default: () => ({ ok: true, items: [] })
+})
+
 type ModelOption = { label: string; value: string }
 const modelOptions = computed<ModelOption[]>(() => {
-  const models = runtimeConfig.public?.GeminiModels || {}
-  return Object.entries(models).map(([key, value]) => ({
-    label: beautifyKey(key) + ` (${value})`,
-    value: value as string
+  const items = modelsFetch.data.value?.items || []
+  return items.map(m => ({
+    label: `${m.displayName} (${m.id})`,
+    value: m.id
   }))
 })
 
-// Try to pick the configured default
-const defaultModel = computed(() =>
-    runtimeConfig.public?.GeminiModels?.nanoBananaPro
-)
+// Prefer gemini-3-pro-image-preview (nano banana pro) as default.
+const PREFERRED_DEFAULT_MODEL = 'gemini-3-pro-image-preview'
+const nanoBananaModelId = computed(() => {
+  const items = modelsFetch.data.value?.items || []
+  const exact = items.find(m => m.id === PREFERRED_DEFAULT_MODEL)
+  if (exact) return exact.id
+  const match = items.find(m => /3[-_]?pro.*image/i.test(m.id) || /nano\s*banana/i.test(m.displayName))
+  return match?.id
+})
+const defaultModel = computed(() => {
+  const items = modelsFetch.data.value?.items || []
+  return nanoBananaModelId.value || items[0]?.id
+})
 
-function beautifyKey(key: string) {
-  // Turn camelCase or mixed into spaced words, e.g., gemini25FlashIOImagePreview -> Gemini 2.5 Flash IO Image Preview
-  try {
-    const spaced = key
-        .replace(/([a-z])([A-Z0-9])/g, '$1 $2')
-        .replace(/([0-9])(\D)/g, '$1 $2')
-        .replace(/([a-zA-Z])(\d)/g, '$1 $2')
-        .replace(/\s+/g, ' ')
-        .trim()
-    return spaced.charAt(0).toUpperCase() + spaced.slice(1)
-  } catch {
-    return key
-  }
-}
+// Set a default once the list arrives.
+watch(defaultModel, (v) => {
+  if (v && !data.selectedModel) data.selectedModel = v
+}, { immediate: true })
 
-if (!data.selectedModel) {
-  data.selectedModel = defaultModel.value
-}
-
-// nanoBananaPro specific UI controls
-const nanoBananaModelId = computed(() => runtimeConfig.public?.GeminiModels?.nanoBananaPro)
-const isNanoBananaSelected = computed(() => data.selectedModel === nanoBananaModelId.value)
+const isNanoBananaSelected = computed(() => !!nanoBananaModelId.value && data.selectedModel === nanoBananaModelId.value)
 
 type Option = { label: string; value: string }
 // Radix Select (used by USelect) does not allow an empty string as an item value.

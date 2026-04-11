@@ -8,7 +8,8 @@ export async function useGemini() {
     if (!apiKey) {
         throw createError({statusCode: 500, statusMessage: 'Gemini API key is missing in runtimeConfig.GeminiApiKey'})
     }
-    const defaultModel = runtimeConfig.public.GeminiModels.gemini25FlashIOImagePreview || 'models/gemini-2.0-flash-exp'
+    // Client always sends a selected model; this is a last-resort fallback.
+    const defaultModel = 'gemini-2.5-flash-image-preview'
 
     const ai = new GoogleGenAI({apiKey})
     const fs = await useFS()
