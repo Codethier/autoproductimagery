@@ -6,35 +6,100 @@ const errorMsg = ref<string | null>(null)
 const temperature = ref(1)
 const topP = ref(0.95)
 
-// Fetch image-capable Gemini models from the server (listed via the SDK).
-type GeminiModelInfo = { id: string; name: string; displayName: string; description?: string }
-const modelsFetch = useFetch<{ ok: boolean; items: GeminiModelInfo[] }>('/api/gemini-models', {
-  key: 'gemini-models',
+// Fetch all image-capable models from the gateway (across providers).
+type ModelPricing = {
+  input: string
+  output: string
+  cachedInputTokens?: string
+  cacheCreationInputTokens?: string
+} | null
+
+type ImageModelInfo = {
+  id: string
+  name: string
+  description?: string
+  provider: string
+  modelType: 'language' | 'image'
+  pricing?: ModelPricing
+}
+const modelsFetch = useFetch<{ ok: boolean; items: ImageModelInfo[] }>('/api/image-models', {
+  key: 'image-models',
   default: () => ({ ok: true, items: [] })
+})
+
+function fmtPerMillion(perTokenUsd?: string) {
+  if (!perTokenUsd) return null
+  const v = Number(perTokenUsd) * 1_000_000
+  if (!isFinite(v) || v <= 0) return null
+  return v < 1 ? `$${v.toFixed(3)}` : `$${v.toFixed(2)}`
+}
+
+function pricingLabel(p?: ModelPricing) {
+  if (!p) return ''
+  const inp = fmtPerMillion(p.input)
+  const out = fmtPerMillion(p.output)
+  if (!inp && !out) return ''
+  return ` — ${inp ?? '?'} in / ${out ?? '?'} out per 1M tok`
+}
+
+function priceScore(p?: ModelPricing) {
+  if (!p) return -1
+  const inp = Number(p.input) || 0
+  const out = Number(p.output) || 0
+  // Weight output 4x — typical chat ratio, also avoids zero-input image models tying.
+  const score = inp + out * 4
+  return score > 0 ? score : -1
+}
+
+const sortedModels = computed<ImageModelInfo[]>(() => {
+  const items = [...(modelsFetch.data.value?.items || [])]
+  items.sort((a, b) => {
+    const da = priceScore(a.pricing)
+    const db = priceScore(b.pricing)
+    if (db !== da) return db - da // expensive first; unpriced (-1) sink to bottom
+    return a.id.localeCompare(b.id)
+  })
+  return items
 })
 
 type ModelOption = { label: string; value: string }
 const modelOptions = computed<ModelOption[]>(() => {
-  const items = modelsFetch.data.value?.items || []
-  return items.map(m => ({
-    label: `${m.displayName} (${m.id})`,
+  return sortedModels.value.map(m => ({
+    label: `${m.provider} · ${m.name || m.id.split('/').pop()}${pricingLabel(m.pricing)}`,
     value: m.id
   }))
 })
 
-// Prefer gemini-3-pro-image-preview (nano banana pro) as default.
-const PREFERRED_DEFAULT_MODEL = 'gemini-3-pro-image-preview'
+const selectedModelInfo = computed<ImageModelInfo | undefined>(() => {
+  const items = modelsFetch.data.value?.items || []
+  return items.find(m => m.id === data.selectedModel)
+})
+
+const selectedPricingText = computed(() => {
+  const p = selectedModelInfo.value?.pricing
+  if (!p) return null
+  const inp = fmtPerMillion(p.input)
+  const out = fmtPerMillion(p.output)
+  const cached = fmtPerMillion(p.cachedInputTokens)
+  const parts: string[] = []
+  if (inp) parts.push(`${inp} input`)
+  if (out) parts.push(`${out} output`)
+  if (cached) parts.push(`${cached} cached input`)
+  if (!parts.length) return null
+  return `${parts.join(' · ')} per 1M tokens`
+})
+
+// Detect the nano-banana family (Gemini 3 pro image preview) for nano-only options.
 const nanoBananaModelId = computed(() => {
   const items = modelsFetch.data.value?.items || []
-  const exact = items.find(m => m.id === PREFERRED_DEFAULT_MODEL)
+  const exact = items.find(m => m.id === 'google/gemini-3-pro-image-preview')
   if (exact) return exact.id
-  const match = items.find(m => /3[-_]?pro.*image/i.test(m.id) || /nano\s*banana/i.test(m.displayName))
+  const match = items.find(m => /3[-_]?pro.*image/i.test(m.id) || /nano\s*banana/i.test(m.name))
   return match?.id
 })
-const defaultModel = computed(() => {
-  const items = modelsFetch.data.value?.items || []
-  return nanoBananaModelId.value || items[0]?.id
-})
+
+// Default selection = most expensive priced model. Falls back to first listed.
+const defaultModel = computed(() => sortedModels.value[0]?.id)
 
 // Set a default once the list arrives.
 watch(defaultModel, (v) => {
@@ -134,7 +199,7 @@ async function submit() {
     loading.value = true
     startTimer()
     const res = await $fetch<{ ok: boolean; url?: string; message?: string }>(
-        '/api/gemini-normal',
+        '/api/image-generate',
         {
           method: 'POST',
           body: {
@@ -227,6 +292,9 @@ async function submit() {
               placeholder="Select a Gemini model"
           />
           <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">Using: {{ data.selectedModel }}</p>
+          <p v-if="selectedPricingText" class="mt-0.5 text-xs text-gray-500 dark:text-gray-400">
+            {{ selectedPricingText }}
+          </p>
         </div>
         <!-- nanoBananaPro-only options -->
         <div v-if="isNanoBananaSelected" class="col-span-1">

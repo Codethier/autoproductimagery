@@ -37,7 +37,7 @@ async function regenerate() {
 
     // Run the job count times
     for (let i = 0; i < count; i++) {
-      await $fetch('/api/gemini-normal', {
+      await $fetch('/api/image-generate', {
         method: 'POST',
         body: {
           prompt: editedPrompt,

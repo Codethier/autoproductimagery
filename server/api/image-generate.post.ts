@@ -1,29 +1,37 @@
 import type {GenerateOptions} from "~~/schemas/main.dto";
 import {useDB} from "~~/server/utils/useDB";
+import {useGateway} from "~~/server/utils/useGateway";
+
+const DEFAULT_MODEL = 'google/gemini-2.5-flash-image-preview'
 
 export default defineEventHandler(async (event) => {
     useAuth(event)
-    let db = await useDB()
-    const gemini = await useGemini()
+    const db = await useDB()
+    const gw = await useGateway()
     const body = await readBody<GenerateOptions>(event)
 
-    // Generate all images concurrently using Promise.all
+    const model = body.model || DEFAULT_MODEL
+    if (!model.includes('/')) {
+        throw createError({
+            statusCode: 400,
+            statusMessage: `Model id must be in 'provider/model' form (got '${model}')`,
+        })
+    }
+
     const results = await Promise.all(
         body.inputImages.map(async (i) => {
-            const geminiJob: GenerateOptions = { ...body, inputImages: [i] }
+            const job: GenerateOptions = {...body, inputImages: [i]}
             try {
-                const result = await gemini.generateStream(geminiJob)
-                return { ok: true, result, inputImage: i }
+                const result = await gw.generateAnyImage({...job, model})
+                return {ok: true, result, inputImage: i}
             } catch (e: any) {
-                // Capture refused images info from error data if provided
                 const refusedImages = e?.data?.refusedImages || [i]
                 const reason = e?.data?.reason || e?.statusMessage || e?.message || 'unknown'
-                return { ok: false, inputImage: i, refusedImages, reason }
+                return {ok: false, inputImage: i, refusedImages, reason}
             }
         })
     )
 
-    // Ensure output directory exists under public so the file is web-accessible
     const outDir = './data/images/output'
     const fs = await import('node:fs/promises')
     await fs.mkdir(outDir, {recursive: true})
@@ -49,28 +57,25 @@ export default defineEventHandler(async (event) => {
         }
     }
 
-
-    let objects = []
-    for (let r of results as any[]) {
+    const objects = []
+    for (const r of results as any[]) {
         let savedUrl: string = ''
         const result = r?.result
         if (r?.ok && result?.buffer && Buffer.isBuffer(result.buffer)) {
             const ext = extFromMime(result.mimeType)
-            const fname = `gemini-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`
+            const fname = `img-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`
             const fullPath = `${outDir}/${fname}`
             await fs.writeFile(fullPath, result.buffer)
-            // Public URL relative to site root
             savedUrl = `/images/output/${fname}`
         }
-        // Prepare record data per item to avoid mutating the original body
-        const recordData: GenerateOptions = { ...body, inputImages: [r.inputImage] }
+        const recordData: GenerateOptions = {...body, inputImages: [r.inputImage]}
         let errMsg: string | undefined = undefined
         if (!r?.ok) {
-            recordData.prompt = 'GEMINI API refused these images' + (r?.reason ? ` (${r.reason})` : '')
+            recordData.prompt = 'Model refused these images' + (r?.reason ? ` (${r.reason})` : '')
             errMsg = r?.reason || 'unknown'
         }
-        let q = await db.createSystemPrompt(recordData, savedUrl, errMsg)
+        const q = await db.createSystemPrompt(recordData, savedUrl, errMsg)
         objects.push(q)
     }
-    return { ok: true, obj: objects }
+    return {ok: true, obj: objects}
 });

@@ -14,7 +14,7 @@
     "drizzle:migrate": "drizzle-kit migrate"
   },
   "dependencies": {
-    "@ai-sdk/google": "^3.0.71",
+    "@ai-sdk/vue": "^3.0.177",
     "@libsql/client": "^0.15.15",
     "@nuxt/image": "^1.11.0",
     "@nuxt/scripts": "^0.11.13",
@@ -30,7 +30,8 @@
     "unstorage": "^1.17.1",
     "vue": "^3.5.20",
     "vue-router": "^4.5.1",
-    "yup": "^1.7.0"
+    "yup": "^1.7.0",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@pinia/nuxt": "^0.11.2",

@@ -32,7 +32,7 @@ export default defineNuxtConfig({
     // debug: true,
     runtimeConfig: {
         //         private
-        GeminiApiKey: '',
+        AiGatewayApiKey: '',
         authUser: '',
         authPassword: '',
         //     public
