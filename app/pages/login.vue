@@ -24,10 +24,11 @@ async function onSubmit() {
     // Set the cookie expected by server-side useAuth: "auth" = "user:pass"
     const auth = useCookie<string>('auth', { path: '/', sameSite: 'lax' })
     auth.value = `${form.username}:${form.password}`
+    await nextTick()
 
     // test credentials
-    let req = await useFetch('/api/testCredentials', {})
-    if (req.data.value !== true || req.error.value) {
+    const ok = await $fetch('/api/testCredentials')
+    if (ok !== true) {
       throw new Error('Invalid credentials')
     }
 

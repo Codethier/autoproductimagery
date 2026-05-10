@@ -1,4 +1,5 @@
-import {GoogleGenAI} from '@google/genai'
+import {createGoogleGenerativeAI} from '@ai-sdk/google'
+import {generateText} from 'ai'
 import * as mainSchema from '../../schemas/main.dto'
 import mime from 'mime'
 
@@ -11,97 +12,86 @@ export async function useGemini() {
     // Client always sends a selected model; this is a last-resort fallback.
     const defaultModel = 'gemini-2.5-flash-image-preview'
 
-    const ai = new GoogleGenAI({apiKey})
+    const google = createGoogleGenerativeAI({apiKey})
     const fs = await useFS()
 
     async function generateStream(opts: mainSchema.GenerateOptions) {
-        const model = opts.model || defaultModel
-        const config: mainSchema.GenerateOptions = {
-            responseModalities: ['IMAGE', 'TEXT'],
-            safetySettings: [
-                {
-                    category: 'HARM_CATEGORY_HATE_SPEECH',
-                    threshold: 'OFF',
-                },
-                {
-                    category: 'HARM_CATEGORY_DANGEROUS_CONTENT',
-                    threshold: 'OFF',
-                },
-                {
-                    category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT',
-                    threshold: 'OFF',
-                },
-                {
-                    category: 'HARM_CATEGORY_HARASSMENT',
-                    threshold: 'OFF',
-                }
-            ],
-            imageConfig: opts.imageConfig
-        } as any
+        const modelId = opts.model || defaultModel
 
-        const userPromptPart = {text: opts.prompt}
         let allImages = [...opts.inputImages]
         if (opts.modelImages) {
             allImages = [...allImages, ...opts.modelImages]
         }
 
-        const inlineParts: any[] = []
+        const fileParts: Array<{ type: 'file'; data: Buffer; mediaType: string }> = []
         for (const i of allImages) {
             const fileBuf = await fs.getFile(i)
-            const inlineData = {
-                inlineData: {
-                    mimeType: mime.getType(i) || 'application/octet-stream',
-                    data: Buffer.from(fileBuf).toString('base64'),
-                },
-            }
-            inlineParts.push(inlineData)
-        }
-
-        const contents = [
-            {
-                role: 'user',
-                parts: [userPromptPart, ...inlineParts],
-            },
-        ]
-
-        // Use non-streaming response since we only care about images and will
-        // return the first image buffer directly.
-        const response = await ai.models.generateContent({model, config, contents})
-
-        // Try to extract the first inlineData part (image) and return it as a Buffer
-        const parts = response?.candidates?.[0]?.content?.parts as any[] | undefined
-        if (parts && parts.length > 0) {
-            const p0 = parts.find(p => p?.inlineData) || parts[0]
-            if (p0?.inlineData) {
-                const mt = p0.inlineData.mimeType || ''
-                const buf = Buffer.from(p0.inlineData.data || response.data || '', 'base64')
-                return {buffer: buf, mimeType: mt}
-            }
-        }
-
-        // If image part not found, but response has inline data via helper, try that.
-        const base64 = (response as any)?.data
-        if (typeof base64 === 'string' && base64.length > 0) {
-            return {buffer: Buffer.from(base64, 'base64'), mimeType: 'image/png'}
-        }
-
-        // Fallback: if there is text only, return it as an error-like result.
-        const text = (response as any)?.text
-        if (typeof text === 'string' && text.length > 0) {
-            throw createError({
-                statusCode: 500,
-                statusMessage: `Expected image output but got text: ${text.slice(0, 200)}`
+            fileParts.push({
+                type: 'file',
+                data: Buffer.from(fileBuf),
+                mediaType: mime.getType(i) || 'application/octet-stream',
             })
         }
 
+        const safetySettings = [
+            {category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'OFF'},
+            {category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'OFF'},
+            {category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'OFF'},
+            {category: 'HARM_CATEGORY_HARASSMENT', threshold: 'OFF'},
+        ]
+
+        let response: Awaited<ReturnType<typeof generateText>>
+        try {
+            response = await generateText({
+                model: google(modelId),
+                providerOptions: {
+                    google: {
+                        responseModalities: ['IMAGE', 'TEXT'],
+                        safetySettings,
+                        ...(opts.imageConfig ? {imageConfig: opts.imageConfig} : {}),
+                    } as any,
+                },
+                messages: [
+                    {
+                        role: 'user',
+                        content: [
+                            {type: 'text', text: opts.prompt},
+                            ...fileParts,
+                        ],
+                    },
+                ],
+            })
+        } catch (e: any) {
+            throw createError({
+                statusCode: 502,
+                statusMessage: `Gemini request failed: ${e?.message || e}`,
+                data: {refusedImages: opts.inputImages, reason: e?.message || 'unknown', prompt: opts.prompt},
+            })
+        }
+
+        const imageFile = (response.files || []).find(f => f.mediaType?.startsWith('image/'))
+        if (imageFile) {
+            const buf = Buffer.from(imageFile.uint8Array)
+            return {buffer: buf, mimeType: imageFile.mediaType || 'image/png'}
+        }
+
+        const text = response.text
+        if (typeof text === 'string' && text.length > 0) {
+            throw createError({
+                statusCode: 500,
+                statusMessage: `Expected image output but got text: ${text.slice(0, 200)}`,
+            })
+        }
+
+        const finishReason = response.finishReason
         throw createError({
             statusCode: 422,
-            statusMessage: 'GEMINI API refused these images' + (response?.promptFeedback?.blockReason ? ': ' + response.promptFeedback.blockReason : ''),
+            statusMessage: 'GEMINI API refused these images' + (finishReason ? ': ' + finishReason : ''),
             data: {
                 refusedImages: opts.inputImages,
-                reason: response?.promptFeedback?.blockReason || 'unknown',
-                prompt: opts.prompt
-            }
+                reason: finishReason || 'unknown',
+                prompt: opts.prompt,
+            },
         })
     }
 

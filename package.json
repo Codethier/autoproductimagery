@@ -14,12 +14,13 @@
     "drizzle:migrate": "drizzle-kit migrate"
   },
   "dependencies": {
-    "@google/genai": "^1.16.0",
+    "@ai-sdk/google": "^3.0.71",
     "@libsql/client": "^0.15.15",
     "@nuxt/image": "^1.11.0",
     "@nuxt/scripts": "^0.11.13",
     "@nuxt/ui": "^4.0.0",
     "@unhead/vue": "^2.0.14",
+    "ai": "^6.0.177",
     "dotenv": "^17.2.1",
     "drizzle-orm": "^0.44.5",
     "mime": "^4.0.7",

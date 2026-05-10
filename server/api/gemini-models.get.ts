@@ -1,5 +1,3 @@
-import { GoogleGenAI } from '@google/genai'
-
 type ModelInfo = { id: string; name: string; displayName: string; description?: string }
 
 // Simple in-memory cache so we don't hit the API on every page load.
@@ -14,9 +12,10 @@ function isImageGenModel(m: any): boolean {
   const name: string = (m?.name || '').toLowerCase()
   const display: string = (m?.displayName || '').toLowerCase()
   const desc: string = (m?.description || '').toLowerCase()
-  const actions: string[] = (m?.supportedActions || []).map((s: string) => s.toLowerCase())
+  const actions: string[] = (m?.supportedGenerationMethods || m?.supportedActions || [])
+    .map((s: string) => s.toLowerCase())
 
-  // Accept if SDK explicitly reports an image-generation action.
+  // Accept if API explicitly reports an image-generation action.
   if (actions.some(a => a.includes('generateimage') || a === 'predict')) return true
 
   // Name-based heuristic for Gemini image preview + Imagen families.
@@ -27,6 +26,16 @@ function isImageGenModel(m: any): boolean {
   if (/image generation/.test(desc)) return true
 
   return false
+}
+
+type ListModelsResponse = {
+  models?: Array<{
+    name?: string
+    displayName?: string
+    description?: string
+    supportedGenerationMethods?: string[]
+  }>
+  nextPageToken?: string
 }
 
 export default defineEventHandler(async (event) => {
@@ -45,22 +54,29 @@ export default defineEventHandler(async (event) => {
     throw createError({ statusCode: 500, statusMessage: 'Gemini API key is missing in runtimeConfig.GeminiApiKey' })
   }
 
-  const ai = new GoogleGenAI({ apiKey })
-
   const items: ModelInfo[] = []
   try {
-    const pager = await ai.models.list({ config: { queryBase: true, pageSize: 100 } })
-    for await (const m of pager) {
-      if (!isImageGenModel(m)) continue
-      const id = stripPrefix(m.name || '')
-      if (!id) continue
-      items.push({
-        id,
-        name: m.name || id,
-        displayName: m.displayName || id,
-        description: m.description,
+    let pageToken: string | undefined = undefined
+    do {
+      const url = new URL('https://generativelanguage.googleapis.com/v1beta/models')
+      url.searchParams.set('pageSize', '100')
+      if (pageToken) url.searchParams.set('pageToken', pageToken)
+      const res = await $fetch<ListModelsResponse>(url.toString(), {
+        headers: { 'x-goog-api-key': apiKey },
       })
-    }
+      for (const m of res.models || []) {
+        if (!isImageGenModel(m)) continue
+        const id = stripPrefix(m.name || '')
+        if (!id) continue
+        items.push({
+          id,
+          name: m.name || id,
+          displayName: m.displayName || id,
+          description: m.description,
+        })
+      }
+      pageToken = res.nextPageToken
+    } while (pageToken)
   } catch (e: any) {
     throw createError({ statusCode: 502, statusMessage: `Failed to list Gemini models: ${e?.message || e}` })
   }
