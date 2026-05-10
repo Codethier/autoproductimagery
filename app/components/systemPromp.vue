@@ -3,6 +3,7 @@ import type { SystemPrompt } from '~/server/db/schema'
 import { refreshNuxtData } from '#app'
 
 const props = defineProps<{ data: SystemPrompt }>()
+const dataStore = useDataStore()
 
 const createdAt = computed(() => {
   const d = props.data?.createdAt ? new Date(props.data.createdAt) : null
@@ -12,6 +13,69 @@ const createdAt = computed(() => {
 const regenLoading = ref(false)
 const regenCount = ref<number>(1)
 const toast = useToast()
+
+// --- Refinement chat ----------------------------------------------------
+type ChatMsg =
+  | { role: 'user'; text: string }
+  | { role: 'image'; url: string }
+  | { role: 'error'; text: string }
+
+const chatMessages = ref<ChatMsg[]>([])
+const chatInput = ref('')
+const chatLoading = ref(false)
+// Latest image in the refinement chain. Each new refinement uses this as input.
+const latestImage = ref<string | null>(props.data?.outputImage || null)
+
+watch(
+  () => props.data?.outputImage,
+  (v) => {
+    if (chatMessages.value.length === 0) latestImage.value = v || null
+  }
+)
+
+async function sendRefine() {
+  const text = chatInput.value.trim()
+  if (!text || chatLoading.value) return
+  if (!latestImage.value) {
+    toast.add({ title: 'No image to refine', color: 'warning' })
+    return
+  }
+  chatMessages.value.push({ role: 'user', text })
+  chatInput.value = ''
+  chatLoading.value = true
+  try {
+    const res = await $fetch<{ ok: boolean; obj: SystemPrompt[] }>('/api/image-generate', {
+      method: 'POST',
+      body: {
+        prompt: text,
+        inputImages: [latestImage.value],
+        modelImages: [],
+        model: dataStore.selectedModel || undefined,
+        responseModalities: ['IMAGE'],
+      },
+    })
+    const row = res?.obj?.[0]
+    if (row?.outputImage && !row.errors) {
+      latestImage.value = row.outputImage
+      chatMessages.value.push({ role: 'image', url: row.outputImage })
+    } else {
+      const reason = row?.errors || 'Unknown error'
+      chatMessages.value.push({ role: 'error', text: reason })
+    }
+  } catch (e: any) {
+    chatMessages.value.push({ role: 'error', text: e?.data?.statusMessage || e?.message || 'Request failed' })
+  } finally {
+    chatLoading.value = false
+    await refreshNuxtData('systemPrompts')
+  }
+}
+
+function onChatKeydown(e: KeyboardEvent) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault()
+    sendRefine()
+  }
+}
 
 async function regenerate() {
   if (regenLoading.value) return
@@ -130,6 +194,53 @@ async function regenerate() {
           </div>
         </div>
         <span class="text-[11px] text-gray-500 dark:text-gray-400">{{ createdAt }}</span>
+      </div>
+
+      <!-- Refinement chat -->
+      <div v-if="props.data?.outputImage" class="mt-2 border-t border-gray-200 dark:border-gray-800 pt-2">
+        <div class="text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Refine</div>
+        <div
+          v-if="chatMessages.length"
+          class="flex flex-col gap-2 max-h-72 overflow-y-auto pr-1 mb-2"
+        >
+          <template v-for="(m, idx) in chatMessages" :key="idx">
+            <div v-if="m.role === 'user'" class="self-end max-w-[85%] px-2 py-1 rounded-lg bg-primary-500 text-white text-xs whitespace-pre-wrap">
+              {{ m.text }}
+            </div>
+            <div v-else-if="m.role === 'image'" class="self-start max-w-[85%]">
+              <DownloadableImage
+                :src="m.url"
+                alt="Refined output"
+                class="w-full h-auto object-contain rounded bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700"
+              />
+            </div>
+            <div v-else class="self-start max-w-[85%] px-2 py-1 rounded-lg bg-red-100 dark:bg-red-900/40 text-red-700 dark:text-red-300 text-xs whitespace-pre-wrap border border-red-200 dark:border-red-800">
+              {{ m.text }}
+            </div>
+          </template>
+          <div v-if="chatLoading" class="self-start text-[11px] text-gray-500 dark:text-gray-400 italic">
+            Refining…
+          </div>
+        </div>
+        <div class="flex items-end gap-2">
+          <UTextarea
+            v-model="chatInput"
+            placeholder="Describe a refinement (Enter = send, Shift+Enter = newline)"
+            class="flex-1"
+            :rows="1"
+            autoresize
+            :disabled="chatLoading"
+            @keydown="onChatKeydown"
+          />
+          <UButton
+            size="xs"
+            :loading="chatLoading"
+            :disabled="chatLoading || !chatInput.trim() || !latestImage"
+            @click="sendRefine"
+          >
+            Send
+          </UButton>
+        </div>
       </div>
     </div>
   </div>
