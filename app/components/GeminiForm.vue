@@ -3,8 +3,6 @@ const data = useDataStore()
 const prompt = ref('')
 const loading = ref(false)
 const errorMsg = ref<string | null>(null)
-const temperature = ref(1)
-const topP = ref(0.95)
 
 // Fetch all image-capable models from the gateway (across providers).
 type ModelPricing = {
@@ -89,10 +87,10 @@ const selectedPricingText = computed(() => {
   return `${parts.join(' · ')} per 1M tokens`
 })
 
-// Detect the nano-banana family (Gemini 3 pro image preview) for nano-only options.
+// Detect the nano-banana family (Gemini 3 Pro Image) for nano-only options.
 const nanoBananaModelId = computed(() => {
   const items = modelsFetch.data.value?.items || []
-  const exact = items.find(m => m.id === 'google/gemini-3-pro-image-preview')
+  const exact = items.find(m => m.id === 'google/gemini-3-pro-image')
   if (exact) return exact.id
   const match = items.find(m => /3[-_]?pro.*image/i.test(m.id) || /nano\s*banana/i.test(m.name))
   return match?.id
@@ -191,10 +189,6 @@ onBeforeUnmount(() => {
 async function submit() {
   if (loading.value) return
   errorMsg.value = null
-  if (data.inputImages.length === 0) {
-    errorMsg.value = 'Please select at least one input image.'
-    return
-  }
   try {
     loading.value = true
     startTimer()
@@ -208,8 +202,6 @@ async function submit() {
             modelImages: data.models,
             model: data.selectedModel || undefined,
             responseModalities: ['IMAGE'],
-            temperature: temperature.value,
-            topP: topP.value,
             // Only include imageConfig if nanoBananaPro is selected
             imageConfig: isNanoBananaSelected.value ? {
               // Map sentinel or cleared value to undefined so the model decides
@@ -243,7 +235,7 @@ async function submit() {
           <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
           <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path>
         </svg>
-        <span class="text-sm text-gray-700 dark:text-gray-200">Generating with Gemini…</span>
+        <span class="text-sm text-gray-700 dark:text-gray-200">Generating...</span>
         <span class="text-xs font-mono text-gray-500 dark:text-gray-400">Elapsed {{ elapsedLabel }}</span>
       </div>
     </div>
@@ -289,7 +281,7 @@ async function submit() {
           <USelect
               v-model="data.selectedModel"
               :items="modelOptions"
-              placeholder="Select a Gemini model"
+              placeholder="Select model"
           />
           <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">Using: {{ data.selectedModel }}</p>
           <p v-if="selectedPricingText" class="mt-0.5 text-xs text-gray-500 dark:text-gray-400">
@@ -317,16 +309,6 @@ async function submit() {
           />
           <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">Optional. Higher values take longer.</p>
         </div>
-        <div>
-          <p>Temperature: {{temperature}}</p>
-          <p class="text-sm">Creativity allowed in the responses</p>
-          <USlider v-model="temperature" :min="0" :max="1" :step="0.01" tooltip/>
-        </div>
-        <div>
-          <p>topP: {{topP}}</p>
-          <p class="text-sm">Probability threshold for top-p sampling</p>
-          <USlider v-model="topP" :min="0" :max="1" :step="0.01" tooltip/>
-        </div>
       </div>
       <div class="mt-2">
         <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Prompt</label>
@@ -334,7 +316,7 @@ async function submit() {
                    autoresize/>
       </div>
       <div class="flex items-center gap-2 justify-end">
-        <UButton class="w-full" @click="submit()" :disabled="data.inputImages.length === 0 || loading">
+        <UButton class="w-full" @click="submit()" :disabled="loading">
           <span v-if="loading">Submitting...</span>
           <span v-else>Submit</span>
         </UButton>

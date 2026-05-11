@@ -24,6 +24,33 @@ export type ListModelsOpts = {
     search?: string
 }
 
+export type ImageGenerationUsage = {
+    inputTokens?: number
+    outputTokens?: number
+    totalTokens?: number
+    cachedInputTokens?: number
+    reasoningTokens?: number
+    raw?: unknown
+}
+
+export type ImageGenerationBilling = {
+    model?: string
+    inputTokens?: number
+    outputTokens?: number
+    totalTokens?: number
+    cachedInputTokens?: number
+    reasoningTokens?: number
+    priceUsd?: string
+    gatewayGenerationId?: string
+    usageJson?: Record<string, unknown>
+}
+
+export type GeneratedImage = {
+    buffer: Buffer
+    mimeType: string
+    billing: ImageGenerationBilling
+}
+
 let _gateway: ReturnType<typeof createGateway> | null = null
 let _modelCache: { at: number; items: GatewayModelInfo[] } | null = null
 const MODEL_CACHE_TTL_MS = 10 * 60 * 1000
@@ -101,6 +128,97 @@ export async function useGateway() {
         return all.find(m => m.id === id)
     }
 
+    function asNumber(value: unknown): number | undefined {
+        return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+    }
+
+    function normalizeUsage(usage: any): ImageGenerationUsage {
+        if (!usage || typeof usage !== 'object') return {}
+        return {
+            inputTokens: asNumber(usage.inputTokens),
+            outputTokens: asNumber(usage.outputTokens),
+            totalTokens: asNumber(usage.totalTokens),
+            cachedInputTokens: asNumber(usage.cachedInputTokens ?? usage.inputTokenDetails?.cacheReadTokens),
+            reasoningTokens: asNumber(usage.reasoningTokens ?? usage.outputTokenDetails?.reasoningTokens),
+            raw: usage.raw,
+        }
+    }
+
+    function getGatewayGenerationId(providerMetadata: any): string | undefined {
+        const id = providerMetadata?.gateway?.generationId
+        return typeof id === 'string' && id.length > 0 ? id : undefined
+    }
+
+    function priceTokenCount(count: number | undefined, perTokenUsd: string | undefined): number {
+        if (count == null || !perTokenUsd) return 0
+        const price = Number(perTokenUsd)
+        return Number.isFinite(price) ? count * price : 0
+    }
+
+    function estimatePriceUsd(usage: ImageGenerationUsage, pricing?: GatewayModelInfo['pricing']): string | undefined {
+        if (!pricing) return undefined
+        const cached = usage.cachedInputTokens
+        const uncachedInputTokens = cached == null
+            ? usage.inputTokens
+            : Math.max((usage.inputTokens ?? 0) - cached, 0)
+        const total =
+            priceTokenCount(uncachedInputTokens, pricing.input) +
+            priceTokenCount(cached, pricing.cachedInputTokens ?? pricing.input) +
+            priceTokenCount(usage.outputTokens, pricing.output)
+        return total > 0 ? total.toFixed(8) : undefined
+    }
+
+    async function getActualGatewayBilling(generationId: string | undefined) {
+        if (!generationId || typeof (gateway as any).getGenerationInfo !== 'function') return undefined
+        try {
+            return await (gateway as any).getGenerationInfo({id: generationId})
+        } catch (e) {
+            // Gateway generation-info can lag or return non-standard errors.
+            // Billing still falls back to model pricing + reported token usage.
+            return undefined
+        }
+    }
+
+    async function buildBilling(modelId: string, usageSource: any, providerMetadata: any): Promise<ImageGenerationBilling> {
+        const usage = normalizeUsage(usageSource)
+        const generationId = getGatewayGenerationId(providerMetadata)
+        const gatewayBilling = await getActualGatewayBilling(generationId)
+        const info = await getModelInfo(modelId)
+
+        const inputTokens = asNumber(gatewayBilling?.promptTokens) ?? usage.inputTokens
+        const outputTokens = asNumber(gatewayBilling?.completionTokens) ?? usage.outputTokens
+        const cachedInputTokens = asNumber(gatewayBilling?.cachedTokens) ?? usage.cachedInputTokens
+        const reasoningTokens = asNumber(gatewayBilling?.reasoningTokens) ?? usage.reasoningTokens
+        const totalTokens = usage.totalTokens ?? (
+            inputTokens != null || outputTokens != null || reasoningTokens != null
+                ? (inputTokens ?? 0) + (outputTokens ?? 0) + (reasoningTokens ?? 0)
+                : undefined
+        )
+        const estimatedPrice = estimatePriceUsd({
+            inputTokens,
+            outputTokens,
+            totalTokens,
+            cachedInputTokens,
+            reasoningTokens,
+        }, info?.pricing)
+
+        return {
+            model: typeof gatewayBilling?.model === 'string' ? gatewayBilling.model : modelId,
+            inputTokens,
+            outputTokens,
+            totalTokens,
+            cachedInputTokens,
+            reasoningTokens,
+            priceUsd: asNumber(gatewayBilling?.totalCost)?.toFixed(8) ?? estimatedPrice,
+            gatewayGenerationId: generationId,
+            usageJson: {
+                usage,
+                ...(gatewayBilling ? {gatewayBilling} : {}),
+                ...(providerMetadata ? {providerMetadata} : {}),
+            },
+        }
+    }
+
     function invalidateModelCache() {
         _modelCache = null
     }
@@ -122,7 +240,7 @@ export async function useGateway() {
      * Image-out via language-model with IMAGE modality (Gemini family).
      * `providerOptions.google` is forwarded by gateway to Google's backend.
      */
-    async function generateImageViaLanguageModel(opts: mainSchema.GenerateOptions & { model: string }) {
+    async function generateImageViaLanguageModel(opts: mainSchema.GenerateOptions & { model: string }): Promise<GeneratedImage> {
         const model: LanguageModel = gateway.languageModel(opts.model)
         const files = await loadInputFiles(opts)
 
@@ -164,7 +282,11 @@ export async function useGateway() {
 
         const imageFile = (response.files || []).find(f => f.mediaType?.startsWith('image/'))
         if (imageFile) {
-            return {buffer: Buffer.from(imageFile.uint8Array), mimeType: imageFile.mediaType || 'image/png'}
+            return {
+                buffer: Buffer.from(imageFile.uint8Array),
+                mimeType: imageFile.mediaType || 'image/png',
+                billing: await buildBilling(response.response?.modelId || opts.model, (response as any).totalUsage ?? response.usage, response.providerMetadata),
+            }
         }
 
         const text = response.text
@@ -190,7 +312,7 @@ export async function useGateway() {
      * Pure image model (modelType === 'image'). Uses experimental_generateImage.
      * Supports input images for providers that allow edit/img2img (e.g. openai/gpt-image-1).
      */
-    async function generateImageViaImageModel(opts: mainSchema.GenerateOptions & { model: string }) {
+    async function generateImageViaImageModel(opts: mainSchema.GenerateOptions & { model: string }): Promise<GeneratedImage> {
         const model = gateway.imageModel(opts.model)
         const files = await loadInputFiles(opts)
 
@@ -212,9 +334,11 @@ export async function useGateway() {
             if (!img) {
                 throw createError({statusCode: 500, statusMessage: 'No image returned'})
             }
+            const responseModelId = res.responses?.[0]?.modelId || opts.model
             return {
                 buffer: Buffer.from(img.uint8Array),
                 mimeType: img.mediaType || 'image/png',
+                billing: await buildBilling(responseModelId, res.usage, res.providerMetadata),
             }
         } catch (e: any) {
             throw createError({
@@ -228,7 +352,7 @@ export async function useGateway() {
     /**
      * Routes to the right call based on modelType. Looks up model info from cache.
      */
-    async function generateAnyImage(opts: mainSchema.GenerateOptions & { model: string }) {
+    async function generateAnyImage(opts: mainSchema.GenerateOptions & { model: string }): Promise<GeneratedImage> {
         const info = await getModelInfo(opts.model)
         if (!info) {
             throw createError({statusCode: 400, statusMessage: `Unknown model: ${opts.model}`})

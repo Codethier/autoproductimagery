@@ -10,37 +10,48 @@ const createdAt = computed(() => {
   return d ? d.toLocaleString() : ''
 })
 
+const generationModelText = computed(() => props.data?.generationModel || '')
+const tokenUsageText = computed(() => {
+  const total = props.data?.totalTokens
+  const input = props.data?.inputTokens
+  const output = props.data?.outputTokens
+  if (total == null && input == null && output == null) return ''
+  const parts: string[] = []
+  if (total != null) parts.push(`${total.toLocaleString()} total`)
+  if (input != null) parts.push(`${input.toLocaleString()} in`)
+  if (output != null) parts.push(`${output.toLocaleString()} out`)
+  return parts.join(' / ')
+})
+const priceText = computed(() => {
+  const price = props.data?.priceUsd ? Number(props.data.priceUsd) : NaN
+  if (!Number.isFinite(price)) return ''
+  return price < 0.01 ? `$${price.toFixed(6)}` : `$${price.toFixed(4)}`
+})
+
 const regenLoading = ref(false)
 const regenCount = ref<number>(1)
 const toast = useToast()
 
-// --- Refinement chat ----------------------------------------------------
-type ChatMsg =
-  | { role: 'user'; text: string }
-  | { role: 'image'; url: string }
-  | { role: 'error'; text: string }
-
-const chatMessages = ref<ChatMsg[]>([])
 const chatInput = ref('')
 const chatLoading = ref(false)
-// Latest image in the refinement chain. Each new refinement uses this as input.
-const latestImage = ref<string | null>(props.data?.outputImage || null)
+// Current output for this card. Regenerate can advance this value.
+const currentImage = ref<string | null>(props.data?.outputImage || null)
 
 watch(
   () => props.data?.outputImage,
   (v) => {
-    if (chatMessages.value.length === 0) latestImage.value = v || null
+    if (!regenLoading.value) currentImage.value = v || null
   }
 )
 
 async function sendRefine() {
   const text = chatInput.value.trim()
   if (!text || chatLoading.value) return
-  if (!latestImage.value) {
+  if (!currentImage.value) {
     toast.add({ title: 'No image to refine', color: 'warning' })
     return
   }
-  chatMessages.value.push({ role: 'user', text })
+  const sourceImage = currentImage.value
   chatInput.value = ''
   chatLoading.value = true
   try {
@@ -48,25 +59,24 @@ async function sendRefine() {
       method: 'POST',
       body: {
         prompt: text,
-        inputImages: [latestImage.value],
+        inputImages: [sourceImage],
         modelImages: [],
+        storeInputImages: false,
         model: dataStore.selectedModel || undefined,
         responseModalities: ['IMAGE'],
       },
     })
     const row = res?.obj?.[0]
     if (row?.outputImage && !row.errors) {
-      latestImage.value = row.outputImage
-      chatMessages.value.push({ role: 'image', url: row.outputImage })
+      toast.add({ title: 'Refinement created' })
+      await refreshNuxtData('systemPrompts')
     } else {
-      const reason = row?.errors || 'Unknown error'
-      chatMessages.value.push({ role: 'error', text: reason })
+      toast.add({ title: 'Refinement failed', description: row?.errors || 'Unknown error', color: 'warning' })
     }
   } catch (e: any) {
-    chatMessages.value.push({ role: 'error', text: e?.data?.statusMessage || e?.message || 'Request failed' })
+    toast.add({ title: 'Refinement failed', description: e?.data?.statusMessage || e?.message || 'Request failed', color: 'warning' })
   } finally {
     chatLoading.value = false
-    await refreshNuxtData('systemPrompts')
   }
 }
 
@@ -81,11 +91,12 @@ async function regenerate() {
   if (regenLoading.value) return
   try {
     regenLoading.value = true
-    const inputImages = Array.isArray(props.data?.serverImages) ? props.data.serverImages : []
+    const storedInputImages = Array.isArray(props.data?.serverImages) ? props.data.serverImages : []
     const modelImages = Array.isArray(props.data?.modelImages) ? props.data.modelImages : []
+    let chainInput = currentImage.value || storedInputImages[0]
 
-    if (inputImages.length === 0) {
-      toast.add({ title: 'Cannot regenerate', description: 'No input images stored for this item.', color: 'warning' })
+    if (!chainInput && storedInputImages.length === 0 && !props.data?.outputImage) {
+      toast.add({ title: 'Cannot regenerate', description: 'No source image stored for this item.', color: 'warning' })
       return
     }
 
@@ -101,7 +112,8 @@ async function regenerate() {
 
     // Run the job count times
     for (let i = 0; i < count; i++) {
-      await $fetch('/api/image-generate', {
+      const inputImages = chainInput ? [chainInput] : storedInputImages
+      const res = await $fetch<{ ok: boolean; obj: SystemPrompt[] }>('/api/image-generate', {
         method: 'POST',
         body: {
           prompt: editedPrompt,
@@ -110,6 +122,13 @@ async function regenerate() {
           responseModalities: ['IMAGE']
         }
       })
+      const row = res?.obj?.[0]
+      if (row?.outputImage && !row.errors) {
+        currentImage.value = row.outputImage
+        chainInput = row.outputImage
+      } else {
+        throw new Error(row?.errors || 'Unknown generation error')
+      }
     }
 
     toast.add({ title: 'Regeneration started', description: `Created ${count} job${count > 1 ? 's' : ''}.` })
@@ -129,7 +148,7 @@ async function regenerate() {
   >
     <div v-if="props.data?.outputImage" class="relative">
       <DownloadableImage
-        :src="props.data.outputImage"
+        :src="currentImage"
         :alt="props.data?.TextPrompt || 'Output image'"
         class="w-full h-auto object-contain bg-gray-50 dark:bg-gray-800"
       />
@@ -148,6 +167,24 @@ async function regenerate() {
       <p class="text-sm font-medium text-gray-900 dark:text-gray-100 line-clamp-3" :title="props.data?.TextPrompt">
         {{ props.data?.TextPrompt }}
       </p>
+
+      <div
+        v-if="generationModelText || tokenUsageText || priceText"
+        class="grid grid-cols-1 gap-1 text-[11px] text-gray-600 dark:text-gray-400 bg-gray-50 dark:bg-gray-800/70 rounded p-2"
+      >
+        <div v-if="generationModelText">
+          <span class="font-medium text-gray-700 dark:text-gray-300">Model:</span>
+          {{ generationModelText }}
+        </div>
+        <div v-if="tokenUsageText">
+          <span class="font-medium text-gray-700 dark:text-gray-300">Tokens:</span>
+          {{ tokenUsageText }}
+        </div>
+        <div v-if="priceText">
+          <span class="font-medium text-gray-700 dark:text-gray-300">Price:</span>
+          {{ priceText }}
+        </div>
+      </div>
 
       <div v-if="props.data?.errors" class="flex items-start gap-2 text-xs text-red-700 dark:text-red-400 bg-red-50 dark:bg-red-900/20 p-2 rounded border border-red-200 dark:border-red-800">
         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-4 h-4 mt-0.5">
@@ -184,7 +221,7 @@ async function regenerate() {
 
       <div class="flex items-center justify-between">
         <div class="flex items-center gap-2">
-          <UButton size="xs" :loading="regenLoading" :disabled="regenLoading || !(props.data?.serverImages?.length)" @click="regenerate">
+          <UButton size="xs" :loading="regenLoading" :disabled="regenLoading || (!currentImage && !(props.data?.serverImages?.length))" @click="regenerate">
             Regenerate
           </UButton>
           <div class="flex items-center gap-1 text-[11px] text-gray-600 dark:text-gray-300">
@@ -196,36 +233,13 @@ async function regenerate() {
         <span class="text-[11px] text-gray-500 dark:text-gray-400">{{ createdAt }}</span>
       </div>
 
-      <!-- Refinement chat -->
+      <!-- Standalone refinement -->
       <div v-if="props.data?.outputImage" class="mt-2 border-t border-gray-200 dark:border-gray-800 pt-2">
         <div class="text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Refine</div>
-        <div
-          v-if="chatMessages.length"
-          class="flex flex-col gap-2 max-h-72 overflow-y-auto pr-1 mb-2"
-        >
-          <template v-for="(m, idx) in chatMessages" :key="idx">
-            <div v-if="m.role === 'user'" class="self-end max-w-[85%] px-2 py-1 rounded-lg bg-primary-500 text-white text-xs whitespace-pre-wrap">
-              {{ m.text }}
-            </div>
-            <div v-else-if="m.role === 'image'" class="self-start max-w-[85%]">
-              <DownloadableImage
-                :src="m.url"
-                alt="Refined output"
-                class="w-full h-auto object-contain rounded bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700"
-              />
-            </div>
-            <div v-else class="self-start max-w-[85%] px-2 py-1 rounded-lg bg-red-100 dark:bg-red-900/40 text-red-700 dark:text-red-300 text-xs whitespace-pre-wrap border border-red-200 dark:border-red-800">
-              {{ m.text }}
-            </div>
-          </template>
-          <div v-if="chatLoading" class="self-start text-[11px] text-gray-500 dark:text-gray-400 italic">
-            Refining…
-          </div>
-        </div>
         <div class="flex items-end gap-2">
           <UTextarea
             v-model="chatInput"
-            placeholder="Describe a refinement (Enter = send, Shift+Enter = newline)"
+            placeholder="Describe a refinement"
             class="flex-1"
             :rows="1"
             autoresize
@@ -235,7 +249,7 @@ async function regenerate() {
           <UButton
             size="xs"
             :loading="chatLoading"
-            :disabled="chatLoading || !chatInput.trim() || !latestImage"
+            :disabled="chatLoading || !chatInput.trim() || !currentImage"
             @click="sendRefine"
           >
             Send

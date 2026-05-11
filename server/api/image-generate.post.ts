@@ -2,7 +2,11 @@ import type {GenerateOptions} from "~~/schemas/main.dto";
 import {useDB} from "~~/server/utils/useDB";
 import {useGateway} from "~~/server/utils/useGateway";
 
-const DEFAULT_MODEL = 'google/gemini-2.5-flash-image-preview'
+const DEFAULT_MODEL = 'google/gemini-2.5-flash-image'
+const MODEL_ALIASES: Record<string, string> = {
+    'google/gemini-2.5-flash-image-preview': 'google/gemini-2.5-flash-image',
+    'google/gemini-3-pro-image-preview': 'google/gemini-3-pro-image',
+}
 
 export default defineEventHandler(async (event) => {
     useAuth(event)
@@ -10,7 +14,8 @@ export default defineEventHandler(async (event) => {
     const gw = await useGateway()
     const body = await readBody<GenerateOptions>(event)
 
-    const model = body.model || DEFAULT_MODEL
+    const requestedModel = body.model || DEFAULT_MODEL
+    const model = MODEL_ALIASES[requestedModel] || requestedModel
     if (!model.includes('/')) {
         throw createError({
             statusCode: 400,
@@ -18,14 +23,18 @@ export default defineEventHandler(async (event) => {
         })
     }
 
+    const inputImages = Array.isArray(body.inputImages) ? body.inputImages : []
+    const generationInputs: Array<string | null> = inputImages.length > 0 ? inputImages : [null]
+
     const results = await Promise.all(
-        body.inputImages.map(async (i) => {
-            const job: GenerateOptions = {...body, inputImages: [i]}
+        generationInputs.map(async (i) => {
+            const jobInputImages = i ? [i] : []
+            const job: GenerateOptions = {...body, inputImages: jobInputImages}
             try {
                 const result = await gw.generateAnyImage({...job, model})
                 return {ok: true, result, inputImage: i}
             } catch (e: any) {
-                const refusedImages = e?.data?.refusedImages || [i]
+                const refusedImages = e?.data?.refusedImages || jobInputImages
                 const reason = e?.data?.reason || e?.statusMessage || e?.message || 'unknown'
                 return {ok: false, inputImage: i, refusedImages, reason}
             }
@@ -68,13 +77,19 @@ export default defineEventHandler(async (event) => {
             await fs.writeFile(fullPath, result.buffer)
             savedUrl = `/images/output/${fname}`
         }
-        const recordData: GenerateOptions = {...body, inputImages: [r.inputImage]}
+        const storedInputImages = body.storeInputImages === false
+            ? []
+            : r.inputImage ? [r.inputImage] : []
+        const recordData: GenerateOptions = {...body, inputImages: storedInputImages}
+        recordData.model = model
         let errMsg: string | undefined = undefined
+        let billing = result?.billing || {model}
         if (!r?.ok) {
             recordData.prompt = 'Model refused these images' + (r?.reason ? ` (${r.reason})` : '')
             errMsg = r?.reason || 'unknown'
+            billing = {model}
         }
-        const q = await db.createSystemPrompt(recordData, savedUrl, errMsg)
+        const q = await db.createSystemPrompt(recordData, savedUrl, errMsg, billing)
         objects.push(q)
     }
     return {ok: true, obj: objects}

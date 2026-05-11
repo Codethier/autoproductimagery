@@ -7,13 +7,10 @@ export type GenerateOptions = {
     responseModalities?: Array<'IMAGE' | 'TEXT'>
     inputImages: Array<string>
     modelImages?: Array<string>
+    storeInputImages?: boolean
     safetySettings: any
     imageConfig?: imageConfig
 
-    topP?: number
-    // Probability threshold for top-p sampling , 0.00 --> 1.00
-    temperature?: number
-    // Creativity allowed in the responses 0.00 --> 1.00
     maxOutputTokens?: number
 }
 
