@@ -24,7 +24,7 @@ Upload product or reference images, choose an image-capable model from Vercel AI
 - A Vercel AI Gateway API key
 - A local SQLite database path
 
-This project now uses Vercel AI Gateway through the Vercel AI SDK. A direct Gemini API key is no longer used by the current generation flow.
+This project uses Vercel AI Gateway through the Vercel AI SDK for all active generation requests.
 
 ## Environment
 
