@@ -1,5 +1,9 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+
+defineOptions({
+  inheritAttrs: false
+})
 
 const props = withDefaults(defineProps<{
   src: string
@@ -7,11 +11,15 @@ const props = withDefaults(defineProps<{
   filename?: string
   downloadOnClick?: boolean
   showHoverIcon?: boolean
+  lazy?: boolean
+  lazyRootMargin?: string
 }>(), {
   alt: '',
   filename: undefined,
   downloadOnClick: true,
-  showHoverIcon: true
+  showHoverIcon: true,
+  lazy: true,
+  lazyRootMargin: '600px 0px'
 })
 
 const emit = defineEmits<{
@@ -28,6 +36,69 @@ const actualSrc = computed(() => {
   const withLead = s.startsWith('/') ? s : '/' + s
   // Prefix with our file-serving endpoint
   return '/api/data' + withLead
+})
+
+const imageEl = ref<HTMLImageElement | null>(null)
+const shouldLoad = ref(!props.lazy)
+let observer: IntersectionObserver | null = null
+
+const visibleSrc = computed(() => shouldLoad.value ? actualSrc.value : undefined)
+
+function disconnectObserver() {
+  observer?.disconnect()
+  observer = null
+}
+
+function markForLoad() {
+  shouldLoad.value = true
+  disconnectObserver()
+}
+
+function observeImage() {
+  disconnectObserver()
+
+  if (!props.lazy || shouldLoad.value) {
+    shouldLoad.value = true
+    return
+  }
+
+  if (typeof window === 'undefined' || !imageEl.value) return
+
+  if (!('IntersectionObserver' in window)) {
+    markForLoad()
+    return
+  }
+
+  observer = new IntersectionObserver((entries) => {
+    if (entries.some(entry => entry.isIntersecting)) {
+      markForLoad()
+    }
+  }, {
+    rootMargin: props.lazyRootMargin,
+    threshold: 0.01
+  })
+
+  observer.observe(imageEl.value)
+}
+
+onMounted(() => {
+  observeImage()
+})
+
+onBeforeUnmount(() => {
+  disconnectObserver()
+})
+
+watch(actualSrc, async () => {
+  shouldLoad.value = !props.lazy
+  await nextTick()
+  observeImage()
+})
+
+watch(() => props.lazy, async () => {
+  shouldLoad.value = !props.lazy
+  await nextTick()
+  observeImage()
 })
 
 function filenameFromUrl(url: string): string {
@@ -108,13 +179,13 @@ function onKeydown(e: KeyboardEvent) {
     class="relative inline-block group select-none"
     :aria-label="alt || 'image'"
     :title="alt"
-    role="button"
-    tabindex="0"
+    :role="downloadOnClick ? 'button' : undefined"
+    :tabindex="downloadOnClick ? 0 : undefined"
     @click="downloadImage"
     @keydown="onKeydown"
   >
     <!-- Actual image behaves like a normal <img> via $attrs forwarding -->
-    <img loading="lazy" :src="actualSrc" :alt="alt" v-bind="$attrs" />
+    <img ref="imageEl" loading="lazy" decoding="async" :src="visibleSrc" :alt="alt" v-bind="$attrs" />
 
     <!-- Hover overlay with transparent black gradient and download icon -->
     <span v-if="showHoverIcon"

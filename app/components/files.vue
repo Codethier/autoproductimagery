@@ -192,7 +192,13 @@ function clearImageSelection() {
       </div>
       <div v-for="file of items.data.value?.files"
            class="text-center text-balance flex flex-col gap-2 justify-center items-center w-full h-full">
-        <img :src="`api/data${file.url}`" class="w-full object-contain">
+        <DownloadableImage
+            :src="file.url"
+            :alt="file.name"
+            :download-on-click="false"
+            :show-hover-icon="false"
+            class="aspect-square w-full object-contain rounded-md bg-gray-50 dark:bg-gray-800"
+        />
         <p class="w-full truncate text-center">{{ file.name }}</p>
         <UCheckbox v-if="props.isModelSelect" v-model="file.selectedModel"
                    @change="syncSelectToStore(file)"></UCheckbox>
