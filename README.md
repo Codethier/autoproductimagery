@@ -5,6 +5,14 @@ AI-powered product image generation for batch product workflows.
 Upload product or reference images, choose an image-capable model from Vercel AI Gateway, write one prompt, and generate outputs across all selected inputs. You can also generate from text only, regenerate previous outputs, and refine an existing image into a new standalone result.
 
 ![Example generated image](public/examples/image.png)
+
+
+
+----------------------------------------------------------------
+
+
+
+
 ![Example generated image](public/examples/image2.png)
 
 ## Features
@@ -71,17 +79,20 @@ Preview the production build:
 npm run preview
 ```
 
-## Run With Docker
+## Run With `node:latest`
 
-Create your `.env` file first, then run:
+No published app image is required. Use the official Node image and mount this repository into the container.
+
+Create your `.env` file first. Then run the app from the project root:
 
 ```bash
 docker run --rm \
   -p 3000:3000 \
+  -w /app \
   --env-file .env \
-  -v /folderOnYourMachine/data:/app/data \
-  -v /folderOnYourMachine/sqlite:/app/sqlite \
-  codethier/autoproductimagery:latest
+  -v "$PWD:/app" \
+  node:latest \
+  sh -lc "npm ci && npm run drizzle:migrate && npm run build && node .output/server/index.mjs"
 ```
 
 On Windows PowerShell:
@@ -89,10 +100,25 @@ On Windows PowerShell:
 ```powershell
 docker run --rm `
   -p 3000:3000 `
+  -w /app `
   --env-file .env `
-  -v C:\path\to\data:/app/data `
-  -v C:\path\to\sqlite:/app/sqlite `
-  codethier/autoproductimagery:latest
+  -v "${PWD}:/app" `
+  node:latest `
+  sh -lc "npm ci && npm run drizzle:migrate && npm run build && node .output/server/index.mjs"
+```
+
+The bind mount keeps `data/images` and `sqlite/drizzle.db` on your machine because they are normal project folders. Open `http://localhost:3000` after the server starts.
+
+For development with hot reload:
+
+```bash
+docker run --rm \
+  -p 3000:3000 \
+  -w /app \
+  --env-file .env \
+  -v "$PWD:/app" \
+  node:latest \
+  sh -lc "npm install && npm run dev -- --host 0.0.0.0"
 ```
 
 ## Database
