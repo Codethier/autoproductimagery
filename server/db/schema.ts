@@ -15,6 +15,7 @@ export const systemPrompt = sqliteTable("systemPrompt", {
     cachedInputTokens: integer("cachedInputTokens"),
     reasoningTokens: integer("reasoningTokens"),
     priceUsd: text("priceUsd"),
+    priceSource: text("priceSource"),
     gatewayGenerationId: text("gatewayGenerationId"),
     usageJson: text("usageJson", {mode: "json"}).$type<Record<string, unknown>>(),
     createdAt: text("createdAt").default(sql`CURRENT_TIMESTAMP`).notNull(),

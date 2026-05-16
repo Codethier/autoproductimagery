@@ -1,5 +1,5 @@
 import {z} from 'zod'
-import {isImageCapableModel, useGateway, type GatewayModelInfo} from '~~/server/utils/useGateway'
+import {enrichImageModelInfo, isImageCapableModel, useGateway, type GatewayModelInfo} from '~~/server/utils/useGateway'
 
 const QuerySchema = z.object({
     provider: z.string().min(1).max(64).optional(),
@@ -14,6 +14,8 @@ export type ImageModelInfo = {
     provider: string
     modelType: 'language' | 'image'
     pricing?: GatewayModelInfo['pricing']
+    pricingDetails?: GatewayModelInfo['pricingDetails']
+    capabilities?: GatewayModelInfo['capabilities']
 }
 
 export default defineEventHandler(async (event) => {
@@ -38,6 +40,7 @@ export default defineEventHandler(async (event) => {
 
     let items: ImageModelInfo[] = all
         .filter(isImageCapableModel)
+        .map(m => enrichImageModelInfo(m))
         .map(m => ({
             id: m.id,
             name: m.name,
@@ -45,6 +48,8 @@ export default defineEventHandler(async (event) => {
             provider: m.provider,
             modelType: (m.modelType === 'image' ? 'image' : 'language') as 'language' | 'image',
             pricing: m.pricing,
+            pricingDetails: m.pricingDetails,
+            capabilities: m.capabilities,
         }))
 
     if (provider) items = items.filter(m => m.provider === provider)

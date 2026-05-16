@@ -27,10 +27,17 @@ const priceText = computed(() => {
   if (!Number.isFinite(price)) return ''
   return price < 0.01 ? `$${price.toFixed(6)}` : `$${price.toFixed(4)}`
 })
+const priceSourceText = computed(() => {
+  const source = (props.data as any)?.priceSource
+  if (source === 'gateway') return 'Gateway'
+  if (source === 'estimate') return 'Estimated'
+  return ''
+})
 
 const regenLoading = ref(false)
 const regenCount = ref<number>(1)
 const toast = useToast()
+const billingLoading = ref(false)
 
 const chatInput = ref('')
 const chatLoading = ref(false)
@@ -80,6 +87,24 @@ async function sendRefine() {
   }
 }
 
+async function refreshBilling() {
+  if (billingLoading.value || !props.data?.id) return
+  billingLoading.value = true
+  try {
+    await $fetch(`/api/systemprompts/${props.data.id}/billing-refresh`, { method: 'POST' })
+    toast.add({ title: 'Cost refreshed' })
+    await refreshNuxtData('systemPrompts')
+  } catch (e: any) {
+    toast.add({
+      title: 'Cost unavailable',
+      description: e?.data?.statusMessage || e?.message || 'Gateway billing is not ready yet.',
+      color: 'warning'
+    })
+  } finally {
+    billingLoading.value = false
+  }
+}
+
 function onChatKeydown(e: KeyboardEvent) {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault()
@@ -119,6 +144,7 @@ async function regenerate() {
           prompt: editedPrompt,
           inputImages,
           modelImages,
+          model: props.data?.generationModel || dataStore.selectedModel || undefined,
           responseModalities: ['IMAGE']
         }
       })
@@ -180,9 +206,24 @@ async function regenerate() {
           <span class="font-medium text-gray-700 dark:text-gray-300">Tokens:</span>
           {{ tokenUsageText }}
         </div>
-        <div v-if="priceText">
-          <span class="font-medium text-gray-700 dark:text-gray-300">Price:</span>
-          {{ priceText }}
+        <div v-if="priceText || props.data?.gatewayGenerationId" class="flex items-center justify-between gap-2">
+          <span>
+            <span class="font-medium text-gray-700 dark:text-gray-300">Price:</span>
+            <span v-if="priceText">
+              {{ priceText }}<span v-if="priceSourceText"> ({{ priceSourceText }})</span>
+            </span>
+            <span v-else>Pending</span>
+          </span>
+          <UButton
+              v-if="props.data?.gatewayGenerationId && priceSourceText !== 'Gateway'"
+              size="xs"
+              variant="ghost"
+              :loading="billingLoading"
+              :disabled="billingLoading"
+              @click="refreshBilling"
+          >
+            Refresh cost
+          </UButton>
         </div>
       </div>
 

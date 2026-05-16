@@ -12,6 +12,29 @@ type ModelPricing = {
   cacheCreationInputTokens?: string
 } | null
 
+type PricingComponent = {
+  kind: 'token' | 'fixed-image' | 'megapixel' | 'unknown'
+  label: string
+  amountUsd?: number
+  unit?: 'token' | 'image' | 'megapixel'
+  source: 'gateway-config' | 'vercel-catalog' | 'inferred'
+  note?: string
+}
+
+type PricingDetails = {
+  method: 'token' | 'fixed-image' | 'megapixel' | 'mixed' | 'unknown'
+  summary: string
+  components: PricingComponent[]
+  estimateNote: string
+}
+
+type ModelCapabilities = {
+  output: Array<'image' | 'text'>
+  input: Array<'text' | 'image' | 'multiple-images'>
+  operations: Array<'text-to-image' | 'image-edit' | 'image-to-image' | 'multi-reference'>
+  warnings: string[]
+}
+
 type ImageModelInfo = {
   id: string
   name: string
@@ -19,6 +42,8 @@ type ImageModelInfo = {
   provider: string
   modelType: 'language' | 'image'
   pricing?: ModelPricing
+  pricingDetails?: PricingDetails
+  capabilities?: ModelCapabilities
 }
 const modelsFetch = useFetch<{ ok: boolean; items: ImageModelInfo[] }>('/api/image-models', {
   key: 'image-models',
@@ -37,34 +62,52 @@ function pricingLabel(p?: ModelPricing) {
   const inp = fmtPerMillion(p.input)
   const out = fmtPerMillion(p.output)
   if (!inp && !out) return ''
-  return ` — ${inp ?? '?'} in / ${out ?? '?'} out per 1M tok`
+  return ` - ${inp ?? '?'} in / ${out ?? '?'} out per 1M tok`
 }
 
 function priceScore(p?: ModelPricing) {
   if (!p) return -1
   const inp = Number(p.input) || 0
   const out = Number(p.output) || 0
-  // Weight output 4x — typical chat ratio, also avoids zero-input image models tying.
+  // Weight output 4x - typical chat ratio, also avoids zero-input image models tying.
   const score = inp + out * 4
   return score > 0 ? score : -1
+}
+
+function modelPriceScore(m: ImageModelInfo) {
+  const fixed = m.pricingDetails?.components.find(c => c.kind === 'fixed-image' && c.amountUsd != null)
+  if (fixed?.amountUsd) return fixed.amountUsd
+  const perMp = m.pricingDetails?.components.find(c => c.kind === 'megapixel' && c.amountUsd != null)
+  if (perMp?.amountUsd) return perMp.amountUsd / 2
+  return priceScore(m.pricing)
+}
+
+function acceptsImageInput(m: ImageModelInfo) {
+  return !!m.capabilities?.input?.includes('image')
 }
 
 const sortedModels = computed<ImageModelInfo[]>(() => {
   const items = [...(modelsFetch.data.value?.items || [])]
   items.sort((a, b) => {
-    const da = priceScore(a.pricing)
-    const db = priceScore(b.pricing)
-    if (db !== da) return db - da // expensive first; unpriced (-1) sink to bottom
+    const aImageInput = acceptsImageInput(a) ? 1 : 0
+    const bImageInput = acceptsImageInput(b) ? 1 : 0
+    if (bImageInput !== aImageInput) return bImageInput - aImageInput
+
+    const da = modelPriceScore(a)
+    const db = modelPriceScore(b)
+    if (db !== da) return db - da // expensive first within capability group; unpriced (-1) sinks.
+
     return a.id.localeCompare(b.id)
   })
   return items
 })
 
-type ModelOption = { label: string; value: string }
+type ModelOption = { label: string; value: string; icon: string }
 const modelOptions = computed<ModelOption[]>(() => {
   return sortedModels.value.map(m => ({
-    label: `${m.provider} · ${m.name || m.id.split('/').pop()}${pricingLabel(m.pricing)}`,
-    value: m.id
+    label: `${m.provider} - ${m.name || m.id.split('/').pop()}`,
+    value: m.id,
+    icon: acceptsImageInput(m) ? 'i-lucide-images' : 'i-lucide-type'
   }))
 })
 
@@ -74,6 +117,8 @@ const selectedModelInfo = computed<ImageModelInfo | undefined>(() => {
 })
 
 const selectedPricingText = computed(() => {
+  const details = selectedModelInfo.value?.pricingDetails
+  if (details?.summary) return details.summary
   const p = selectedModelInfo.value?.pricing
   if (!p) return null
   const inp = fmtPerMillion(p.input)
@@ -84,7 +129,43 @@ const selectedPricingText = computed(() => {
   if (out) parts.push(`${out} output`)
   if (cached) parts.push(`${cached} cached input`)
   if (!parts.length) return null
-  return `${parts.join(' · ')} per 1M tokens`
+  return `${parts.join(' - ')} per 1M tokens`
+})
+
+const selectedPricingMethod = computed(() => selectedModelInfo.value?.pricingDetails?.method || 'unknown')
+const selectedPricingComponents = computed(() => selectedModelInfo.value?.pricingDetails?.components || [])
+const selectedCapabilities = computed(() => selectedModelInfo.value?.capabilities)
+const selectedWarnings = computed(() => selectedCapabilities.value?.warnings || [])
+const selectedCapabilityPills = computed(() => {
+  const caps = selectedCapabilities.value
+  if (!caps) return []
+  return [
+    ...caps.operations.map(v => v.replaceAll('-', ' ')),
+    ...caps.input.filter(v => v !== 'text').map(v => v.replaceAll('-', ' ') + ' input'),
+    ...caps.output.filter(v => v !== 'image').map(v => v + ' output')
+  ]
+})
+const estimatedOutputCount = computed(() => Math.max(1, data.inputImages.length))
+const selectedCostEstimate = computed(() => {
+  const components = selectedPricingComponents.value
+  const fixed = components.find(c => c.kind === 'fixed-image' && c.amountUsd != null)
+  if (fixed?.amountUsd != null) {
+    const total = fixed.amountUsd * estimatedOutputCount.value
+    return `Estimate: $${total.toFixed(total < 0.01 ? 4 : 2)} for ${estimatedOutputCount.value} image${estimatedOutputCount.value > 1 ? 's' : ''}`
+  }
+  const mp = components.find(c => c.kind === 'megapixel')
+  if (mp) return `Estimate needs final dimensions (${mp.label})`
+  const token = components.find(c => c.kind === 'token')
+  if (token) return 'Estimate needs final token usage; exact Gateway cost is stored after generation when available.'
+  return 'Exact cost will be queried from the Gateway generation record after generation when available.'
+})
+const inputCapabilityWarning = computed(() => {
+  const hasImageInputs = data.inputImages.length > 0 || data.models.length > 0
+  const caps = selectedCapabilities.value
+  if (!hasImageInputs || !caps) return ''
+  return caps.input.includes('image')
+      ? ''
+      : 'Selected images may be rejected because this model is text-to-image only.'
 })
 
 // Detect the nano-banana family (Gemini 3 Pro Image) for nano-only options.
@@ -275,40 +356,79 @@ async function submit() {
         <DownloadableImage v-for="i in data.inputImages" :key="i" :src="i"
                            class="w-full object-contain rounded-md border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800"/>
       </div>
-      <div class="grid grid-cols-2 gap-8">
-        <div>
-          <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Model</label>
-          <USelect
-              v-model="data.selectedModel"
-              :items="modelOptions"
-              placeholder="Select model"
-          />
-          <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">Using: {{ data.selectedModel }}</p>
-          <p v-if="selectedPricingText" class="mt-0.5 text-xs text-gray-500 dark:text-gray-400">
-            {{ selectedPricingText }}
-          </p>
+      <div class="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_360px] gap-4">
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 content-start">
+          <div class="sm:col-span-2">
+            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Model</label>
+            <USelect
+                v-model="data.selectedModel"
+                :items="modelOptions"
+                placeholder="Select model"
+            />
+            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400 break-all">Using: {{ data.selectedModel }}</p>
+          </div>
+          <!-- nanoBananaPro-only options -->
+          <div v-if="isNanoBananaSelected">
+            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Aspect ratio</label>
+            <USelect
+                v-model="data.imageConfig.aspectRatio"
+                :items="aspectRatioOptions"
+                placeholder="Default (model decides)"
+                clearable
+            />
+            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">Optional. Choose image aspect ratio.</p>
+          </div>
+          <div v-if="isNanoBananaSelected">
+            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Image size</label>
+            <USelect
+                v-model="data.imageConfig.imageSize"
+                :items="imageSizeOptions"
+                placeholder="Default (1K)"
+                clearable
+            />
+            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">Optional. Higher values take longer.</p>
+          </div>
         </div>
-        <!-- nanoBananaPro-only options -->
-        <div v-if="isNanoBananaSelected" class="col-span-1">
-          <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Aspect ratio</label>
-          <USelect
-              v-model="data.imageConfig.aspectRatio"
-              :items="aspectRatioOptions"
-              placeholder="Default (model decides)"
-              clearable
-          />
-          <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">Optional. Choose image aspect ratio.</p>
-        </div>
-        <div v-if="isNanoBananaSelected" class="col-span-1">
-          <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Image size</label>
-          <USelect
-              v-model="data.imageConfig.imageSize"
-              :items="imageSizeOptions"
-              placeholder="Default (1K)"
-              clearable
-          />
-          <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">Optional. Higher values take longer.</p>
-        </div>
+        <aside class="rounded-lg border border-gray-200 dark:border-gray-800 bg-white/70 dark:bg-gray-900/60 p-3 text-sm">
+          <div class="flex items-start justify-between gap-3">
+            <div>
+              <div class="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">Model info</div>
+              <div class="mt-1 font-semibold text-gray-900 dark:text-gray-100">{{ selectedModelInfo?.name || 'No model selected' }}</div>
+            </div>
+            <span class="shrink-0 rounded border border-gray-200 dark:border-gray-700 px-2 py-0.5 text-xs text-gray-600 dark:text-gray-300 capitalize">
+              {{ selectedPricingMethod }}
+            </span>
+          </div>
+          <div class="mt-3 space-y-2 text-xs text-gray-600 dark:text-gray-300">
+            <div v-if="selectedPricingText">
+              <span class="font-medium text-gray-800 dark:text-gray-100">Pricing:</span>
+              {{ selectedPricingText }}
+            </div>
+            <div>
+              <span class="font-medium text-gray-800 dark:text-gray-100">Batch cost:</span>
+              {{ selectedCostEstimate }}
+            </div>
+            <div v-if="selectedCapabilityPills.length" class="flex flex-wrap gap-1.5 pt-1">
+              <span
+                  v-for="cap in selectedCapabilityPills"
+                  :key="cap"
+                  class="rounded border border-gray-200 dark:border-gray-700 px-2 py-0.5 text-[11px] text-gray-700 dark:text-gray-200"
+              >
+                {{ cap }}
+              </span>
+            </div>
+            <div v-if="inputCapabilityWarning" class="rounded border border-amber-200 bg-amber-50 p-2 text-amber-800 dark:border-amber-800 dark:bg-amber-900/20 dark:text-amber-200">
+              {{ inputCapabilityWarning }}
+            </div>
+            <div
+                v-for="warning in selectedWarnings"
+                :key="warning"
+                class="rounded border border-gray-200 bg-gray-50 p-2 text-gray-600 dark:border-gray-800 dark:bg-gray-800/60 dark:text-gray-300"
+            >
+              {{ warning }}
+            </div>
+          </div>
+        </aside>
       </div>
       <div class="mt-2">
         <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Prompt</label>

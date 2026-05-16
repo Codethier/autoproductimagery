@@ -17,6 +17,8 @@ export type GatewayModelInfo = {
         cachedInputTokens?: string
         cacheCreationInputTokens?: string
     } | null
+    pricingDetails?: ImageModelPricingDetails
+    capabilities?: ImageModelCapabilities
 }
 
 export type ListModelsOpts = {
@@ -41,8 +43,32 @@ export type ImageGenerationBilling = {
     cachedInputTokens?: number
     reasoningTokens?: number
     priceUsd?: string
+    priceSource?: 'gateway' | 'estimate' | 'unknown'
     gatewayGenerationId?: string
     usageJson?: Record<string, unknown>
+}
+
+export type ImagePricingComponent = {
+    kind: 'token' | 'fixed-image' | 'megapixel' | 'unknown'
+    label: string
+    amountUsd?: number
+    unit?: 'token' | 'image' | 'megapixel'
+    source: 'gateway-config' | 'vercel-catalog' | 'inferred'
+    note?: string
+}
+
+export type ImageModelPricingDetails = {
+    method: 'token' | 'fixed-image' | 'megapixel' | 'mixed' | 'unknown'
+    summary: string
+    components: ImagePricingComponent[]
+    estimateNote: string
+}
+
+export type ImageModelCapabilities = {
+    output: Array<'image' | 'text'>
+    input: Array<'text' | 'image' | 'multiple-images'>
+    operations: Array<'text-to-image' | 'image-edit' | 'image-to-image' | 'multi-reference'>
+    warnings: string[]
 }
 
 export type GeneratedImage = {
@@ -54,6 +80,28 @@ export type GeneratedImage = {
 let _gateway: ReturnType<typeof createGateway> | null = null
 let _modelCache: { at: number; items: GatewayModelInfo[] } | null = null
 const MODEL_CACHE_TTL_MS = 10 * 60 * 1000
+
+const IMAGE_PRICE_OVERRIDES: Record<string, { kind: 'fixed-image' | 'megapixel'; amountUsd: number; label: string; note?: string }> = {
+    // The AI SDK Gateway config currently exposes these image-only models as
+    // zero token price, while the Vercel catalog shows image-metered pricing.
+    'google/imagen-4.0-fast-generate-001': {
+        kind: 'fixed-image',
+        amountUsd: 0.02,
+        label: '$0.02 / image',
+        note: 'Text-to-image only in the Vercel model page.',
+    },
+    'xai/grok-imagine-image': {
+        kind: 'fixed-image',
+        amountUsd: 0.02,
+        label: '$0.02 / image',
+    },
+    'bfl/flux-2-pro': {
+        kind: 'megapixel',
+        amountUsd: 0.03,
+        label: '$0.03 / output MP',
+        note: 'Depends on output megapixels.',
+    },
+}
 
 function getGateway() {
     if (_gateway) return _gateway
@@ -87,6 +135,136 @@ export function isImageOutputLanguageModel(m: GatewayModelInfo): boolean {
 
 export function isImageCapableModel(m: GatewayModelInfo): boolean {
     return m.modelType === 'image' || isImageOutputLanguageModel(m)
+}
+
+function usdPerMillion(perTokenUsd?: string) {
+    if (!perTokenUsd) return undefined
+    const value = Number(perTokenUsd) * 1_000_000
+    if (!Number.isFinite(value) || value <= 0) return undefined
+    return value
+}
+
+function formatUsd(value: number, fractionDigits = value < 1 ? 3 : 2) {
+    return `$${value.toFixed(fractionDigits)}`
+}
+
+function tokenPricingLabel(pricing: NonNullable<GatewayModelInfo['pricing']>) {
+    const input = usdPerMillion(pricing.input)
+    const output = usdPerMillion(pricing.output)
+    const cached = usdPerMillion(pricing.cachedInputTokens)
+    const parts: string[] = []
+    if (input != null) parts.push(`${formatUsd(input)} input / 1M tokens`)
+    if (output != null) parts.push(`${formatUsd(output)} output / 1M tokens`)
+    if (cached != null) parts.push(`${formatUsd(cached)} cached input / 1M tokens`)
+    return parts.join('; ')
+}
+
+export function getImageModelPricingDetails(model: GatewayModelInfo): ImageModelPricingDetails {
+    const components: ImagePricingComponent[] = []
+    const tokenLabel = model.pricing ? tokenPricingLabel(model.pricing) : ''
+    if (tokenLabel) {
+        components.push({
+            kind: 'token',
+            label: tokenLabel,
+            unit: 'token',
+            source: 'gateway-config',
+        })
+    }
+
+    const override = IMAGE_PRICE_OVERRIDES[model.id]
+    if (override) {
+        components.push({
+            kind: override.kind,
+            amountUsd: override.amountUsd,
+            unit: override.kind === 'fixed-image' ? 'image' : 'megapixel',
+            label: override.label,
+            source: 'vercel-catalog',
+            note: override.note,
+        })
+    }
+
+    const hasPositiveTokenPricing = !!tokenLabel
+    if (model.modelType === 'image' && !hasPositiveTokenPricing && !override) {
+        components.push({
+            kind: 'unknown',
+            label: 'Image-metered pricing',
+            source: 'inferred',
+            note: 'The Gateway config does not expose a token price for this image-only model. Exact cost is queried from the generation record after the request.',
+        })
+    }
+
+    const pricedKinds = new Set(components.map(c => c.kind).filter(k => k !== 'unknown'))
+    const method = pricedKinds.size > 1
+        ? 'mixed'
+        : pricedKinds.has('token')
+            ? 'token'
+            : pricedKinds.has('fixed-image')
+                ? 'fixed-image'
+                : pricedKinds.has('megapixel')
+                    ? 'megapixel'
+                    : 'unknown'
+
+    const summary = components.map(c => c.label).join('; ') || 'Pricing not exposed by Gateway config'
+    const estimateNote = method === 'fixed-image'
+        ? 'Pre-run estimates can be calculated from the number of output images.'
+        : method === 'megapixel'
+            ? 'Pre-run estimates need the final output dimensions.'
+            : method === 'token'
+                ? 'Pre-run estimates need token usage, so the app records the post-run Gateway cost when available.'
+                : 'The app will query the Gateway generation record after each request.'
+
+    return {method, summary, components, estimateNote}
+}
+
+export function getImageModelCapabilities(model: GatewayModelInfo): ImageModelCapabilities {
+    const id = model.id.toLowerCase()
+    const name = model.name.toLowerCase()
+    const output: ImageModelCapabilities['output'] = ['image']
+    const input: ImageModelCapabilities['input'] = ['text']
+    const operations: ImageModelCapabilities['operations'] = ['text-to-image']
+    const warnings: string[] = []
+
+    if (isImageOutputLanguageModel(model)) {
+        output.push('text')
+        input.push('image', 'multiple-images')
+        operations.push('image-edit', 'image-to-image', 'multi-reference')
+    } else if (
+        /gpt-image/.test(id) ||
+        /flux-(?:2|kontext)/.test(id) ||
+        /seedream/.test(id) ||
+        /recraft/.test(id)
+    ) {
+        input.push('image')
+        operations.push('image-edit', 'image-to-image')
+        if (/flux-2|recraft|seedream/.test(id)) {
+            input.push('multiple-images')
+            operations.push('multi-reference')
+        }
+    }
+
+    if (/imagen/.test(id) || /grok-imagine-image/.test(id) || /flux-fast-schnell/.test(id)) {
+        warnings.push('This model is treated as text-to-image only; selected input/model images may be ignored or rejected.')
+    }
+
+    if (model.modelType === 'image' && !model.pricingDetails?.components.some(c => c.kind !== 'unknown')) {
+        warnings.push('Exact image price is not exposed by the AI SDK model config; use post-generation cost refresh for the final charge.')
+    }
+
+    return {
+        output: [...new Set(output)],
+        input: [...new Set(input)],
+        operations: [...new Set(operations)],
+        warnings,
+    }
+}
+
+export function enrichImageModelInfo(model: GatewayModelInfo): GatewayModelInfo {
+    const pricingDetails = getImageModelPricingDetails(model)
+    const withPricing = {...model, pricingDetails}
+    return {
+        ...withPricing,
+        capabilities: getImageModelCapabilities(withPricing),
+    }
 }
 
 export async function useGateway() {
@@ -145,8 +323,23 @@ export async function useGateway() {
     }
 
     function getGatewayGenerationId(providerMetadata: any): string | undefined {
-        const id = providerMetadata?.gateway?.generationId
-        return typeof id === 'string' && id.length > 0 ? id : undefined
+        const direct = providerMetadata?.gateway?.generationId ?? providerMetadata?.gateway?.generation_id
+        if (typeof direct === 'string' && direct.length > 0) return direct
+        const seen = new Set<object>()
+        const visit = (value: unknown): string | undefined => {
+            if (!value || typeof value !== 'object') return undefined
+            if (seen.has(value)) return undefined
+            seen.add(value)
+            for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+                if ((key === 'generationId' || key === 'generation_id' || key === 'id') && typeof nested === 'string' && nested.startsWith('gen_')) {
+                    return nested
+                }
+                const found = visit(nested)
+                if (found) return found
+            }
+            return undefined
+        }
+        return visit(providerMetadata)
     }
 
     function priceTokenCount(count: number | undefined, perTokenUsd: string | undefined): number {
@@ -168,6 +361,12 @@ export async function useGateway() {
         return total > 0 ? total.toFixed(8) : undefined
     }
 
+    function estimateImageMeteredPriceUsd(info: GatewayModelInfo | undefined, outputImages = 1): string | undefined {
+        const component = info?.pricingDetails?.components.find(c => c.kind === 'fixed-image' && c.amountUsd != null)
+        if (!component?.amountUsd) return undefined
+        return (component.amountUsd * Math.max(1, outputImages)).toFixed(8)
+    }
+
     async function getActualGatewayBilling(generationId: string | undefined) {
         if (!generationId || typeof (gateway as any).getGenerationInfo !== 'function') return undefined
         try {
@@ -179,11 +378,37 @@ export async function useGateway() {
         }
     }
 
+    async function getGenerationBilling(generationId: string | undefined, fallbackModel?: string): Promise<ImageGenerationBilling | undefined> {
+        const gatewayBilling = await getActualGatewayBilling(generationId)
+        if (!gatewayBilling) return undefined
+        return {
+            model: typeof gatewayBilling.model === 'string' ? gatewayBilling.model : fallbackModel,
+            inputTokens: asNumber(gatewayBilling.promptTokens),
+            outputTokens: asNumber(gatewayBilling.completionTokens),
+            cachedInputTokens: asNumber(gatewayBilling.cachedTokens),
+            reasoningTokens: asNumber(gatewayBilling.reasoningTokens),
+            totalTokens: (
+                asNumber(gatewayBilling.promptTokens) != null ||
+                asNumber(gatewayBilling.completionTokens) != null ||
+                asNumber(gatewayBilling.reasoningTokens) != null
+            )
+                ? (asNumber(gatewayBilling.promptTokens) ?? 0) +
+                  (asNumber(gatewayBilling.completionTokens) ?? 0) +
+                  (asNumber(gatewayBilling.reasoningTokens) ?? 0)
+                : undefined,
+            priceUsd: asNumber(gatewayBilling.totalCost)?.toFixed(8),
+            priceSource: 'gateway',
+            gatewayGenerationId: generationId,
+            usageJson: {gatewayBilling},
+        }
+    }
+
     async function buildBilling(modelId: string, usageSource: any, providerMetadata: any): Promise<ImageGenerationBilling> {
         const usage = normalizeUsage(usageSource)
         const generationId = getGatewayGenerationId(providerMetadata)
         const gatewayBilling = await getActualGatewayBilling(generationId)
         const info = await getModelInfo(modelId)
+        const enrichedInfo = info ? enrichImageModelInfo(info) : undefined
 
         const inputTokens = asNumber(gatewayBilling?.promptTokens) ?? usage.inputTokens
         const outputTokens = asNumber(gatewayBilling?.completionTokens) ?? usage.outputTokens
@@ -200,7 +425,9 @@ export async function useGateway() {
             totalTokens,
             cachedInputTokens,
             reasoningTokens,
-        }, info?.pricing)
+        }, enrichedInfo?.pricing)
+        const imageMeteredEstimate = estimateImageMeteredPriceUsd(enrichedInfo)
+        const gatewayPrice = asNumber(gatewayBilling?.totalCost)?.toFixed(8)
 
         return {
             model: typeof gatewayBilling?.model === 'string' ? gatewayBilling.model : modelId,
@@ -209,10 +436,12 @@ export async function useGateway() {
             totalTokens,
             cachedInputTokens,
             reasoningTokens,
-            priceUsd: asNumber(gatewayBilling?.totalCost)?.toFixed(8) ?? estimatedPrice,
+            priceUsd: gatewayPrice ?? estimatedPrice ?? imageMeteredEstimate,
+            priceSource: gatewayPrice ? 'gateway' : (estimatedPrice || imageMeteredEstimate ? 'estimate' : 'unknown'),
             gatewayGenerationId: generationId,
             usageJson: {
                 usage,
+                ...(enrichedInfo?.pricingDetails ? {pricingDetails: enrichedInfo.pricingDetails} : {}),
                 ...(gatewayBilling ? {gatewayBilling} : {}),
                 ...(providerMetadata ? {providerMetadata} : {}),
             },
@@ -374,6 +603,7 @@ export async function useGateway() {
         listModels,
         getModelInfo,
         invalidateModelCache,
+        getGenerationBilling,
         generateImageViaLanguageModel,
         generateImageViaImageModel,
         generateAnyImage,
