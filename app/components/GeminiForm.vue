@@ -45,6 +45,29 @@ type ImageModelInfo = {
   pricingDetails?: PricingDetails
   capabilities?: ModelCapabilities
 }
+
+type AiGatewayLog = {
+  id: number
+  systemPromptId?: number | null
+  status: string
+  model: string
+  prompt: string
+  inputImages?: string[] | null
+  modelImages?: string[] | null
+  outputImage?: string | null
+  inputTokens?: number | null
+  outputTokens?: number | null
+  totalTokens?: number | null
+  priceUsd?: string | null
+  priceSource?: string | null
+  gatewayGenerationId?: string | null
+  requestJson?: unknown
+  responseJson?: unknown
+  error?: string | null
+  durationMs?: number | null
+  createdAt: string
+}
+
 const modelsFetch = useFetch<{ ok: boolean; items: ImageModelInfo[] }>('/api/image-models', {
   key: 'image-models',
   default: () => ({ ok: true, items: [] })
@@ -221,6 +244,62 @@ watch(
 )
 
 let pastPrompts = useFetch('/api/systemprompts', {deep: true, key: () => 'systemPrompts',})
+const gatewayLogs = useFetch<{ ok: boolean; items: AiGatewayLog[] }>('/api/ai-gateway-logs?limit=25', {
+  key: 'aiGatewayLogs',
+  immediate: false,
+  default: () => ({ ok: true, items: [] })
+})
+
+const debugLogsOpen = ref(false)
+const expandedLogIds = ref<Set<number>>(new Set())
+const gatewayLogItems = computed(() => gatewayLogs.data.value?.items || [])
+
+watch(debugLogsOpen, async (open) => {
+  if (open && !gatewayLogItems.value.length) {
+    await gatewayLogs.refresh()
+  }
+})
+
+function formatLogTime(value?: string) {
+  return value ? new Date(value).toLocaleString() : ''
+}
+
+function formatLogPrice(value?: string | null, source?: string | null) {
+  const price = value ? Number(value) : NaN
+  if (!Number.isFinite(price)) return source === 'unknown' ? 'Unknown' : ''
+  const amount = price < 0.01 ? `$${price.toFixed(6)}` : `$${price.toFixed(4)}`
+  return source ? `${amount} (${source})` : amount
+}
+
+function formatLogImages(items?: string[] | null) {
+  const count = Array.isArray(items) ? items.length : 0
+  return `${count} image${count === 1 ? '' : 's'}`
+}
+
+function formatJson(value: unknown) {
+  if (value == null || value === '') return ''
+  try {
+    const parsed = typeof value === 'string' ? JSON.parse(value) : value
+    return JSON.stringify(parsed, null, 2)
+  } catch {
+    return String(value)
+  }
+}
+
+function toggleDebugLogs() {
+  debugLogsOpen.value = !debugLogsOpen.value
+}
+
+function toggleLogDetails(id: number) {
+  const next = new Set(expandedLogIds.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  expandedLogIds.value = next
+}
+
+function isLogExpanded(id: number) {
+  return expandedLogIds.value.has(id)
+}
 
 function clearModels() {
   try {
@@ -299,6 +378,7 @@ async function submit() {
     errorMsg.value = e?.message || 'Request failed'
   } finally {
     await pastPrompts.refresh()
+    if (debugLogsOpen.value) await gatewayLogs.refresh()
     stopTimer()
     loading.value = false
   }
@@ -356,7 +436,7 @@ async function submit() {
         <DownloadableImage v-for="i in data.inputImages" :key="i" :src="i"
                            class="w-full object-contain rounded-md border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800"/>
       </div>
-      <div class="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_360px] gap-4">
+      <div class="grid grid-cols-1 xl:grid-cols-[minmax(520px,1fr)_360px] gap-4">
         <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 content-start">
           <div class="sm:col-span-2">
             <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Model</label>
@@ -364,6 +444,9 @@ async function submit() {
                 v-model="data.selectedModel"
                 :items="modelOptions"
                 placeholder="Select model"
+                class="w-full"
+                :content="{ align: 'start', sideOffset: 6 }"
+                :ui="{ content: 'min-w-[min(720px,calc(100vw-2rem))]' }"
             />
             <p class="mt-1 text-xs text-gray-500 dark:text-gray-400 break-all">Using: {{ data.selectedModel }}</p>
           </div>
@@ -444,6 +527,105 @@ async function submit() {
       </div>
 
     </div>
+    <div class="mt-4 flex justify-end">
+      <UButton
+          size="xs"
+          variant="ghost"
+          icon="i-lucide-bug"
+          @click="toggleDebugLogs"
+      >
+        {{ debugLogsOpen ? 'Hide debug logs' : 'Debug logs' }}
+      </UButton>
+    </div>
+    <section v-if="debugLogsOpen" class="mt-2 rounded-lg border border-gray-200 dark:border-gray-800 overflow-hidden">
+      <div class="flex items-center justify-between gap-3 px-3 py-2 bg-gray-50 dark:bg-gray-900/70 border-b border-gray-200 dark:border-gray-800">
+        <div>
+          <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100">AI Gateway debug log</h2>
+          <p class="text-xs text-gray-500 dark:text-gray-400">Raw request/response records for development</p>
+        </div>
+        <UButton size="xs" variant="ghost" :loading="gatewayLogs.status === 'pending'" @click="gatewayLogs.refresh()">
+          Refresh
+        </UButton>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="min-w-full text-xs">
+          <thead class="bg-white dark:bg-gray-950 text-gray-500 dark:text-gray-400">
+            <tr>
+              <th class="px-3 py-2 text-left font-medium">Time</th>
+              <th class="px-3 py-2 text-left font-medium">Status</th>
+              <th class="px-3 py-2 text-left font-medium">Model</th>
+              <th class="px-3 py-2 text-left font-medium">Prompt</th>
+              <th class="px-3 py-2 text-left font-medium">Inputs</th>
+              <th class="px-3 py-2 text-left font-medium">Tokens</th>
+              <th class="px-3 py-2 text-left font-medium">Cost</th>
+              <th class="px-3 py-2 text-left font-medium">Output/Error</th>
+              <th class="px-3 py-2 text-left font-medium">JSON</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-gray-200 dark:divide-gray-800">
+            <template v-for="log in gatewayLogItems" :key="log.id">
+              <tr class="bg-white/70 dark:bg-gray-900/40 align-top">
+                <td class="px-3 py-2 whitespace-nowrap text-gray-600 dark:text-gray-300">{{ formatLogTime(log.createdAt) }}</td>
+                <td class="px-3 py-2">
+                  <span
+                      class="rounded px-2 py-0.5 text-[11px] font-medium"
+                      :class="log.status === 'success'
+                          ? 'bg-green-50 text-green-700 dark:bg-green-900/20 dark:text-green-300'
+                          : 'bg-red-50 text-red-700 dark:bg-red-900/20 dark:text-red-300'"
+                  >
+                    {{ log.status }}
+                  </span>
+                </td>
+                <td class="px-3 py-2 max-w-48 truncate text-gray-800 dark:text-gray-100" :title="log.model">{{ log.model }}</td>
+                <td class="px-3 py-2 max-w-64 truncate text-gray-600 dark:text-gray-300" :title="log.prompt">{{ log.prompt }}</td>
+                <td class="px-3 py-2 whitespace-nowrap text-gray-600 dark:text-gray-300">
+                  {{ formatLogImages(log.inputImages) }} / {{ formatLogImages(log.modelImages) }}
+                </td>
+                <td class="px-3 py-2 whitespace-nowrap text-gray-600 dark:text-gray-300">
+                  {{ log.totalTokens?.toLocaleString?.() || '-' }}
+                </td>
+                <td class="px-3 py-2 whitespace-nowrap text-gray-600 dark:text-gray-300">
+                  {{ formatLogPrice(log.priceUsd, log.priceSource) || '-' }}
+                </td>
+                <td class="px-3 py-2 max-w-56 truncate">
+                  <a v-if="log.outputImage" class="text-primary-600 dark:text-primary-400" :href="log.outputImage" target="_blank">
+                    {{ log.outputImage }}
+                  </a>
+                  <span v-else class="text-red-600 dark:text-red-300" :title="log.error || ''">{{ log.error || '-' }}</span>
+                </td>
+                <td class="px-3 py-2 whitespace-nowrap">
+                  <UButton
+                      size="xs"
+                      variant="ghost"
+                      :icon="isLogExpanded(log.id) ? 'i-lucide-chevron-up' : 'i-lucide-chevron-down'"
+                      @click="toggleLogDetails(log.id)"
+                  >
+                    {{ isLogExpanded(log.id) ? 'Hide' : 'View' }}
+                  </UButton>
+                </td>
+              </tr>
+              <tr v-if="isLogExpanded(log.id)" class="bg-gray-50 dark:bg-gray-950">
+                <td colspan="9" class="px-3 py-3">
+                  <div class="grid grid-cols-1 xl:grid-cols-2 gap-3">
+                    <div>
+                      <div class="mb-1 text-[11px] font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">Request JSON</div>
+                      <pre class="max-h-96 overflow-auto rounded border border-gray-200 dark:border-gray-800 bg-white dark:bg-black p-3 text-[11px] leading-5 text-gray-800 dark:text-gray-100">{{ formatJson(log.requestJson) }}</pre>
+                    </div>
+                    <div>
+                      <div class="mb-1 text-[11px] font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">Response JSON</div>
+                      <pre class="max-h-96 overflow-auto rounded border border-gray-200 dark:border-gray-800 bg-white dark:bg-black p-3 text-[11px] leading-5 text-gray-800 dark:text-gray-100">{{ formatJson(log.responseJson) }}</pre>
+                    </div>
+                  </div>
+                </td>
+              </tr>
+            </template>
+            <tr v-if="!gatewayLogItems.length">
+              <td colspan="9" class="px-3 py-6 text-center text-gray-500 dark:text-gray-400">No Gateway logs yet.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
     <div class="mt-6">
       <div v-if="pastPrompts.data?.value?.items?.length"
            class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">

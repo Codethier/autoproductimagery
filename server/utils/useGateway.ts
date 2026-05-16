@@ -137,6 +137,22 @@ export function isImageCapableModel(m: GatewayModelInfo): boolean {
     return m.modelType === 'image' || isImageOutputLanguageModel(m)
 }
 
+// well, APi doesn't show shit in terms of which is image to image so it is manual.. https://vercel.com/ai-gateway/models
+export function supportsImageInput(model: GatewayModelInfo): boolean {
+    const id = model.id.toLowerCase()
+    if (isImageOutputLanguageModel(model)) return true
+    if (/gpt-image/.test(id)) return true
+    if (/flux-(?:2|kontext)/.test(id)) return true
+    return false
+}
+
+export function supportsMultipleImageInputs(model: GatewayModelInfo): boolean {
+    const id = model.id.toLowerCase()
+    if (isImageOutputLanguageModel(model)) return true
+    if (/flux-(?:2|kontext)/.test(id)) return true
+    return false
+}
+
 function usdPerMillion(perTokenUsd?: string) {
     if (!perTokenUsd) return undefined
     const value = Number(perTokenUsd) * 1_000_000
@@ -228,21 +244,16 @@ export function getImageModelCapabilities(model: GatewayModelInfo): ImageModelCa
         output.push('text')
         input.push('image', 'multiple-images')
         operations.push('image-edit', 'image-to-image', 'multi-reference')
-    } else if (
-        /gpt-image/.test(id) ||
-        /flux-(?:2|kontext)/.test(id) ||
-        /seedream/.test(id) ||
-        /recraft/.test(id)
-    ) {
+    } else if (supportsImageInput(model)) {
         input.push('image')
         operations.push('image-edit', 'image-to-image')
-        if (/flux-2|recraft|seedream/.test(id)) {
+        if (supportsMultipleImageInputs(model)) {
             input.push('multiple-images')
             operations.push('multi-reference')
         }
     }
 
-    if (/imagen/.test(id) || /grok-imagine-image/.test(id) || /flux-fast-schnell/.test(id)) {
+    if (/imagen/.test(id) || /grok-imagine-image/.test(id) || /flux-fast-schnell/.test(id) || /recraft/.test(id) || /seedream/.test(id) || /bytedance/.test(id)) {
         warnings.push('This model is treated as text-to-image only; selected input/model images may be ignored or rejected.')
     }
 
@@ -585,6 +596,18 @@ export async function useGateway() {
         const info = await getModelInfo(opts.model)
         if (!info) {
             throw createError({statusCode: 400, statusMessage: `Unknown model: ${opts.model}`})
+        }
+        const hasImageInputs = opts.inputImages.length > 0 || (opts.modelImages || []).length > 0
+        if (hasImageInputs && !supportsImageInput(info)) {
+            throw createError({
+                statusCode: 400,
+                statusMessage: `Model ${opts.model} does not support input images through AI Gateway. Remove selected input/model images or choose an image-edit model such as GPT Image, Gemini image, or FLUX Kontext/FLUX.2.`,
+                data: {
+                    refusedImages: [...opts.inputImages, ...(opts.modelImages || [])],
+                    reason: 'Model does not support input images',
+                    prompt: opts.prompt,
+                },
+            })
         }
         if (info.modelType === 'image') {
             return generateImageViaImageModel(opts)
