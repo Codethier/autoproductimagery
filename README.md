@@ -4,7 +4,8 @@ AI-powered product image generation for batch product workflows.
 
 Upload product or reference images, choose an image-capable model from Vercel AI Gateway, write one prompt, and generate outputs across all selected inputs. You can also generate from text only, regenerate previous outputs, and refine an existing image into a new standalone result.
 
-![Example generated image](public/examples/img.png)
+![Example generated image](public/examples/image.png)
+![Example generated image](public/examples/image2.png)
 
 ## Features
 

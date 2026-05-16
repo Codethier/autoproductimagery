@@ -28,15 +28,38 @@ export default defineEventHandler(async (event) => {
 
     const results = await Promise.all(
         generationInputs.map(async (i) => {
+            const startedAt = Date.now()
             const jobInputImages = i ? [i] : []
             const job: GenerateOptions = {...body, inputImages: jobInputImages}
+            const requestJson = {
+                model,
+                prompt: job.prompt,
+                inputImages: jobInputImages,
+                modelImages: Array.isArray(job.modelImages) ? job.modelImages : [],
+                responseModalities: job.responseModalities,
+                imageConfig: job.imageConfig,
+                maxOutputTokens: job.maxOutputTokens,
+            }
             try {
                 const result = await gw.generateAnyImage({...job, model})
-                return {ok: true, result, inputImage: i}
+                return {
+                    ok: true,
+                    result,
+                    inputImage: i,
+                    requestJson,
+                    durationMs: Date.now() - startedAt,
+                }
             } catch (e: any) {
                 const refusedImages = e?.data?.refusedImages || jobInputImages
                 const reason = e?.data?.reason || e?.statusMessage || e?.message || 'unknown'
-                return {ok: false, inputImage: i, refusedImages, reason}
+                return {
+                    ok: false,
+                    inputImage: i,
+                    refusedImages,
+                    reason,
+                    requestJson,
+                    durationMs: Date.now() - startedAt,
+                }
             }
         })
     )
@@ -90,6 +113,35 @@ export default defineEventHandler(async (event) => {
             billing = {model}
         }
         const q = await db.createSystemPrompt(recordData, savedUrl, errMsg, billing)
+        await db.createAiGatewayLog({
+            systemPromptId: q?.id ?? null as any,
+            status: r?.ok ? 'success' : 'error',
+            model,
+            prompt: body.prompt,
+            inputImages: (r.inputImage ? [r.inputImage] : []) as any,
+            modelImages: (Array.isArray(body.modelImages) ? body.modelImages : []) as any,
+            outputImage: savedUrl || null as any,
+            outputMimeType: result?.mimeType ?? null as any,
+            inputTokens: billing.inputTokens ?? null as any,
+            outputTokens: billing.outputTokens ?? null as any,
+            totalTokens: billing.totalTokens ?? null as any,
+            priceUsd: billing.priceUsd ?? null as any,
+            priceSource: billing.priceSource ?? null as any,
+            gatewayGenerationId: billing.gatewayGenerationId ?? null as any,
+            requestJson: r.requestJson ?? null as any,
+            responseJson: r?.ok
+                ? {
+                    mimeType: result?.mimeType,
+                    bytes: result?.buffer?.length,
+                    billing,
+                } as any
+                : {
+                    refusedImages: r?.refusedImages || [],
+                    reason: errMsg,
+                } as any,
+            error: errMsg ?? null as any,
+            durationMs: r.durationMs ?? null as any,
+        })
         objects.push(q)
     }
     return {ok: true, obj: objects}

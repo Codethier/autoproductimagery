@@ -9,6 +9,8 @@ ORM: Drizzle
 
 Database: Local database
 
+NEVER EVER edit the migrations files, you must generate them with the proper commands, drizzle:generate and drizzle:migrate
+
 Core Requirements & Architecture
 AI Integration: Vercel's AI SDK must always be used for AI integrations, as it provides a reliable and simple abstraction layer.
 

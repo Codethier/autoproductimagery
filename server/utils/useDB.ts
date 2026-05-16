@@ -1,5 +1,5 @@
 import { db } from "~~/server/utils/lib/db";
-import { systemPrompt } from "~~/server/db/schema";
+import { aiGatewayLog, systemPrompt, type NewAiGatewayLog } from "~~/server/db/schema";
 import { desc, eq, sql as drizzleSql } from "drizzle-orm";
 import type { GenerateOptions } from "~~/schemas/main.dto";
 
@@ -11,11 +11,39 @@ export type GenerationBilling = {
     cachedInputTokens?: number
     reasoningTokens?: number
     priceUsd?: string
+    priceSource?: 'gateway' | 'estimate' | 'unknown'
     gatewayGenerationId?: string
     usageJson?: Record<string, unknown>
 }
 
 export async function useDB() {
+    async function ensureAiGatewayLogTable() {
+        await db.run(drizzleSql.raw(`
+            CREATE TABLE IF NOT EXISTS \`aiGatewayLog\` (
+                \`id\` integer PRIMARY KEY AUTOINCREMENT NOT NULL,
+                \`systemPromptId\` integer,
+                \`status\` text NOT NULL,
+                \`model\` text NOT NULL,
+                \`prompt\` text NOT NULL,
+                \`inputImages\` text,
+                \`modelImages\` text,
+                \`outputImage\` text,
+                \`outputMimeType\` text,
+                \`inputTokens\` integer,
+                \`outputTokens\` integer,
+                \`totalTokens\` integer,
+                \`priceUsd\` text,
+                \`priceSource\` text,
+                \`gatewayGenerationId\` text,
+                \`requestJson\` text,
+                \`responseJson\` text,
+                \`error\` text,
+                \`durationMs\` integer,
+                \`createdAt\` text DEFAULT CURRENT_TIMESTAMP NOT NULL
+            )
+        `))
+    }
+
     async function ensureSystemPromptBillingColumns() {
         const rows = await db.all(drizzleSql.raw("PRAGMA table_info(systemPrompt)"))
         if (rows.length === 0) return
@@ -36,6 +64,7 @@ export async function useDB() {
         }
     }
 
+    await ensureAiGatewayLogTable()
     await ensureSystemPromptBillingColumns()
 
     async function createSystemPrompt(data: GenerateOptions, outputImage: string, errors?: string, billing: GenerationBilling = {}){
@@ -54,6 +83,7 @@ export async function useDB() {
             cachedInputTokens: billing.cachedInputTokens ?? null as any,
             reasoningTokens: billing.reasoningTokens ?? null as any,
             priceUsd: billing.priceUsd ?? null as any,
+            priceSource: billing.priceSource ?? null as any,
             gatewayGenerationId: billing.gatewayGenerationId ?? null as any,
             usageJson: billing.usageJson ?? null as any,
             errors: errors ?? null as any,
@@ -70,11 +100,62 @@ export async function useDB() {
         return row;
     }
 
+    async function getSystemPrompt(id: number) {
+        const [row] = await db.select().from(systemPrompt).where(eq(systemPrompt.id, id)).limit(1)
+        return row
+    }
+
+    async function updateSystemPromptBilling(id: number, billing: GenerationBilling) {
+        const values: Record<string, unknown> = {
+                inputTokens: billing.inputTokens ?? null as any,
+                outputTokens: billing.outputTokens ?? null as any,
+                totalTokens: billing.totalTokens ?? null as any,
+                cachedInputTokens: billing.cachedInputTokens ?? null as any,
+                reasoningTokens: billing.reasoningTokens ?? null as any,
+                priceUsd: billing.priceUsd ?? null as any,
+                priceSource: billing.priceSource ?? null as any,
+                usageJson: billing.usageJson ?? null as any,
+                updatedAt: drizzleSql`CURRENT_TIMESTAMP`,
+        }
+        if (billing.model) values.generationModel = billing.model
+        if (billing.gatewayGenerationId) values.gatewayGenerationId = billing.gatewayGenerationId
+
+        await db.update(systemPrompt)
+            .set(values as any)
+            .where(eq(systemPrompt.id, id))
+            .run()
+        return getSystemPrompt(id)
+    }
+
     async function getSystemPrompts() {
         const rows = await db.select().from(systemPrompt)
             .orderBy(desc(systemPrompt.createdAt))
         return rows
     }
 
-    return {createSystemPrompt, getSystemPrompts}
+    async function createAiGatewayLog(data: NewAiGatewayLog) {
+        const result = await db.insert(aiGatewayLog).values(data).run()
+        const id = Number((result as any)?.lastInsertRowid ?? 0)
+        if (id) {
+            const [row] = await db.select().from(aiGatewayLog).where(eq(aiGatewayLog.id, id))
+            return row
+        }
+        const [row] = await db.select().from(aiGatewayLog).orderBy(desc(aiGatewayLog.id)).limit(1)
+        return row
+    }
+
+    async function getAiGatewayLogs(limit = 50) {
+        return db.select().from(aiGatewayLog)
+            .orderBy(desc(aiGatewayLog.createdAt), desc(aiGatewayLog.id))
+            .limit(Math.max(1, Math.min(200, limit)))
+    }
+
+    return {
+        createSystemPrompt,
+        getSystemPrompt,
+        updateSystemPromptBilling,
+        getSystemPrompts,
+        createAiGatewayLog,
+        getAiGatewayLogs,
+    }
 }
