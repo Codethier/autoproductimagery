@@ -483,6 +483,7 @@ export async function useGateway() {
     async function generateImageViaLanguageModel(opts: mainSchema.GenerateOptions & { model: string }): Promise<GeneratedImage> {
         const model: LanguageModel = gateway.languageModel(opts.model)
         const files = await loadInputFiles(opts)
+        const hasFiles = files.length > 0
 
         const safetySettings = [
             {category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'OFF'},
@@ -491,27 +492,51 @@ export async function useGateway() {
             {category: 'HARM_CATEGORY_HARASSMENT', threshold: 'OFF'},
         ]
 
-        let response: Awaited<ReturnType<typeof generateText>>
-        try {
-            response = await generateText({
+        const responseModalities = opts.responseModalities?.includes('IMAGE')
+            ? ['TEXT', 'IMAGE']
+            : ['TEXT', 'IMAGE']
+
+        const buildImagePrompt = (retry = false) => {
+            const prompt = opts.prompt.trim()
+            if (hasFiles) return prompt
+
+            return [
+                'Generate exactly one image from the user prompt below.',
+                'Return an actual image file in the response. Do not answer with text only, and do not merely describe the image.',
+                retry ? 'The previous attempt did not include an image file; this attempt must include an image file.' : '',
+                '',
+                'User prompt:',
+                prompt,
+            ].filter(Boolean).join('\n')
+        }
+
+        const callGeminiImageModel = (prompt: string) => generateText({
                 model,
                 providerOptions: {
                     google: {
-                        responseModalities: ['IMAGE', 'TEXT'],
+                        responseModalities,
                         safetySettings,
                         ...(opts.imageConfig ? {imageConfig: opts.imageConfig} : {}),
                     } as any,
                 },
-                messages: [
-                    {
-                        role: 'user',
-                        content: [
-                            {type: 'text', text: opts.prompt},
-                            ...files.map(f => ({type: 'file' as const, data: f.buffer, mediaType: f.mediaType})),
+                ...(hasFiles
+                    ? {
+                        messages: [
+                            {
+                                role: 'user' as const,
+                                content: [
+                                    {type: 'text' as const, text: prompt},
+                                    ...files.map(f => ({type: 'file' as const, data: f.buffer, mediaType: f.mediaType})),
+                                ],
+                            },
                         ],
-                    },
-                ],
+                    }
+                    : {prompt}),
             })
+
+        let response: Awaited<ReturnType<typeof generateText>>
+        try {
+            response = await callGeminiImageModel(buildImagePrompt())
         } catch (e: any) {
             throw createError({
                 statusCode: 502,
@@ -530,6 +555,26 @@ export async function useGateway() {
         }
 
         const text = response.text
+        if (!hasFiles && typeof text === 'string' && text.length > 0) {
+            try {
+                response = await callGeminiImageModel(buildImagePrompt(true))
+                const retryImageFile = (response.files || []).find(f => f.mediaType?.startsWith('image/'))
+                if (retryImageFile) {
+                    return {
+                        buffer: Buffer.from(retryImageFile.uint8Array),
+                        mimeType: retryImageFile.mediaType || 'image/png',
+                        billing: await buildBilling(response.response?.modelId || opts.model, (response as any).totalUsage ?? response.usage, response.providerMetadata),
+                    }
+                }
+            } catch (e: any) {
+                throw createError({
+                    statusCode: 502,
+                    statusMessage: `Gateway retry failed after text-only response: ${e?.message || e}`,
+                    data: {refusedImages: opts.inputImages, reason: e?.message || 'unknown', prompt: opts.prompt},
+                })
+            }
+        }
+
         if (typeof text === 'string' && text.length > 0) {
             throw createError({
                 statusCode: 500,
