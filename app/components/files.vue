@@ -155,6 +155,36 @@ function clearImageSelection() {
     for (const f of files) f.selectedImage = false
   }
 }
+
+async function handlePaste(event: ClipboardEvent) {
+  const target = event.target as HTMLElement | null
+  if (target) {
+    const tag = target.tagName
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || target.isContentEditable) return
+  }
+  const clipboardItems = event.clipboardData?.items
+  if (!clipboardItems) return
+
+  const pastedFiles: File[] = []
+  for (const item of clipboardItems) {
+    if (item.kind !== 'file') continue
+    if (!item.type.startsWith('image/')) continue
+    const blob = item.getAsFile()
+    if (!blob) continue
+    const ext = item.type.split('/')[1] || 'png'
+    const name = blob.name && blob.name !== 'image.png'
+        ? blob.name
+        : `pasted-${Date.now()}.${ext}`
+    pastedFiles.push(new File([blob], name, {type: item.type}))
+  }
+  if (pastedFiles.length === 0) return
+
+  event.preventDefault()
+  images.value = [...images.value, ...pastedFiles]
+}
+
+onMounted(() => window.addEventListener('paste', handlePaste))
+onBeforeUnmount(() => window.removeEventListener('paste', handlePaste))
 </script>
 
 <template>
