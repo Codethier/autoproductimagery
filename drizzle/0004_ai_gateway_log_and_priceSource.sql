@@ -1,0 +1,22 @@
+CREATE TABLE IF NOT EXISTS `aiGatewayLog` (
+	`id` integer PRIMARY KEY AUTOINCREMENT NOT NULL,
+	`systemPromptId` integer,
+	`status` text NOT NULL,
+	`model` text NOT NULL,
+	`prompt` text NOT NULL,
+	`inputImages` text,
+	`modelImages` text,
+	`outputImage` text,
+	`outputMimeType` text,
+	`inputTokens` integer,
+	`outputTokens` integer,
+	`totalTokens` integer,
+	`priceUsd` text,
+	`priceSource` text,
+	`gatewayGenerationId` text,
+	`requestJson` text,
+	`responseJson` text,
+	`error` text,
+	`durationMs` integer,
+	`createdAt` text DEFAULT CURRENT_TIMESTAMP NOT NULL
+);

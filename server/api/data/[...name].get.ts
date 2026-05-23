@@ -3,7 +3,10 @@ import path from "node:path";
 import { createError } from "h3";
 
 export default defineEventHandler(async (event) => {
+  useAuth(event);
+
   const base = "data";
+  const allowed = path.join("data", "images");
   const params = event.context.params as { name?: string | string[] } | undefined;
   if (!params || params.name == null) {
     throw createError({ statusCode: 400, statusMessage: "Missing path parameter 'name'" });
@@ -11,29 +14,27 @@ export default defineEventHandler(async (event) => {
 
   const rawSegments = Array.isArray(params.name) ? params.name : [params.name];
 
-  // Decode each URL segment to handle spaces and special characters
   const decodedSegments = rawSegments.map((seg) => {
     try {
       return decodeURIComponent(seg);
     } catch {
-      // If decoding fails, fall back to the original segment
       return seg;
     }
   });
 
-  // Join segments using POSIX-style separator, then normalize with path utilities
   const joined = decodedSegments.join("/");
 
-  // Prevent path traversal and ensure the resolved path stays within the base directory
-  const resolvedBase = path.resolve(base);
+  const resolvedAllowed = path.resolve(allowed);
   const resolvedTarget = path.resolve(base, joined.replace(/^[/\\]+/, ""));
-  if (!resolvedTarget.startsWith(resolvedBase + path.sep) && resolvedTarget !== resolvedBase) {
+  if (!resolvedTarget.startsWith(resolvedAllowed + path.sep)) {
     throw createError({ statusCode: 400, statusMessage: "Invalid path" });
   }
 
-  // Stream the file if it exists; otherwise return 404
   try {
-    await fs.promises.access(resolvedTarget, fs.constants.R_OK);
+    const stat = await fs.promises.stat(resolvedTarget);
+    if (!stat.isFile()) {
+      throw createError({ statusCode: 404, statusMessage: "File not found" });
+    }
   } catch {
     throw createError({ statusCode: 404, statusMessage: "File not found" });
   }

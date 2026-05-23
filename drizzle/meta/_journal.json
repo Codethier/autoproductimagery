@@ -29,6 +29,13 @@
       "when": 1778953200000,
       "tag": "0003_price_source",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1779559239843,
+      "tag": "0004_ai_gateway_log_and_priceSource",
+      "breakpoints": true
     }
   ]
 }

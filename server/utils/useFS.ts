@@ -31,20 +31,47 @@ function resolveWithin(base: string, relative: string): string {
     return resolved
 }
 
-async function uniqueDestination(dir: string, filename: string): Promise<string> {
+async function openExclusive(dir: string, filename: string, data: Buffer): Promise<string> {
     const ext = path.extname(filename)
     const stem = path.basename(filename, ext)
-    let candidate = path.join(dir, filename)
-    let counter = 1
+    let counter = 0
     while (true) {
+        const candidate = counter === 0
+            ? path.join(dir, filename)
+            : path.join(dir, `${stem} (${counter})${ext}`)
         try {
-            await fs.access(candidate)
-            candidate = path.join(dir, `${stem} (${counter})${ext}`)
-            counter += 1
-        } catch {
+            const handle = await fs.open(candidate, "wx")
+            try {
+                await handle.writeFile(data)
+            } finally {
+                await handle.close()
+            }
             return candidate
+        } catch (err: any) {
+            if (err?.code !== "EEXIST") throw err
+            counter += 1
+            if (counter > 10000) {
+                throw createError({ statusCode: 500, statusMessage: "Could not allocate unique filename" })
+            }
         }
     }
+}
+
+const IMAGE_MAGIC_SIGNATURES: Array<{ ext: string; check: (b: Buffer) => boolean }> = [
+    { ext: "png", check: (b) => b.length >= 8 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47 && b[4] === 0x0d && b[5] === 0x0a && b[6] === 0x1a && b[7] === 0x0a },
+    { ext: "jpg", check: (b) => b.length >= 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff },
+    { ext: "gif", check: (b) => b.length >= 6 && b.slice(0, 6).toString("ascii").match(/^GIF8[79]a$/) !== null },
+    { ext: "webp", check: (b) => b.length >= 12 && b.slice(0, 4).toString("ascii") === "RIFF" && b.slice(8, 12).toString("ascii") === "WEBP" },
+    { ext: "bmp", check: (b) => b.length >= 2 && b[0] === 0x42 && b[1] === 0x4d },
+    { ext: "tiff", check: (b) => b.length >= 4 && ((b[0] === 0x49 && b[1] === 0x49 && b[2] === 0x2a && b[3] === 0x00) || (b[0] === 0x4d && b[1] === 0x4d && b[2] === 0x00 && b[3] === 0x2a)) },
+    { ext: "heic", check: (b) => b.length >= 12 && b.slice(4, 8).toString("ascii") === "ftyp" },
+]
+
+function detectImageType(data: Buffer): string | null {
+    for (const sig of IMAGE_MAGIC_SIGNATURES) {
+        if (sig.check(data)) return sig.ext
+    }
+    return null
 }
 
 export async function useFS() {
@@ -111,11 +138,17 @@ export async function useFS() {
         if (!file.filename) {
             throw createError({ statusCode: 400, statusMessage: "Missing filename" })
         }
+        const detected = detectImageType(file.data)
+        if (!detected) {
+            throw createError({ statusCode: 415, statusMessage: "Unsupported file type — image required" })
+        }
+        if (file.type && !file.type.toLowerCase().startsWith("image/")) {
+            throw createError({ statusCode: 415, statusMessage: "Declared content-type is not an image" })
+        }
         const safeName = sanitizeName(path.basename(file.filename))
         const dir = resolvePath(relative)
         await fs.mkdir(dir, { recursive: true })
-        const destination = await uniqueDestination(dir, safeName)
-        await fs.writeFile(destination, file.data)
+        const destination = await openExclusive(dir, safeName, file.data)
         return path.basename(destination)
     }
 

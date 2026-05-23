@@ -17,56 +17,6 @@ export type GenerationBilling = {
 }
 
 export async function useDB() {
-    async function ensureAiGatewayLogTable() {
-        await db.run(drizzleSql.raw(`
-            CREATE TABLE IF NOT EXISTS \`aiGatewayLog\` (
-                \`id\` integer PRIMARY KEY AUTOINCREMENT NOT NULL,
-                \`systemPromptId\` integer,
-                \`status\` text NOT NULL,
-                \`model\` text NOT NULL,
-                \`prompt\` text NOT NULL,
-                \`inputImages\` text,
-                \`modelImages\` text,
-                \`outputImage\` text,
-                \`outputMimeType\` text,
-                \`inputTokens\` integer,
-                \`outputTokens\` integer,
-                \`totalTokens\` integer,
-                \`priceUsd\` text,
-                \`priceSource\` text,
-                \`gatewayGenerationId\` text,
-                \`requestJson\` text,
-                \`responseJson\` text,
-                \`error\` text,
-                \`durationMs\` integer,
-                \`createdAt\` text DEFAULT CURRENT_TIMESTAMP NOT NULL
-            )
-        `))
-    }
-
-    async function ensureSystemPromptBillingColumns() {
-        const rows = await db.all(drizzleSql.raw("PRAGMA table_info(systemPrompt)"))
-        if (rows.length === 0) return
-        const existing = new Set(rows.map((row: any) => row.name))
-        const additions: Array<[string, string]> = [
-            ['generationModel', 'ALTER TABLE `systemPrompt` ADD `generationModel` text'],
-            ['inputTokens', 'ALTER TABLE `systemPrompt` ADD `inputTokens` integer'],
-            ['outputTokens', 'ALTER TABLE `systemPrompt` ADD `outputTokens` integer'],
-            ['totalTokens', 'ALTER TABLE `systemPrompt` ADD `totalTokens` integer'],
-            ['cachedInputTokens', 'ALTER TABLE `systemPrompt` ADD `cachedInputTokens` integer'],
-            ['reasoningTokens', 'ALTER TABLE `systemPrompt` ADD `reasoningTokens` integer'],
-            ['priceUsd', 'ALTER TABLE `systemPrompt` ADD `priceUsd` text'],
-            ['gatewayGenerationId', 'ALTER TABLE `systemPrompt` ADD `gatewayGenerationId` text'],
-            ['usageJson', 'ALTER TABLE `systemPrompt` ADD `usageJson` text'],
-        ]
-        for (const [name, sql] of additions) {
-            if (!existing.has(name)) await db.run(drizzleSql.raw(sql))
-        }
-    }
-
-    await ensureAiGatewayLogTable()
-    await ensureSystemPromptBillingColumns()
-
     async function createSystemPrompt(data: GenerateOptions, outputImage: string, errors?: string, billing: GenerationBilling = {}){
         const modelImages = Array.isArray(data.modelImages) ? data.modelImages : []
         const serverImages = Array.isArray(data.inputImages) ? data.inputImages : []

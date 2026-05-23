@@ -588,7 +588,7 @@ async function submit() {
                   {{ formatLogPrice(log.priceUsd, log.priceSource) || '-' }}
                 </td>
                 <td class="px-3 py-2 max-w-56 truncate">
-                  <a v-if="log.outputImage" class="text-primary-600 dark:text-primary-400" :href="log.outputImage" target="_blank">
+                  <a v-if="log.outputImage" class="text-primary-600 dark:text-primary-400" :href="`/api/data${log.outputImage}`" target="_blank">
                     {{ log.outputImage }}
                   </a>
                   <span v-else class="text-red-600 dark:text-red-300" :title="log.error || ''">{{ log.error || '-' }}</span>
