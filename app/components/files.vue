@@ -12,8 +12,11 @@ const props = defineProps<{
 const route = useRoute()
 const router = useRouter()
 let dataStore = useDataStore()
+const toast = useToast()
 
 let images: Ref<File[]> = ref([])
+const uploading = ref(false)
+const creatingFolder = ref(false)
 
 
 let currentQuery = router.currentRoute.value.query.path
@@ -87,53 +90,77 @@ function syncSelectToStore(file: SelectableFile) {
   }
 }
 
-let formSubmitBody = computed(() => {
-  let form: FormData = new FormData()
-  for (const file of images.value) {
-    form.append('files', file)
-  }
+function buildUploadBody(): FormData {
+  const form = new FormData()
+  for (const file of images.value) form.append('files', file)
   form.append('path', path.value)
   return form
-})
+}
 
 async function fileFormSubmit() {
-  let sumBytes = 0
-  for (const file of images.value) {
-    sumBytes += file.size
+  if (images.value.length === 0 || uploading.value) return
+  uploading.value = true
+  try {
+    const result = await $fetch<{ saved: string[]; failed: Array<{ filename: string; reason: string }> }>(
+        '/api/upload',
+        { method: 'POST', body: buildUploadBody() }
+    )
+    if (result.saved.length > 0) {
+      toast.add({
+        title: `Uploaded ${result.saved.length} file${result.saved.length === 1 ? '' : 's'}`,
+        color: 'success'
+      })
+    }
+    if (result.failed.length > 0) {
+      toast.add({
+        title: `Failed to upload ${result.failed.length} file${result.failed.length === 1 ? '' : 's'}`,
+        description: result.failed.map((f) => `${f.filename}: ${f.reason}`).join('\n'),
+        color: 'error'
+      })
+    }
+    images.value = []
+    await items.refresh()
+  } catch (err: any) {
+    toast.add({ title: 'Upload failed', description: err?.statusMessage ?? err?.message, color: 'error' })
+  } finally {
+    uploading.value = false
   }
-  let response = await useFetch('/api/upload', {method: 'POST', body: formSubmitBody})
-  if (response.error.value) {
-    console.error(response.error.value)
-  }
-  console.log(response.data.value)
-  await items.refresh()
 }
 
 let newFolderName = ref('')
 
 async function createFolder() {
-  console.log('call')
-  let response = await useFetch('/api/createFolder', {
-    method: 'POST',
-    body: {path: path.value, name: newFolderName.value}
-  })
-  await items.refresh()
-  newFolderName.value = ''
-  return true
+  const name = newFolderName.value.trim()
+  if (!name || creatingFolder.value) return
+  creatingFolder.value = true
+  try {
+    await $fetch('/api/createFolder', { method: 'POST', body: { path: path.value, name } })
+    newFolderName.value = ''
+    await items.refresh()
+    toast.add({ title: `Folder "${name}" created`, color: 'success' })
+  } catch (err: any) {
+    toast.add({
+      title: 'Could not create folder',
+      description: err?.statusMessage ?? err?.message,
+      color: 'error'
+    })
+  } finally {
+    creatingFolder.value = false
+  }
 }
 
 async function deleteFileOrFolder(filename: string) {
-  const isConfirmed = window.confirm(`Are you sure you want to delete "${filename}"? This cannot be undone.`)
-  if (!isConfirmed) return false
-  let pathToSubmit = String(path.value)
-  pathToSubmit = pathToSubmit + '/' + filename
-  let response = await useFetch('/api/deleteFileOrFolder', {
-    method: 'DELETE',
-    body: {path: pathToSubmit},
-    key: `/deleteFile${pathToSubmit}`
-  })
-  await items.refresh()
-  return true
+  const confirmed = window.confirm(`Delete "${filename}"? This cannot be undone.`)
+  if (!confirmed) return
+  const base = path.value.endsWith('/') ? path.value.slice(0, -1) : path.value
+  const pathToSubmit = `${base}/${filename}`
+  try {
+    await $fetch('/api/deleteFileOrFolder', { method: 'DELETE', body: { path: pathToSubmit } })
+    await items.refresh()
+    toast.add({ title: `Deleted "${filename}"`, color: 'success' })
+  } catch (err: any) {
+    toast.add({ title: 'Delete failed', description: err?.statusMessage ?? err?.message, color: 'error' })
+  }
 }
 
 function clearModelSelection() {
@@ -196,14 +223,17 @@ onBeforeUnmount(() => window.removeEventListener('paste', handlePaste))
       <div class="col-span-4 flex flex-col gap-2">
         <UFileUpload v-model="images" label="Drop your image here" accept="image/*" multiple class="w-96 min-h-48"
                      description="WEBP, PNG, JPG" icon="i-lucide-image"/>
-        <UButton :disabled="images.length === 0" @click="fileFormSubmit" type="submit" label="Upload"/>
+        <UButton :disabled="images.length === 0 || uploading" :loading="uploading"
+                 @click="fileFormSubmit" type="submit" label="Upload"/>
         <UPopover>
           <UButton label="Create New Folder" color="neutral" variant="subtle"/>
 
           <template #content>
             <div class="inline-flex m-4 gap-2">
-              <UInput v-model="newFolderName" placeholder="Folder Name" class="w-full"/>
-              <UButton @click="createFolder()" label="Save"/>
+              <UInput v-model="newFolderName" placeholder="Folder Name" class="w-full"
+                      @keydown.enter="createFolder()"/>
+              <UButton @click="createFolder()" :disabled="!newFolderName.trim() || creatingFolder"
+                       :loading="creatingFolder" label="Save"/>
             </div>
           </template>
         </UPopover>
@@ -222,7 +252,7 @@ onBeforeUnmount(() => window.removeEventListener('paste', handlePaste))
       </div>
       <div v-for="file of items.data.value?.files"
            class="text-center text-balance flex flex-col gap-2 justify-center items-center w-full h-full">
-        <img :src="`api/data${file.url}`" class="w-full object-contain">
+        <img :src="`api/data${file.url}`" class="w-full object-contain" loading="lazy">
         <p class="w-full truncate text-center">{{ file.name }}</p>
         <UCheckbox v-if="props.isModelSelect" v-model="file.selectedModel"
                    @change="syncSelectToStore(file)"></UCheckbox>
