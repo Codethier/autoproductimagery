@@ -19,17 +19,19 @@ const uploading = ref(false)
 const creatingFolder = ref(false)
 
 
-let currentQuery = router.currentRoute.value.query.path
-let path = ref('')
-if (currentQuery) {
-  path.value = String(currentQuery)
-} else {
-  path.value = '/'
+function normalizeQueryPath(v: unknown): string {
+  if (v == null) return '/'
+  const s = String(v)
+  if (!s || s === 'undefined' || s === 'null') return '/'
+  return s
 }
+
+let path = ref(normalizeQueryPath(router.currentRoute.value.query.path))
 watch(path, () => router.push({query: {path: path.value}}))
 watch(() => route.query.path, (v) => {
-  if (v !== path.value) {
-    path.value = String(v)
+  const next = normalizeQueryPath(v)
+  if (next !== path.value) {
+    path.value = next
   }
 })
 
