@@ -31,6 +31,14 @@ function resolveWithin(base: string, relative: string): string {
     return resolved
 }
 
+function decodeUrlPath(relative: string): string {
+    try {
+        return decodeURIComponent(relative)
+    } catch {
+        throw createError({ statusCode: 400, statusMessage: "Invalid path encoding" })
+    }
+}
+
 async function openExclusive(dir: string, filename: string, data: Buffer): Promise<string> {
     const ext = path.extname(filename)
     const stem = path.basename(filename, ext)
@@ -168,7 +176,7 @@ export async function useFS() {
     }
 
     async function getFile(relative: string): Promise<Buffer> {
-        const target = resolveWithin(DATA_ROOT, relative)
+        const target = resolveWithin(DATA_ROOT, decodeUrlPath(relative))
         try {
             return await fs.readFile(target)
         } catch (err: any) {

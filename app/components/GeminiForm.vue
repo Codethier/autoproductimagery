@@ -1,8 +1,8 @@
 <script setup lang="ts">
 const data = useDataStore()
 const prompt = ref('')
-const loading = ref(false)
 const errorMsg = ref<string | null>(null)
+const keepSubmitInputs = ref(true)
 
 // Fetch all image-capable models from the gateway (across providers).
 type ModelPricing = {
@@ -66,6 +66,17 @@ type AiGatewayLog = {
   error?: string | null
   durationMs?: number | null
   createdAt: string
+}
+
+type PendingGeneration = {
+  id: string
+  prompt: string
+  model: string
+  inputImages: string[]
+  modelImages: string[]
+  startedAt: number
+  status: 'pending' | 'failed'
+  error?: string
 }
 
 const modelsFetch = useFetch<{ ok: boolean; items: ImageModelInfo[] }>('/api/image-models', {
@@ -253,12 +264,30 @@ const gatewayLogs = useFetch<{ ok: boolean; items: AiGatewayLog[] }>('/api/ai-ga
 const debugLogsOpen = ref(false)
 const expandedLogIds = ref<Set<number>>(new Set())
 const gatewayLogItems = computed(() => gatewayLogs.data.value?.items || [])
+const pendingGenerations = ref<PendingGeneration[]>([])
+const pendingTick = ref(Date.now())
+let pendingTimerId: ReturnType<typeof setInterval> | null = null
+
+const activeGenerationCount = computed(() => pendingGenerations.value.filter((job) => job.status === 'pending').length)
+const failedGenerationCount = computed(() => pendingGenerations.value.filter((job) => job.status === 'failed').length)
 
 watch(debugLogsOpen, async (open) => {
   if (open && !gatewayLogItems.value.length) {
     await gatewayLogs.refresh()
   }
 })
+
+watch(activeGenerationCount, (count) => {
+  if (count > 0 && !pendingTimerId) {
+    pendingTimerId = setInterval(() => {
+      pendingTick.value = Date.now()
+    }, 1000)
+  }
+  if (count === 0 && pendingTimerId) {
+    clearInterval(pendingTimerId)
+    pendingTimerId = null
+  }
+}, { immediate: true })
 
 function formatLogTime(value?: string) {
   return value ? new Date(value).toLocaleString() : ''
@@ -316,50 +345,59 @@ function clearInputImages() {
   }
 }
 
-// Elapsed time counter for loading indicator
-const elapsedMs = ref(0)
-let timerId: any = null
-const elapsedLabel = computed(() => {
-  const totalSeconds = Math.floor(elapsedMs.value / 1000)
+function elapsedLabel(startedAt: number) {
+  const totalSeconds = Math.max(0, Math.floor((pendingTick.value - startedAt) / 1000))
   const minutes = Math.floor(totalSeconds / 60)
   const seconds = String(totalSeconds % 60).padStart(2, '0')
   return `${minutes}:${seconds}`
-})
-
-function startTimer() {
-  stopTimer()
-  const start = Date.now()
-  elapsedMs.value = 0
-  timerId = setInterval(() => {
-    elapsedMs.value = Date.now() - start
-  }, 1000)
 }
 
-function stopTimer() {
-  if (timerId) {
-    clearInterval(timerId)
-    timerId = null
-  }
+function removePendingJob(id: string) {
+  pendingGenerations.value = pendingGenerations.value.filter((job) => job.id !== id)
+}
+
+function clearFailedJobs() {
+  pendingGenerations.value = pendingGenerations.value.filter((job) => job.status !== 'failed')
 }
 
 onBeforeUnmount(() => {
-  stopTimer()
+  if (pendingTimerId) clearInterval(pendingTimerId)
 })
 
 async function submit() {
-  if (loading.value) return
+  const promptText = prompt.value.trim()
+  if (!promptText) {
+    errorMsg.value = 'Prompt is required'
+    return
+  }
+
   errorMsg.value = null
+  const job: PendingGeneration = {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    prompt: promptText,
+    model: data.selectedModel || 'Default model',
+    inputImages: [...data.inputImages],
+    modelImages: [...data.models],
+    startedAt: Date.now(),
+    status: 'pending'
+  }
+  pendingGenerations.value.unshift(job)
+  if (!keepSubmitInputs.value) {
+    prompt.value = ''
+    clearInputImages()
+    clearModels()
+  }
+  let serverCreatedRows = false
+
   try {
-    loading.value = true
-    startTimer()
-    const res = await $fetch<{ ok: boolean; url?: string; message?: string }>(
+    const res = await $fetch<{ ok: boolean; obj?: Array<{ outputImage?: string | null; errors?: string | null }> }>(
         '/api/image-generate',
         {
           method: 'POST',
           body: {
-            prompt: prompt.value,
-            inputImages: data.inputImages,
-            modelImages: data.models,
+            prompt: promptText,
+            inputImages: job.inputImages,
+            modelImages: job.modelImages,
             model: data.selectedModel || undefined,
             responseModalities: ['IMAGE'],
             // Only include imageConfig if nanoBananaPro is selected
@@ -373,14 +411,26 @@ async function submit() {
           }
         }
     )
-
+    serverCreatedRows = true
+    const failedRow = res?.obj?.find((row) => row?.errors)
+    if (failedRow?.errors) {
+      job.status = 'failed'
+      job.error = failedRow.errors
+    } else {
+      removePendingJob(job.id)
+    }
   } catch (e: any) {
-    errorMsg.value = e?.message || 'Request failed'
+    job.status = 'failed'
+    job.error = e?.data?.statusMessage || e?.message || 'Request failed'
   } finally {
     await pastPrompts.refresh()
     if (debugLogsOpen.value) await gatewayLogs.refresh()
-    stopTimer()
-    loading.value = false
+    if (serverCreatedRows) {
+      removePendingJob(job.id)
+    }
+    if (job.status === 'failed' && job.error) {
+      errorMsg.value = job.error
+    }
   }
 }
 
@@ -388,19 +438,6 @@ async function submit() {
 
 <template>
   <div>
-    <!-- Loading overlay while waiting for Gemini response -->
-    <div v-if="loading" class="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
-      <div class="flex flex-col items-center gap-3 p-5 bg-white/90 dark:bg-gray-800/90 rounded-xl shadow-xl">
-        <svg class="animate-spin h-7 w-7 text-primary-600" xmlns="http://www.w3.org/2000/svg" fill="none"
-             viewBox="0 0 24 24">
-          <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-          <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path>
-        </svg>
-        <span class="text-sm text-gray-700 dark:text-gray-200">Generating...</span>
-        <span class="text-xs font-mono text-gray-500 dark:text-gray-400">Elapsed {{ elapsedLabel }}</span>
-      </div>
-    </div>
-
     <div class="flex flex-col gap-2">
       <UModal :ui="{ content: 'max-w-7xl'}">
         <UButton color="primary" variant="solid">
@@ -518,12 +555,33 @@ async function submit() {
         <UTextarea v-model="prompt" class="w-full" placeholder="Describe how to transform the input image(s)..."
                    autoresize/>
       </div>
+      <UCheckbox
+          v-model="keepSubmitInputs"
+          label="Keep prompt and selected images after submit"
+          class="self-start"
+      />
       <div class="flex items-center gap-2 justify-end">
-        <UButton class="w-full" @click="submit()" :disabled="loading">
-          <span v-if="loading">Submitting...</span>
-          <span v-else>Submit</span>
+        <UButton class="w-full" @click="submit()" :disabled="!prompt.trim()">
+          Submit
         </UButton>
-        <span v-if="errorMsg" class="text-red-500 text-sm">{{ errorMsg }}</span>
+      </div>
+      <div
+          v-if="activeGenerationCount || failedGenerationCount || errorMsg"
+          class="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-gray-200 dark:border-gray-800 bg-white/70 dark:bg-gray-900/50 px-3 py-2 text-xs text-gray-600 dark:text-gray-300"
+      >
+        <div class="flex flex-wrap items-center gap-2">
+          <span v-if="activeGenerationCount" class="inline-flex items-center gap-1.5 text-primary-600 dark:text-primary-400">
+            <UIcon name="i-lucide-loader-circle" class="size-3.5 animate-spin" />
+            {{ activeGenerationCount }} generating
+          </span>
+          <span v-if="failedGenerationCount" class="text-red-600 dark:text-red-300">
+            {{ failedGenerationCount }} failed
+          </span>
+          <span v-if="errorMsg" class="text-red-600 dark:text-red-300">{{ errorMsg }}</span>
+        </div>
+        <UButton v-if="failedGenerationCount" size="xs" variant="ghost" color="neutral" @click="clearFailedJobs">
+          Clear failed
+        </UButton>
       </div>
 
     </div>
@@ -627,10 +685,63 @@ async function submit() {
       </div>
     </section>
     <div class="mt-6">
-      <div v-if="pastPrompts.data?.value?.items?.length"
+      <div
+          v-if="pendingGenerations.length || pastPrompts.data?.value?.items?.length"
            class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+        <div
+            v-for="job in pendingGenerations"
+            :key="job.id"
+            class="overflow-hidden rounded-xl border shadow-sm"
+            :class="job.status === 'failed'
+                ? 'border-red-200 dark:border-red-800 bg-red-50/70 dark:bg-red-950/30'
+                : 'border-primary-200 dark:border-primary-800 bg-white/70 dark:bg-gray-900/50'"
+        >
+          <div
+              class="flex min-h-28 items-center justify-center gap-2 border-b p-6"
+              :class="job.status === 'failed'
+                  ? 'border-red-200 dark:border-red-800 text-red-700 dark:text-red-300'
+                  : 'border-primary-200 dark:border-primary-800 text-primary-700 dark:text-primary-300'"
+          >
+            <UIcon
+                :name="job.status === 'failed' ? 'i-lucide-triangle-alert' : 'i-lucide-loader-circle'"
+                class="size-5"
+                :class="job.status === 'pending' ? 'animate-spin' : ''"
+            />
+            <span class="text-sm font-medium">{{ job.status === 'failed' ? 'Generation failed' : 'Generating image' }}</span>
+          </div>
+          <div class="flex flex-col gap-3 p-3">
+            <p class="text-sm font-medium text-gray-900 dark:text-gray-100 line-clamp-3" :title="job.prompt">
+              {{ job.prompt }}
+            </p>
+            <div class="grid grid-cols-1 gap-1 rounded bg-gray-50 p-2 text-[11px] text-gray-600 dark:bg-gray-800/70 dark:text-gray-400">
+              <div>
+                <span class="font-medium text-gray-700 dark:text-gray-300">Model:</span>
+                {{ job.model }}
+              </div>
+              <div>
+                <span class="font-medium text-gray-700 dark:text-gray-300">Elapsed:</span>
+                {{ elapsedLabel(job.startedAt) }}
+              </div>
+            </div>
+            <div v-if="job.error" class="rounded border border-red-200 bg-red-50 p-2 text-xs text-red-700 dark:border-red-800 dark:bg-red-900/20 dark:text-red-300">
+              {{ job.error }}
+            </div>
+            <div v-if="job.inputImages.length" class="mt-1">
+              <div class="mb-1 text-xs font-medium text-gray-700 dark:text-gray-300">Input image(s)</div>
+              <div class="grid grid-cols-5 gap-1">
+                <DownloadableImage
+                    v-for="src in job.inputImages"
+                    :key="src"
+                    :src="src"
+                    :alt="'Pending input ' + src"
+                    class="h-16 w-full rounded bg-gray-50 object-cover dark:bg-gray-800"
+                />
+              </div>
+            </div>
+          </div>
+        </div>
         <system-promp
-            v-for="item in pastPrompts.data.value.items"
+            v-for="item in pastPrompts.data?.value?.items || []"
             :key="item.id"
             :data="item"
         />
@@ -641,5 +752,10 @@ async function submit() {
 </template>
 
 <style scoped>
-
+.line-clamp-3 {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
 </style>
