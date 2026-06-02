@@ -187,6 +187,17 @@ export async function useFS() {
         }
     }
 
+    async function fileExists(relative: string): Promise<boolean> {
+        const target = resolveWithin(DATA_ROOT, decodeUrlPath(relative))
+        try {
+            const stat = await fs.stat(target)
+            return stat.isFile()
+        } catch (err: any) {
+            if (err?.code === "ENOENT") return false
+            throw err
+        }
+    }
+
     return {
         listDirs,
         listFiles,
@@ -198,5 +209,6 @@ export async function useFS() {
         deleteFileOrFolder,
         rootFS: fs,
         getFile,
+        fileExists,
     }
 }
