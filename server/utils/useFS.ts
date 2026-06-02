@@ -10,6 +10,7 @@ const DATA_ROOT = path.resolve("./data")
 
 const INVALID_NAME_CHARS = /[\\/:*?"<>|\x00-\x1f]/
 const RESERVED_NAMES = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\..*)?$/i
+const DIAGNOSTIC_ENTRY_LIMIT = 25
 
 function sanitizeName(name: string): string {
     const trimmed = name.trim()
@@ -36,6 +37,15 @@ function decodeUrlPath(relative: string): string {
         return decodeURIComponent(relative)
     } catch {
         throw createError({ statusCode: 400, statusMessage: "Invalid path encoding" })
+    }
+}
+
+function errorInfo(err: any) {
+    if (!err) return undefined
+    return {
+        code: typeof err?.code === "string" ? err.code : undefined,
+        message: String(err?.statusMessage || err?.message || err),
+        statusCode: typeof err?.statusCode === "number" ? err.statusCode : undefined,
     }
 }
 
@@ -176,14 +186,106 @@ export async function useFS() {
     }
 
     async function getFile(relative: string): Promise<Buffer> {
-        const target = resolveWithin(DATA_ROOT, decodeUrlPath(relative))
+        let target: string
+        try {
+            target = resolveWithin(DATA_ROOT, decodeUrlPath(relative))
+        } catch (err: any) {
+            const diagnostics = await getFileDiagnostics(relative, err)
+            console.warn("[image-file-load] Invalid image path", diagnostics)
+            throw createError({
+                statusCode: err?.statusCode || 400,
+                statusMessage: err?.statusMessage || "Invalid image path",
+                data: {
+                    reason: err?.statusMessage || "Invalid image path",
+                    fileDiagnostics: diagnostics,
+                },
+            })
+        }
         try {
             return await fs.readFile(target)
         } catch (err: any) {
+            const diagnostics = await getFileDiagnostics(relative, err)
+            console.warn("[image-file-load] Could not read image file", diagnostics)
             if (err?.code === "ENOENT") {
-                throw createError({ statusCode: 404, statusMessage: "File not found" })
+                throw createError({
+                    statusCode: 404,
+                    statusMessage: "File not found",
+                    data: {
+                        reason: "File not found",
+                        fileDiagnostics: diagnostics,
+                    },
+                })
             }
-            throw err
+            throw createError({
+                statusCode: 500,
+                statusMessage: err?.message || "Could not read file",
+                data: {
+                    reason: err?.message || "Could not read file",
+                    fileDiagnostics: diagnostics,
+                },
+            })
+        }
+    }
+
+    async function getFileDiagnostics(relative: string, err?: any) {
+        const originalPath = String(relative ?? "")
+        let decodedPath: string | undefined
+        let decodeError: string | undefined
+        let resolvedPath: string | undefined
+        let parentPath: string | undefined
+        let parentExists = false
+        let parentEntriesSample: string[] = []
+        let fileExists = false
+        let isFile = false
+        let fileSize: number | undefined
+        let statError: ReturnType<typeof errorInfo> | undefined
+
+        try {
+            decodedPath = decodeURIComponent(originalPath)
+        } catch (decodeErr: any) {
+            decodeError = decodeErr?.message || String(decodeErr)
+        }
+
+        try {
+            resolvedPath = resolveWithin(DATA_ROOT, decodedPath ?? originalPath)
+            parentPath = path.dirname(resolvedPath)
+            try {
+                const stat = await fs.stat(resolvedPath)
+                fileExists = true
+                isFile = stat.isFile()
+                fileSize = stat.size
+            } catch (pathErr: any) {
+                statError = errorInfo(pathErr)
+            }
+            try {
+                const parentStat = await fs.stat(parentPath)
+                parentExists = parentStat.isDirectory()
+                if (parentExists) {
+                    parentEntriesSample = (await fs.readdir(parentPath)).slice(0, DIAGNOSTIC_ENTRY_LIMIT)
+                }
+            } catch {
+                parentExists = false
+            }
+        } catch (resolveErr: any) {
+            statError = errorInfo(resolveErr)
+        }
+
+        return {
+            originalPath,
+            decodedPath,
+            decodeError,
+            cwd: path.resolve("."),
+            dataRoot: DATA_ROOT,
+            baseDir: BASE_DIR,
+            resolvedPath,
+            parentPath,
+            parentExists,
+            parentEntriesSample,
+            fileExists,
+            isFile,
+            fileSize,
+            statError,
+            thrownError: errorInfo(err),
         }
     }
 
@@ -210,5 +312,6 @@ export async function useFS() {
         rootFS: fs,
         getFile,
         fileExists,
+        getFileDiagnostics,
     }
 }

@@ -52,11 +52,13 @@ export default defineEventHandler(async (event) => {
             } catch (e: any) {
                 const refusedImages = e?.data?.refusedImages || jobInputImages
                 const reason = e?.data?.reason || e?.statusMessage || e?.message || 'unknown'
+                const errorData = e?.data && typeof e.data === 'object' ? e.data : undefined
                 return {
                     ok: false,
                     inputImage: i,
                     refusedImages,
                     reason,
+                    errorData,
                     requestJson,
                     durationMs: Date.now() - startedAt,
                 }
@@ -137,6 +139,7 @@ export default defineEventHandler(async (event) => {
                 : {
                     refusedImages: r?.refusedImages || [],
                     reason: errMsg,
+                    diagnostics: r?.errorData || null,
                 } as any,
             error: errMsg ?? null as any,
             durationMs: r.durationMs ?? null as any,
