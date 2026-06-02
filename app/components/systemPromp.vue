@@ -1,6 +1,22 @@
 <script setup lang="ts">
-import type { SystemPrompt } from '~/server/db/schema'
 import { refreshNuxtData } from '#app'
+
+type SystemPrompt = {
+  id: number
+  TextPrompt: string
+  serverImages?: string[] | null
+  modelImages?: string[] | null
+  outputImage: string
+  generationModel?: string | null
+  inputTokens?: number | null
+  outputTokens?: number | null
+  totalTokens?: number | null
+  priceUsd?: string | null
+  priceSource?: string | null
+  gatewayGenerationId?: string | null
+  createdAt: string
+  errors?: string | null
+}
 
 const props = defineProps<{ data: SystemPrompt }>()
 const dataStore = useDataStore()
@@ -174,7 +190,7 @@ async function regenerate() {
   >
     <div v-if="props.data?.outputImage" class="relative">
       <DownloadableImage
-        :src="currentImage"
+        :src="currentImage || props.data?.outputImage || ''"
         :alt="props.data?.TextPrompt || 'Output image'"
         class="w-full h-auto object-contain bg-gray-50 dark:bg-gray-800"
       />
@@ -267,7 +283,7 @@ async function regenerate() {
           </UButton>
           <div class="flex items-center gap-1 text-[11px] text-gray-600 dark:text-gray-300">
             <span>×</span>
-            <UInput v-model.number="regenCount" type="number" size="xs" class="w-14" :ui="{ size: { xs: 'text-xs' } }" min="1" :disabled="regenLoading" />
+            <UInput v-model.number="regenCount" type="number" size="xs" class="w-14" min="1" :disabled="regenLoading" />
             <span>times</span>
           </div>
         </div>

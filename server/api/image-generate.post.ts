@@ -108,7 +108,6 @@ export default defineEventHandler(async (event) => {
         let errMsg: string | undefined = undefined
         let billing = result?.billing || {model}
         if (!r?.ok) {
-            recordData.prompt = 'Model refused these images' + (r?.reason ? ` (${r.reason})` : '')
             errMsg = r?.reason || 'unknown'
             billing = {model}
         }

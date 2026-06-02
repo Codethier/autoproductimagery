@@ -149,6 +149,12 @@ const selectedModelInfo = computed<ImageModelInfo | undefined>(() => {
   const items = modelsFetch.data.value?.items || []
   return items.find(m => m.id === data.selectedModel)
 })
+const selectedModelValue = computed<string | undefined>({
+  get: () => data.selectedModel || undefined,
+  set: (value) => {
+    data.selectedModel = value || null
+  }
+})
 
 const selectedPricingText = computed(() => {
   const details = selectedModelInfo.value?.pricingDetails
@@ -264,6 +270,7 @@ const gatewayLogs = useFetch<{ ok: boolean; items: AiGatewayLog[] }>('/api/ai-ga
 const debugLogsOpen = ref(false)
 const expandedLogIds = ref<Set<number>>(new Set())
 const gatewayLogItems = computed(() => gatewayLogs.data.value?.items || [])
+const gatewayLogsPending = computed(() => gatewayLogs.status.value === 'pending')
 const pendingGenerations = ref<PendingGeneration[]>([])
 const pendingTick = ref(Date.now())
 let pendingTimerId: ReturnType<typeof setInterval> | null = null
@@ -478,7 +485,7 @@ async function submit() {
           <div class="sm:col-span-2">
             <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Model</label>
             <USelect
-                v-model="data.selectedModel"
+                v-model="selectedModelValue"
                 :items="modelOptions"
                 placeholder="Select model"
                 class="w-full"
@@ -601,7 +608,7 @@ async function submit() {
           <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100">AI Gateway debug log</h2>
           <p class="text-xs text-gray-500 dark:text-gray-400">Raw request/response records for development</p>
         </div>
-        <UButton size="xs" variant="ghost" :loading="gatewayLogs.status === 'pending'" @click="gatewayLogs.refresh()">
+        <UButton size="xs" variant="ghost" :loading="gatewayLogsPending" @click="gatewayLogs.refresh()">
           Refresh
         </UButton>
       </div>
