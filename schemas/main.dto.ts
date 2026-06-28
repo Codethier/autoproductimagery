@@ -16,6 +16,8 @@ export type GenerateOptions = {
 
 type imageConfig= {
     aspectRatio?: string
+    // Generic AI SDK image-model size, e.g. "1024x1024" or "1536x1024".
+    size?: string
     // default is 1K in API
     imageSize?: '1K' | '2K' | '4K'
 }

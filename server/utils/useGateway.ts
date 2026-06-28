@@ -495,6 +495,13 @@ export async function useGateway() {
         const responseModalities = opts.responseModalities?.includes('IMAGE')
             ? ['TEXT', 'IMAGE']
             : ['TEXT', 'IMAGE']
+        const googleImageConfig = opts.imageConfig
+            ? {
+                aspectRatio: opts.imageConfig.aspectRatio,
+                imageSize: opts.imageConfig.imageSize,
+            }
+            : undefined
+        const hasGoogleImageConfig = !!googleImageConfig && Object.values(googleImageConfig).some(Boolean)
 
         const buildImagePrompt = (retry = false) => {
             const prompt = opts.prompt.trim()
@@ -516,7 +523,7 @@ export async function useGateway() {
                     google: {
                         responseModalities,
                         safetySettings,
-                        ...(opts.imageConfig ? {imageConfig: opts.imageConfig} : {}),
+                        ...(hasGoogleImageConfig ? {imageConfig: googleImageConfig} : {}),
                     } as any,
                 },
                 ...(hasFiles
@@ -612,6 +619,7 @@ export async function useGateway() {
             const res = await aiGenerateImage({
                 model,
                 prompt: promptArg,
+                size: opts.imageConfig?.size as any,
                 aspectRatio: opts.imageConfig?.aspectRatio as any,
                 providerOptions: {} as any,
             })
