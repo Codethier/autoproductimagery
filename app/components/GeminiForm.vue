@@ -208,15 +208,6 @@ const inputCapabilityWarning = computed(() => {
       : 'Selected images may be rejected because this model is text-to-image only.'
 })
 
-// Detect the nano-banana family (Gemini 3 Pro Image) for nano-only options.
-const nanoBananaModelId = computed(() => {
-  const items = modelsFetch.data.value?.items || []
-  const exact = items.find(m => m.id === 'google/gemini-3-pro-image')
-  if (exact) return exact.id
-  const match = items.find(m => /3[-_]?pro.*image/i.test(m.id) || /nano\s*banana/i.test(m.name))
-  return match?.id
-})
-
 // Default selection = most expensive priced model. Falls back to first listed.
 const defaultModel = computed(() => sortedModels.value[0]?.id)
 
@@ -224,8 +215,6 @@ const defaultModel = computed(() => sortedModels.value[0]?.id)
 watch(defaultModel, (v) => {
   if (v && !data.selectedModel) data.selectedModel = v
 }, { immediate: true })
-
-const isNanoBananaSelected = computed(() => !!nanoBananaModelId.value && data.selectedModel === nanoBananaModelId.value)
 
 type Option = { label: string; value: string }
 // Radix Select (used by USelect) does not allow an empty string as an item value.
@@ -245,20 +234,29 @@ const imageSizeOptions: Option[] = [
   { label: '2K', value: '2K' },
   { label: '4K', value: '4K' }
 ]
+const exactSizeOptions: Option[] = [
+  { label: '512x512', value: '512x512' },
+  { label: '1024x1024', value: '1024x1024' },
+  { label: '1024x1536', value: '1024x1536' },
+  { label: '1536x1024', value: '1536x1024' },
+  { label: '1024x1792', value: '1024x1792' },
+  { label: '1792x1024', value: '1792x1024' },
+  { label: '2048x2048', value: '2048x2048' },
+  { label: '864x1536', value: '864x1536' },
+  { label: '1536x864', value: '1536x864' }
+]
 
-// Clear or set sensible defaults when switching models
-watch(
-  () => data.selectedModel,
-  (newVal) => {
-    if (newVal !== nanoBananaModelId.value) {
-      // Do not send nano-only config for other models
-      data.imageConfig.aspectRatio = undefined
-      data.imageConfig.imageSize = undefined
-    } else {
-      // If not set, keep them undefined so API defaults apply; user can override
-    }
+function buildImageConfig() {
+  const aspectRatio = (!data.imageConfig.aspectRatio || data.imageConfig.aspectRatio === DEFAULT_ASPECT_RATIO)
+      ? undefined
+      : data.imageConfig.aspectRatio
+  const config = {
+    aspectRatio,
+    size: data.imageConfig.size || undefined,
+    imageSize: data.imageConfig.imageSize || undefined
   }
-)
+  return Object.values(config).some(Boolean) ? config : undefined
+}
 
 let pastPrompts = useFetch('/api/systemprompts', {deep: true, key: () => 'systemPrompts',})
 const gatewayLogs = useFetch<{ ok: boolean; items: AiGatewayLog[] }>('/api/ai-gateway-logs?limit=25', {
@@ -407,14 +405,7 @@ async function submit() {
             modelImages: job.modelImages,
             model: data.selectedModel || undefined,
             responseModalities: ['IMAGE'],
-            // Only include imageConfig if nanoBananaPro is selected
-            imageConfig: isNanoBananaSelected.value ? {
-              // Map sentinel or cleared value to undefined so the model decides
-              aspectRatio: (!data.imageConfig.aspectRatio || data.imageConfig.aspectRatio === DEFAULT_ASPECT_RATIO)
-                  ? undefined
-                  : data.imageConfig.aspectRatio,
-              imageSize: (data.imageConfig.imageSize as any) || undefined
-            } : undefined
+            imageConfig: buildImageConfig()
           }
         }
     )
@@ -494,8 +485,7 @@ async function submit() {
             />
             <p class="mt-1 text-xs text-gray-500 dark:text-gray-400 break-all">Using: {{ data.selectedModel }}</p>
           </div>
-          <!-- nanoBananaPro-only options -->
-          <div v-if="isNanoBananaSelected">
+          <div>
             <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Aspect ratio</label>
             <USelect
                 v-model="data.imageConfig.aspectRatio"
@@ -505,15 +495,25 @@ async function submit() {
             />
             <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">Optional. Choose image aspect ratio.</p>
           </div>
-          <div v-if="isNanoBananaSelected">
-            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Image size</label>
+          <div>
+            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Exact size</label>
+            <USelect
+                v-model="data.imageConfig.size"
+                :items="exactSizeOptions"
+                placeholder="Default (model decides)"
+                clearable
+            />
+            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">Optional. Sent to image models as width x height.</p>
+          </div>
+          <div>
+            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Gemini image size</label>
             <USelect
                 v-model="data.imageConfig.imageSize"
                 :items="imageSizeOptions"
                 placeholder="Default (1K)"
                 clearable
             />
-            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">Optional. Higher values take longer.</p>
+            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">Optional. Sent to Gemini image models as 1K, 2K, or 4K.</p>
           </div>
         </div>
         <aside class="rounded-lg border border-gray-200 dark:border-gray-800 bg-white/70 dark:bg-gray-900/60 p-3 text-sm">
