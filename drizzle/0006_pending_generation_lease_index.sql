@@ -1,0 +1,1 @@
+CREATE INDEX `systemPrompt_status_updatedAt_idx` ON `systemPrompt` (`status`,`updatedAt`);

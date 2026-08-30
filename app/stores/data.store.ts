@@ -1,19 +1,24 @@
+import {
+    DEFAULT_IMAGE_MODEL_ID,
+    createDefaultSettings,
+    type ImageGenerationSettings,
+    type ImageModelId,
+} from '~~/schemas/image-generation'
+
 export const useDataStore = defineStore('data', () => {
 
     let models = ref<Array<string>>([])
     let inputImages = ref<Array<string>>([])
-    // Selected AI Gateway model id (e.g. "google/gemini-2.5-flash-image")
-    let selectedModel = ref<string | null>(null)
-    // Additional image generation config for specific models (e.g., nanoBananaPro)
-    let imageConfig = reactive<{ aspectRatio?: string; size?: string; imageSize?: '1K' | '2K' | '4K' }>({})
-
-
+    let selectedModel = ref<ImageModelId>(DEFAULT_IMAGE_MODEL_ID)
+    let generationSettings = ref<ImageGenerationSettings>(createDefaultSettings(DEFAULT_IMAGE_MODEL_ID))
+    let maskImage = ref<string | null>(null)
 
     return {
         models,
         inputImages,
         selectedModel,
-        imageConfig
+        generationSettings,
+        maskImage,
     }
 
 })

@@ -1,26 +1,8 @@
-import {Dirent} from "node:fs";
-import {number, string} from "yup";
+import type { ImageGenerationRequest } from './image-generation'
 
-export type GenerateOptions = {
-    prompt: string
-    model?: string
-    responseModalities?: Array<'IMAGE' | 'TEXT'>
-    inputImages: Array<string>
-    modelImages?: Array<string>
-    storeInputImages?: boolean
-    safetySettings: any
-    imageConfig?: imageConfig
-
-    maxOutputTokens?: number
-}
-
-type imageConfig= {
-    aspectRatio?: string
-    // Generic AI SDK image-model size, e.g. "1024x1024" or "1536x1024".
-    size?: string
-    // default is 1K in API
-    imageSize?: '1K' | '2K' | '4K'
-}
+// Kept as an alias while older imports are migrated. The runtime contract lives
+// in image-generation.ts and must be parsed at every API boundary.
+export type GenerateOptions = ImageGenerationRequest
 export type inputImages = { mimeType: string; dataBase64: string }
 
 export type StreamChunk = {
@@ -31,10 +13,10 @@ export type StreamChunk = {
 
 export type SelectableFile = {
     name: string
-    parentPath: string
     url: string
     selectedModel: boolean
     selectedImage: boolean
+    selectedMask: boolean
 }
 
 export type  typeFileUploadDTO = {

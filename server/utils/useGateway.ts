@@ -1,6 +1,20 @@
-import {createGateway, experimental_generateImage as aiGenerateImage, generateText, type LanguageModel} from 'ai'
-import mime from 'mime'
-import * as mainSchema from '../../schemas/main.dto'
+import {createGateway, experimental_generateImage as aiGenerateImage, generateText} from 'ai'
+import {createProviderToolFactory} from '@ai-sdk/provider-utils'
+import {z} from 'zod'
+import {
+    IMAGE_MODEL_PROFILES,
+    ImageGenerationRequestSchema,
+    type ImageGenerationRequest,
+    type OutputMetadata,
+    type StoredGenerationError,
+} from '../../schemas/image-generation'
+import {settleWithinMs} from './gatewayTimeout'
+import {
+    getGatewayMetadataLookupPool,
+    sanitizeProviderMetadata,
+} from './gatewayMetadata'
+import { resolveGenerationTotalTokens } from './generationBilling'
+import { toBufferView } from './imageBuffer'
 
 // Supported model types reported by the gateway /config endpoint.
 export type GatewayModelType = 'language' | 'image' | 'embedding' | 'reranking' | 'video'
@@ -75,11 +89,192 @@ export type GeneratedImage = {
     buffer: Buffer
     mimeType: string
     billing: ImageGenerationBilling
+    responseText?: string
+    reasoningText?: string
+    warnings: string[]
+    grounding?: NonNullable<OutputMetadata['grounding']>
+}
+
+const googleSearchInputSchema = z.object({}).strict()
+type GoogleSearchArgs = {
+    searchTypes: {
+        webSearch?: Record<string, never>
+        imageSearch?: Record<string, never>
+    }
+}
+
+const googleSearchTool = createProviderToolFactory<z.infer<typeof googleSearchInputSchema>, GoogleSearchArgs>({
+    id: 'google.google_search',
+    inputSchema: googleSearchInputSchema,
+})
+
+const SECRET_KEY_PATTERN = /authorization|api[-_]?key|cookie|credential|password|secret|access[-_]?token|refresh[-_]?token/i
+const RETRYABLE_STATUS_CODES = new Set([408, 409, 425, 429])
+export const DEFAULT_IMAGE_GENERATION_TIMEOUT_MS = 180_000
+export const MIN_IMAGE_GENERATION_TIMEOUT_MS = 10_000
+export const MAX_IMAGE_GENERATION_TIMEOUT_MS = 600_000
+const GATEWAY_METADATA_TIMEOUT_MS = 10_000
+
+export function resolveImageGenerationTimeoutMs(value: unknown): number {
+    const parsed = typeof value === 'number'
+        ? value
+        : typeof value === 'string' && value.trim().length > 0
+            ? Number(value)
+            : Number.NaN
+    if (!Number.isFinite(parsed)) return DEFAULT_IMAGE_GENERATION_TIMEOUT_MS
+    return Math.min(
+        MAX_IMAGE_GENERATION_TIMEOUT_MS,
+        Math.max(MIN_IMAGE_GENERATION_TIMEOUT_MS, Math.round(parsed)),
+    )
+}
+
+function getImageGenerationTimeoutMs(): number {
+    const runtimeConfig = useRuntimeConfig() as Record<string, unknown>
+    return resolveImageGenerationTimeoutMs(
+        runtimeConfig.imageGenerationTimeoutMs
+        ?? process.env.NUXT_IMAGE_GENERATION_TIMEOUT_MS,
+    )
+}
+
+function isTimeoutLikeError(error: unknown, seen = new WeakSet<object>()): boolean {
+    if (!error || typeof error !== 'object') return false
+    if (seen.has(error)) return false
+    seen.add(error)
+    const record = error as Record<string, unknown>
+    const name = typeof record.name === 'string' ? record.name : ''
+    const code = typeof record.code === 'string' ? record.code : ''
+    const message = typeof record.message === 'string' ? record.message : ''
+    if (/timeout/i.test(name) || /(?:ETIMEDOUT|UND_ERR_CONNECT_TIMEOUT)/i.test(code)) return true
+    if (/timed?\s*out|timeout/i.test(message)) return true
+    return isTimeoutLikeError(record.lastError, seen) || isTimeoutLikeError(record.cause, seen)
+}
+
+function redactString(value: string): string {
+    const redacted = value
+        .replace(/Bearer\s+[^\s,;]+/gi, 'Bearer [REDACTED]')
+        .replace(/([?&](?:key|api_key|apiKey|token)=)[^&\s]+/gi, '$1[REDACTED]')
+        .replace(/data:[^;,\s]+;base64,[A-Za-z0-9+/=]+/gi, '[REDACTED_DATA_URL]')
+    return redacted.length > 8_000 ? `${redacted.slice(0, 8_000)}...[truncated]` : redacted
+}
+
+function redactSerializable(
+    value: unknown,
+    depth = 0,
+    seen = new WeakSet<object>(),
+): unknown {
+    if (value == null || typeof value === 'boolean' || typeof value === 'number') return value
+    if (typeof value === 'string') return redactString(value)
+    if (typeof value === 'bigint') return value.toString()
+    if (typeof value === 'function' || typeof value === 'symbol') return undefined
+    if (Buffer.isBuffer(value) || value instanceof Uint8Array || value instanceof ArrayBuffer) {
+        return '[REDACTED_BINARY]'
+    }
+    if (depth >= 5) return '[truncated]'
+    if (typeof value !== 'object') return redactString(String(value))
+    if (seen.has(value)) return '[circular]'
+    seen.add(value)
+
+    if (Array.isArray(value)) {
+        return value.slice(0, 25).map(item => redactSerializable(item, depth + 1, seen))
+    }
+
+    const source = value instanceof Error
+        ? {
+            ...value as unknown as Record<string, unknown>,
+            name: value.name,
+            message: value.message,
+            ...(value.cause !== undefined ? {cause: value.cause} : {}),
+        }
+        : value as Record<string, unknown>
+    const result: Record<string, unknown> = {}
+    for (const [key, nested] of Object.entries(source).slice(0, 50)) {
+        if (key === 'stack') continue
+        result[key] = SECRET_KEY_PATTERN.test(key)
+            ? '[REDACTED]'
+            : redactSerializable(nested, depth + 1, seen)
+    }
+    return result
+}
+
+function findHeader(headers: unknown, name: string): string | undefined {
+    if (headers instanceof Headers) return headers.get(name) ?? undefined
+    if (!headers || typeof headers !== 'object') return undefined
+    const record = headers as Record<string, unknown>
+    const value = record[name] ?? record[name.toLowerCase()] ?? record[name.toUpperCase()]
+    return typeof value === 'string' && value.length > 0 ? value : undefined
+}
+
+function serializeGatewayError(error: unknown): StoredGenerationError {
+    const record = error && typeof error === 'object' ? error as Record<string, unknown> : {}
+    const lastError = record.lastError && typeof record.lastError === 'object'
+        ? record.lastError as Record<string, unknown>
+        : undefined
+    const response = record.response && typeof record.response === 'object'
+        ? record.response as Record<string, unknown>
+        : undefined
+    const statusCandidate = record.statusCode ?? record.status ?? lastError?.statusCode ?? lastError?.status ?? response?.status
+    const statusCode = typeof statusCandidate === 'number' && Number.isInteger(statusCandidate)
+        ? statusCandidate
+        : undefined
+    const codeCandidate = record.code ?? lastError?.code
+    const code = typeof codeCandidate === 'string' ? redactString(codeCandidate) : undefined
+    const messageCandidate = record.message ?? lastError?.message
+    const message = redactString(
+        typeof messageCandidate === 'string' && messageCandidate.length > 0
+            ? messageCandidate
+            : String(error || 'Unknown Gateway error'),
+    )
+    const headers = record.responseHeaders ?? lastError?.responseHeaders ?? response?.headers
+    const requestId = [
+        record.requestId,
+        lastError?.requestId,
+        findHeader(headers, 'x-request-id'),
+        findHeader(headers, 'x-vercel-id'),
+        findHeader(headers, 'request-id'),
+    ].find(value => typeof value === 'string' && value.length > 0) as string | undefined
+    const explicitRetryable = record.retryable ?? record.isRetryable ?? lastError?.retryable ?? lastError?.isRetryable
+    const retryable = typeof explicitRetryable === 'boolean'
+        ? explicitRetryable
+        : statusCode != null
+            ? RETRYABLE_STATUS_CODES.has(statusCode) || statusCode >= 500
+            : undefined
+    const nameCandidate = record.name ?? lastError?.name
+
+    return {
+        name: typeof nameCandidate === 'string' ? redactString(nameCandidate) : undefined,
+        message,
+        statusCode,
+        code,
+        retryable,
+        requestId: requestId ? redactString(requestId) : undefined,
+        details: redactSerializable({
+            error: record,
+            ...(lastError ? {lastError} : {}),
+        }),
+    }
+}
+
+function formatWarnings(warnings: readonly unknown[] | undefined): string[] {
+    if (!warnings) return []
+    return warnings.map((warning) => {
+        if (typeof warning === 'string') return redactString(warning)
+        if (!warning || typeof warning !== 'object') return redactString(String(warning))
+        const value = warning as Record<string, unknown>
+        if (value.type === 'other' && typeof value.message === 'string') return redactString(value.message)
+        const feature = typeof value.feature === 'string' ? value.feature : 'provider setting'
+        const details = typeof value.details === 'string' ? `: ${value.details}` : ''
+        return redactString(`${String(value.type || 'warning')} ${feature}${details}`)
+    })
+}
+
+function mergeWarnings(...groups: Array<readonly string[] | undefined>): string[] {
+    return [...new Set(groups.flatMap(group => group ?? []).filter(Boolean))]
 }
 
 let _gateway: ReturnType<typeof createGateway> | null = null
 let _modelCache: { at: number; items: GatewayModelInfo[] } | null = null
 const MODEL_CACHE_TTL_MS = 10 * 60 * 1000
+const gatewayMetadataPool = getGatewayMetadataLookupPool()
 
 const IMAGE_PRICE_OVERRIDES: Record<string, { kind: 'fixed-image' | 'megapixel'; amountUsd: number; label: string; note?: string }> = {
     // The AI SDK Gateway config currently exposes these image-only models as
@@ -287,7 +482,20 @@ export async function useGateway() {
         if (_modelCache && Date.now() - _modelCache.at < MODEL_CACHE_TTL_MS) {
             models = _modelCache.items
         } else {
-            const res = await gateway.getAvailableModels()
+            const lookup = gatewayMetadataPool.start(
+                'model-catalog',
+                () => gateway.getAvailableModels(),
+            )
+            if (!lookup) {
+                const error = new Error('Gateway metadata capacity is temporarily unavailable.')
+                error.name = 'GatewayMetadataCapacityError'
+                throw error
+            }
+            const res = await settleWithinMs(
+                lookup,
+                GATEWAY_METADATA_TIMEOUT_MS,
+                'Gateway model catalog lookup',
+            )
             models = (res.models || []).map(m => ({
                 id: m.id,
                 name: m.name,
@@ -329,7 +537,7 @@ export async function useGateway() {
             totalTokens: asNumber(usage.totalTokens),
             cachedInputTokens: asNumber(usage.cachedInputTokens ?? usage.inputTokenDetails?.cacheReadTokens),
             reasoningTokens: asNumber(usage.reasoningTokens ?? usage.outputTokenDetails?.reasoningTokens),
-            raw: usage.raw,
+            raw: sanitizeProviderMetadata(usage.raw),
         }
     }
 
@@ -381,7 +589,16 @@ export async function useGateway() {
     async function getActualGatewayBilling(generationId: string | undefined) {
         if (!generationId || typeof (gateway as any).getGenerationInfo !== 'function') return undefined
         try {
-            return await (gateway as any).getGenerationInfo({id: generationId})
+            const lookup = gatewayMetadataPool.start(
+                `generation:${generationId}`,
+                () => (gateway as any).getGenerationInfo({id: generationId}) as Promise<any>,
+            )
+            if (!lookup) return undefined
+            return await settleWithinMs<any>(
+                lookup,
+                GATEWAY_METADATA_TIMEOUT_MS,
+                'Gateway billing lookup',
+            )
         } catch (e) {
             // Gateway generation-info can lag or return non-standard errors.
             // Billing still falls back to model pricing + reported token usage.
@@ -392,43 +609,52 @@ export async function useGateway() {
     async function getGenerationBilling(generationId: string | undefined, fallbackModel?: string): Promise<ImageGenerationBilling | undefined> {
         const gatewayBilling = await getActualGatewayBilling(generationId)
         if (!gatewayBilling) return undefined
+        const inputTokens = asNumber(gatewayBilling.promptTokens)
+        const outputTokens = asNumber(gatewayBilling.completionTokens)
         return {
             model: typeof gatewayBilling.model === 'string' ? gatewayBilling.model : fallbackModel,
-            inputTokens: asNumber(gatewayBilling.promptTokens),
-            outputTokens: asNumber(gatewayBilling.completionTokens),
+            inputTokens,
+            outputTokens,
             cachedInputTokens: asNumber(gatewayBilling.cachedTokens),
             reasoningTokens: asNumber(gatewayBilling.reasoningTokens),
-            totalTokens: (
-                asNumber(gatewayBilling.promptTokens) != null ||
-                asNumber(gatewayBilling.completionTokens) != null ||
-                asNumber(gatewayBilling.reasoningTokens) != null
-            )
-                ? (asNumber(gatewayBilling.promptTokens) ?? 0) +
-                  (asNumber(gatewayBilling.completionTokens) ?? 0) +
-                  (asNumber(gatewayBilling.reasoningTokens) ?? 0)
-                : undefined,
+            totalTokens: resolveGenerationTotalTokens(
+                asNumber(gatewayBilling.totalTokens ?? gatewayBilling.total_tokens),
+                inputTokens,
+                outputTokens,
+            ),
             priceUsd: asNumber(gatewayBilling.totalCost)?.toFixed(8),
             priceSource: 'gateway',
             gatewayGenerationId: generationId,
-            usageJson: {gatewayBilling},
+            usageJson: {gatewayBilling: sanitizeProviderMetadata(gatewayBilling)},
         }
     }
 
-    async function buildBilling(modelId: string, usageSource: any, providerMetadata: any): Promise<ImageGenerationBilling> {
+    async function buildBilling(
+        modelId: string,
+        usageSource: any,
+        providerMetadata: any,
+        outputImages = 1,
+    ): Promise<ImageGenerationBilling> {
         const usage = normalizeUsage(usageSource)
         const generationId = getGatewayGenerationId(providerMetadata)
         const gatewayBilling = await getActualGatewayBilling(generationId)
-        const info = await getModelInfo(modelId)
+        let info: GatewayModelInfo | undefined
+        try {
+            info = await getModelInfo(modelId)
+        } catch {
+            // Catalog availability must not turn a completed generation into a failure.
+            info = undefined
+        }
         const enrichedInfo = info ? enrichImageModelInfo(info) : undefined
 
         const inputTokens = asNumber(gatewayBilling?.promptTokens) ?? usage.inputTokens
         const outputTokens = asNumber(gatewayBilling?.completionTokens) ?? usage.outputTokens
         const cachedInputTokens = asNumber(gatewayBilling?.cachedTokens) ?? usage.cachedInputTokens
         const reasoningTokens = asNumber(gatewayBilling?.reasoningTokens) ?? usage.reasoningTokens
-        const totalTokens = usage.totalTokens ?? (
-            inputTokens != null || outputTokens != null || reasoningTokens != null
-                ? (inputTokens ?? 0) + (outputTokens ?? 0) + (reasoningTokens ?? 0)
-                : undefined
+        const totalTokens = resolveGenerationTotalTokens(
+            asNumber(gatewayBilling?.totalTokens ?? gatewayBilling?.total_tokens) ?? usage.totalTokens,
+            inputTokens,
+            outputTokens,
         )
         const estimatedPrice = estimatePriceUsd({
             inputTokens,
@@ -437,7 +663,7 @@ export async function useGateway() {
             cachedInputTokens,
             reasoningTokens,
         }, enrichedInfo?.pricing)
-        const imageMeteredEstimate = estimateImageMeteredPriceUsd(enrichedInfo)
+        const imageMeteredEstimate = estimateImageMeteredPriceUsd(enrichedInfo, outputImages)
         const gatewayPrice = asNumber(gatewayBilling?.totalCost)?.toFixed(8)
 
         return {
@@ -453,8 +679,8 @@ export async function useGateway() {
             usageJson: {
                 usage,
                 ...(enrichedInfo?.pricingDetails ? {pricingDetails: enrichedInfo.pricingDetails} : {}),
-                ...(gatewayBilling ? {gatewayBilling} : {}),
-                ...(providerMetadata ? {providerMetadata} : {}),
+                ...(gatewayBilling ? {gatewayBilling: sanitizeProviderMetadata(gatewayBilling)} : {}),
+                ...(providerMetadata ? {providerMetadata: sanitizeProviderMetadata(providerMetadata)} : {}),
             },
         }
     }
@@ -463,215 +689,366 @@ export async function useGateway() {
         _modelCache = null
     }
 
-    async function loadInputFiles(opts: mainSchema.GenerateOptions) {
-        const all = [...opts.inputImages, ...(opts.modelImages || [])]
-        const out: Array<{ buffer: Buffer; mediaType: string }> = []
-        for (const i of all) {
-            const buf = await fs.getFile(i)
-            out.push({
-                buffer: Buffer.from(buf),
-                mediaType: mime.getType(i) || 'application/octet-stream',
-            })
-        }
-        return out
-    }
-
-    /**
-     * Image-out via language-model with IMAGE modality (Gemini family).
-     * `providerOptions.google` is forwarded by gateway to Google's backend.
-     */
-    async function generateImageViaLanguageModel(opts: mainSchema.GenerateOptions & { model: string }): Promise<GeneratedImage> {
-        const model: LanguageModel = gateway.languageModel(opts.model)
-        const files = await loadInputFiles(opts)
-        const hasFiles = files.length > 0
-
-        const safetySettings = [
-            {category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'OFF'},
-            {category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'OFF'},
-            {category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'OFF'},
-            {category: 'HARM_CATEGORY_HARASSMENT', threshold: 'OFF'},
-        ]
-
-        const responseModalities = opts.responseModalities?.includes('IMAGE')
-            ? ['TEXT', 'IMAGE']
-            : ['TEXT', 'IMAGE']
-        const googleImageConfig = opts.imageConfig
-            ? {
-                aspectRatio: opts.imageConfig.aspectRatio,
-                imageSize: opts.imageConfig.imageSize,
-            }
-            : undefined
-        const hasGoogleImageConfig = !!googleImageConfig && Object.values(googleImageConfig).some(Boolean)
-
-        const buildImagePrompt = (retry = false) => {
-            const prompt = opts.prompt.trim()
-            if (hasFiles) return prompt
-
-            return [
-                'Generate exactly one image from the user prompt below.',
-                'Return an actual image file in the response. Do not answer with text only, and do not merely describe the image.',
-                retry ? 'The previous attempt did not include an image file; this attempt must include an image file.' : '',
-                '',
-                'User prompt:',
-                prompt,
-            ].filter(Boolean).join('\n')
-        }
-
-        const callGeminiImageModel = (prompt: string) => generateText({
-                model,
-                providerOptions: {
-                    google: {
-                        responseModalities,
-                        safetySettings,
-                        ...(hasGoogleImageConfig ? {imageConfig: googleImageConfig} : {}),
-                    } as any,
-                },
-                ...(hasFiles
-                    ? {
-                        messages: [
-                            {
-                                role: 'user' as const,
-                                content: [
-                                    {type: 'text' as const, text: prompt},
-                                    ...files.map(f => ({type: 'file' as const, data: f.buffer, mediaType: f.mediaType})),
-                                ],
-                            },
-                        ],
-                    }
-                    : {prompt}),
-            })
-
-        let response: Awaited<ReturnType<typeof generateText>>
-        try {
-            response = await callGeminiImageModel(buildImagePrompt())
-        } catch (e: any) {
-            throw createError({
-                statusCode: 502,
-                statusMessage: `Gateway request failed: ${e?.message || e}`,
-                data: {refusedImages: opts.inputImages, reason: e?.message || 'unknown', prompt: opts.prompt},
-            })
-        }
-
-        const imageFile = (response.files || []).find(f => f.mediaType?.startsWith('image/'))
-        if (imageFile) {
-            return {
-                buffer: Buffer.from(imageFile.uint8Array),
-                mimeType: imageFile.mediaType || 'image/png',
-                billing: await buildBilling(response.response?.modelId || opts.model, (response as any).totalUsage ?? response.usage, response.providerMetadata),
-            }
-        }
-
-        const text = response.text
-        if (!hasFiles && typeof text === 'string' && text.length > 0) {
-            try {
-                response = await callGeminiImageModel(buildImagePrompt(true))
-                const retryImageFile = (response.files || []).find(f => f.mediaType?.startsWith('image/'))
-                if (retryImageFile) {
-                    return {
-                        buffer: Buffer.from(retryImageFile.uint8Array),
-                        mimeType: retryImageFile.mediaType || 'image/png',
-                        billing: await buildBilling(response.response?.modelId || opts.model, (response as any).totalUsage ?? response.usage, response.providerMetadata),
-                    }
-                }
-            } catch (e: any) {
+    async function loadInputFiles(opts: ImageGenerationRequest) {
+        const paths = [...opts.inputImages, ...opts.modelImages]
+        const files: Array<{buffer: Buffer; mediaType: string}> = []
+        const allowedMediaTypes = opts.model === 'openai/gpt-image-2'
+            ? new Set(['image/png', 'image/jpeg', 'image/webp'])
+            : new Set(['image/png', 'image/jpeg', 'image/webp', 'image/heic'])
+        let totalBytes = 0
+        for (const imagePath of paths) {
+            const image = await fs.getImageFile(imagePath)
+            if (!allowedMediaTypes.has(image.mimeType)) {
                 throw createError({
-                    statusCode: 502,
-                    statusMessage: `Gateway retry failed after text-only response: ${e?.message || e}`,
-                    data: {refusedImages: opts.inputImages, reason: e?.message || 'unknown', prompt: opts.prompt},
+                    statusCode: 415,
+                    statusMessage: `${opts.model} does not accept ${image.mimeType} reference images. Use PNG, JPEG, WebP${opts.model === 'openai/gpt-image-2' ? '' : ', or HEIC'}.`,
                 })
             }
-        }
-
-        if (typeof text === 'string' && text.length > 0) {
-            throw createError({
-                statusCode: 500,
-                statusMessage: `Expected image output but got text: ${text.slice(0, 200)}`,
+            totalBytes += image.buffer.length
+            if (totalBytes > 100 * 1024 * 1024) {
+                throw createError({
+                    statusCode: 413,
+                    statusMessage: 'Reference images may total at most 100 MB per provider request.',
+                })
+            }
+            files.push({
+                buffer: image.buffer,
+                mediaType: image.mimeType,
             })
         }
+        return files
+    }
 
+    async function loadMaskFile(opts: ImageGenerationRequest): Promise<Buffer | undefined> {
+        if (!opts.maskImage) return undefined
+        const mask = await fs.getImageFile(opts.maskImage)
+        return mask.buffer
+    }
+
+    function validationError(issues: z.core.$ZodIssue[]): never {
+        const errorData: StoredGenerationError = {
+            name: 'ValidationError',
+            message: 'Image generation request does not match the selected model profile.',
+            statusCode: 400,
+            code: 'INVALID_IMAGE_GENERATION_REQUEST',
+            retryable: false,
+            details: {issues: redactSerializable(issues)},
+        }
+        throw createError({
+            statusCode: 400,
+            statusMessage: errorData.message,
+            data: errorData,
+        })
+    }
+
+    function validateGenerationRequest(opts: ImageGenerationRequest): ImageGenerationRequest {
+        const parsed = ImageGenerationRequestSchema.safeParse(opts)
+        if (!parsed.success) validationError(parsed.error.issues)
+        return parsed.data
+    }
+
+    function throwGatewayError(prefix: string, error: unknown): never {
+        const errorData = serializeGatewayError(error)
+        const upstreamStatus = errorData.statusCode
+        throw createError({
+            statusCode: upstreamStatus != null && upstreamStatus >= 400 && upstreamStatus <= 599
+                ? upstreamStatus
+                : 502,
+            statusMessage: `${prefix}: ${errorData.message}`,
+            data: errorData,
+        })
+    }
+
+    function throwGatewayTimeout(prefix: string, timeoutMs: number, error: unknown): never {
+        const errorData: StoredGenerationError = {
+            name: 'ProviderCallTimeoutError',
+            message: `${prefix} timed out after ${timeoutMs} ms.`,
+            statusCode: 504,
+            code: 'PROVIDER_CALL_TIMEOUT',
+            retryable: true,
+            details: redactSerializable({timeoutMs, cause: error}),
+        }
+        throw createError({
+            statusCode: 504,
+            statusMessage: errorData.message,
+            data: errorData,
+        })
+    }
+
+    function noImageError(model: string, finishReason: unknown, responseText?: string): never {
+        const reason = typeof finishReason === 'string' && finishReason.length > 0
+            ? finishReason
+            : 'unknown'
+        const errorData: StoredGenerationError = {
+            name: 'NoImageGeneratedError',
+            message: `Model ${model} returned no image (${reason}).`,
+            statusCode: 422,
+            code: 'NO_IMAGE_GENERATED',
+            retryable: false,
+            details: {
+                finishReason: reason,
+                ...(responseText ? {responseText: redactString(responseText)} : {}),
+            },
+        }
         throw createError({
             statusCode: 422,
-            statusMessage: 'Model refused these images' + (response.finishReason ? ': ' + response.finishReason : ''),
-            data: {
-                refusedImages: opts.inputImages,
-                reason: response.finishReason || 'unknown',
-                prompt: opts.prompt,
+            statusMessage: errorData.message,
+            data: errorData,
+        })
+    }
+
+    function createGoogleSearch(grounding: 'web' | 'images' | 'web-and-images') {
+        return googleSearchTool({
+            searchTypes: {
+                ...(grounding === 'web' || grounding === 'web-and-images' ? {webSearch: {}} : {}),
+                ...(grounding === 'web-and-images' ? {imageSearch: {}} : {}),
+                ...(grounding === 'images' ? {imageSearch: {}} : {}),
             },
         })
     }
 
-    /**
-     * Pure image model (modelType === 'image'). Uses experimental_generateImage.
-     * Supports input images for providers that allow edit/img2img (e.g. openai/gpt-image-1).
-     */
-    async function generateImageViaImageModel(opts: mainSchema.GenerateOptions & { model: string }): Promise<GeneratedImage> {
-        const model = gateway.imageModel(opts.model)
-        const files = await loadInputFiles(opts)
-
-        const promptArg: any = files.length > 0
-            ? {
-                text: opts.prompt,
-                images: files.map(f => f.buffer),
-            }
-            : opts.prompt
-
-        try {
-            const res = await aiGenerateImage({
-                model,
-                prompt: promptArg,
-                size: opts.imageConfig?.size as any,
-                aspectRatio: opts.imageConfig?.aspectRatio as any,
-                providerOptions: {} as any,
+    function extractGrounding(response: any): NonNullable<OutputMetadata['grounding']> | undefined {
+        const seen = new Set<string>()
+        const sources: Array<{url: string; title?: string}> = []
+        for (const source of Array.isArray(response?.sources) ? response.sources : []) {
+            const url = typeof source?.url === 'string' ? source.url : undefined
+            if (!url || seen.has(url) || !/^https?:\/\//i.test(url)) continue
+            seen.add(url)
+            sources.push({
+                url,
+                ...(typeof source?.title === 'string' && source.title ? {title: source.title} : {}),
             })
-            const img = res.image || res.images?.[0]
-            if (!img) {
-                throw createError({statusCode: 500, statusMessage: 'No image returned'})
-            }
-            const responseModelId = res.responses?.[0]?.modelId || opts.model
-            return {
-                buffer: Buffer.from(img.uint8Array),
-                mimeType: img.mediaType || 'image/png',
-                billing: await buildBilling(responseModelId, res.usage, res.providerMetadata),
-            }
-        } catch (e: any) {
-            throw createError({
-                statusCode: 502,
-                statusMessage: `Gateway image request failed: ${e?.message || e}`,
-                data: {refusedImages: opts.inputImages, reason: e?.message || 'unknown', prompt: opts.prompt},
-            })
+            if (sources.length >= 50) break
         }
+        const metadata = response?.providerMetadata?.google?.groundingMetadata
+        const rawHtml = metadata?.searchEntryPoint?.renderedContent
+            ?? metadata?.searchEntryPoint?.rendered_content
+            ?? metadata?.searchSuggestions
+        const searchEntryPointHtml = typeof rawHtml === 'string' && rawHtml.length > 0
+            ? rawHtml.slice(0, 100_000)
+            : undefined
+        if (!sources.length && !searchEntryPointHtml) return undefined
+        return {sources, ...(searchEntryPointHtml ? {searchEntryPointHtml} : {})}
     }
 
     /**
-     * Routes to the right call based on modelType. Looks up model info from cache.
+     * Gemini image models are multimodal language models. Their exact profile,
+     * not a Gateway catalog heuristic, determines this generateText path.
      */
-    async function generateAnyImage(opts: mainSchema.GenerateOptions & { model: string }): Promise<GeneratedImage> {
-        const info = await getModelInfo(opts.model)
-        if (!info) {
-            throw createError({statusCode: 400, statusMessage: `Unknown model: ${opts.model}`})
+    async function generateImageViaLanguageModel(opts: ImageGenerationRequest): Promise<GeneratedImage[]> {
+        const request = validateGenerationRequest(opts)
+        if (request.settings.kind === 'openai-gpt-image-2') {
+            validationError([{
+                code: 'custom',
+                path: ['model'],
+                message: `${request.model} is not a Gateway language image model.`,
+                input: request.model,
+            }])
         }
-        const hasImageInputs = opts.inputImages.length > 0 || (opts.modelImages || []).length > 0
-        if (hasImageInputs && !supportsImageInput(info)) {
-            throw createError({
-                statusCode: 400,
-                statusMessage: `Model ${opts.model} does not support input images through AI Gateway. Remove selected input/model images or choose an image-edit model such as GPT Image, Gemini image, or FLUX Kontext/FLUX.2.`,
-                data: {
-                    refusedImages: [...opts.inputImages, ...(opts.modelImages || [])],
-                    reason: 'Model does not support input images',
-                    prompt: opts.prompt,
+
+        const profile = IMAGE_MODEL_PROFILES[request.model]
+        if (profile.adapter !== 'gateway-language-image') {
+            validationError([{
+                code: 'custom',
+                path: ['model'],
+                message: `${request.model} does not use the Gateway language-image adapter.`,
+                input: request.model,
+            }])
+        }
+
+        const settings = request.settings
+        const files = await loadInputFiles(request)
+        const safetySettings = [
+            {category: 'HARM_CATEGORY_HATE_SPEECH', threshold: settings.safety.hateSpeech},
+            {category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: settings.safety.dangerousContent},
+            {category: 'HARM_CATEGORY_HARASSMENT', threshold: settings.safety.harassment},
+            {category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: settings.safety.sexuallyExplicit},
+        ]
+        const imageConfig = {
+            ...(settings.aspectRatio ? {aspectRatio: settings.aspectRatio} : {}),
+            ...('imageSize' in settings ? {imageSize: settings.imageSize} : {}),
+        }
+        const thinkingConfig = settings.kind === 'gemini-3.1-flash-image'
+            || settings.kind === 'gemini-3.1-flash-lite-image'
+            ? {
+                thinkingLevel: settings.thinkingLevel,
+                includeThoughts: settings.includeThoughts,
+            }
+            : settings.kind === 'gemini-3-pro-image'
+                ? {includeThoughts: settings.includeThoughts}
+                : undefined
+        const grounding = 'grounding' in settings ? settings.grounding : 'off'
+        const searchTool = grounding === 'web' || grounding === 'images' || grounding === 'web-and-images'
+            ? createGoogleSearch(grounding)
+            : undefined
+        const timeoutMs = getImageGenerationTimeoutMs()
+        const abortSignal = AbortSignal.timeout(timeoutMs)
+
+        const callGateway = () => generateText({
+            model: gateway.languageModel(request.model),
+            maxRetries: 0,
+            abortSignal,
+            timeout: {totalMs: timeoutMs},
+            providerOptions: {
+                google: {
+                    responseModalities: settings.includeText ? ['TEXT', 'IMAGE'] : ['IMAGE'],
+                    ...(Object.keys(imageConfig).length > 0 ? {imageConfig} : {}),
+                    safetySettings,
+                    ...(thinkingConfig ? {thinkingConfig} : {}),
                 },
-            })
-        }
-        if (info.modelType === 'image') {
-            return generateImageViaImageModel(opts)
-        }
-        if (isImageOutputLanguageModel(info)) {
-            return generateImageViaLanguageModel(opts)
-        }
-        throw createError({
-            statusCode: 400,
-            statusMessage: `Model ${opts.model} does not support image output`,
+            },
+            ...settings.sampling,
+            ...(searchTool ? {tools: {google_search: searchTool}} : {}),
+            ...(files.length > 0
+                ? {
+                    messages: [{
+                        role: 'user' as const,
+                        content: [
+                            {type: 'text' as const, text: request.prompt},
+                            ...files.map(file => ({
+                                type: 'file' as const,
+                                data: file.buffer,
+                                mediaType: file.mediaType,
+                            })),
+                        ],
+                    }],
+                }
+                : {prompt: request.prompt}),
         })
+        let response: Awaited<ReturnType<typeof callGateway>>
+        try {
+            response = await callGateway()
+        } catch (error) {
+            if (abortSignal.aborted || isTimeoutLikeError(error)) {
+                throwGatewayTimeout('Gateway Gemini request', timeoutMs, error)
+            }
+            throwGatewayError('Gateway Gemini request failed', error)
+        }
+
+        const images = response.files.filter(file => file.mediaType?.startsWith('image/'))
+        if (images.length === 0) noImageError(request.model, response.finishReason, response.text)
+
+        const billing = await buildBilling(
+            response.response?.modelId || request.model,
+            response.totalUsage,
+            response.providerMetadata,
+            images.length,
+        )
+        const warnings = mergeWarnings(profile.warnings, formatWarnings(response.warnings))
+        const responseText = settings.includeText && response.text.length > 0
+            ? response.text
+            : undefined
+        const reasoningText = 'includeThoughts' in settings
+            && settings.includeThoughts
+            && typeof response.reasoningText === 'string'
+            && response.reasoningText.length > 0
+            ? response.reasoningText
+            : undefined
+        const groundingMetadata = searchTool ? extractGrounding(response) : undefined
+
+        return images.map(file => ({
+            buffer: toBufferView(file.uint8Array),
+            mimeType: file.mediaType || 'image/png',
+            billing,
+            ...(responseText ? {responseText} : {}),
+            ...(reasoningText ? {reasoningText} : {}),
+            ...(groundingMetadata ? {grounding: groundingMetadata} : {}),
+            warnings,
+        }))
+    }
+
+    /**
+     * GPT Image 2 is a Gateway image model. Only schema-backed options are sent;
+     * unsupported aspectRatio, seed, inputFidelity, and transparency controls are
+     * intentionally absent.
+     */
+    async function generateImageViaImageModel(opts: ImageGenerationRequest): Promise<GeneratedImage[]> {
+        const request = validateGenerationRequest(opts)
+        if (request.settings.kind !== 'openai-gpt-image-2') {
+            validationError([{
+                code: 'custom',
+                path: ['model'],
+                message: `${request.model} is not the supported Gateway image model.`,
+                input: request.model,
+            }])
+        }
+
+        const profile = IMAGE_MODEL_PROFILES[request.model]
+        if (profile.adapter !== 'gateway-image') {
+            validationError([{
+                code: 'custom',
+                path: ['model'],
+                message: `${request.model} does not use the Gateway image adapter.`,
+                input: request.model,
+            }])
+        }
+
+        const settings = request.settings
+        const files = await loadInputFiles(request)
+        const mask = await loadMaskFile(request)
+        const prompt = files.length > 0 || mask
+            ? {
+                text: request.prompt,
+                images: files.map(file => file.buffer),
+                ...(mask ? {mask} : {}),
+            }
+            : request.prompt
+        const openaiOptions = {
+            quality: settings.quality,
+            background: settings.background,
+            outputFormat: settings.outputFormat,
+            moderation: settings.moderation,
+            ...(settings.outputCompression != null ? {outputCompression: settings.outputCompression} : {}),
+            ...(settings.user ? {user: settings.user} : {}),
+        }
+        const timeoutMs = getImageGenerationTimeoutMs()
+        const abortSignal = AbortSignal.timeout(timeoutMs)
+
+        let response: Awaited<ReturnType<typeof aiGenerateImage>>
+        try {
+            response = await aiGenerateImage({
+                model: gateway.imageModel(request.model),
+                maxRetries: 0,
+                prompt,
+                n: settings.numberOfImages,
+                abortSignal,
+                ...(settings.size ? {size: settings.size as `${number}x${number}`} : {}),
+                providerOptions: {openai: openaiOptions},
+            })
+        } catch (error) {
+            if (abortSignal.aborted || isTimeoutLikeError(error)) {
+                throwGatewayTimeout('Gateway GPT Image 2 request', timeoutMs, error)
+            }
+            throwGatewayError('Gateway GPT Image 2 request failed', error)
+        }
+
+        if (response.images.length === 0) noImageError(request.model, 'no image files')
+        const responseModelId = response.responses.find(item => item.modelId)?.modelId || request.model
+        const billing = await buildBilling(
+            responseModelId,
+            response.usage,
+            response.providerMetadata,
+            response.images.length,
+        )
+        const warnings = mergeWarnings(profile.warnings, formatWarnings(response.warnings))
+        const fallbackMimeType = settings.outputFormat === 'jpeg'
+            ? 'image/jpeg'
+            : `image/${settings.outputFormat}`
+
+        return response.images.map(image => ({
+            buffer: toBufferView(image.uint8Array),
+            mimeType: image.mediaType || fallbackMimeType,
+            billing,
+            warnings,
+        }))
+    }
+
+    async function generateAnyImage(opts: ImageGenerationRequest): Promise<GeneratedImage[]> {
+        const request = validateGenerationRequest(opts)
+        const profile = IMAGE_MODEL_PROFILES[request.model]
+        return profile.adapter === 'gateway-language-image'
+            ? generateImageViaLanguageModel(request)
+            : generateImageViaImageModel(request)
     }
 
     return {

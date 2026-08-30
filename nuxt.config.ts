@@ -5,19 +5,17 @@
 // guards against `typeof localStorage === "undefined"`, so SSR crashes during
 // timeline init. Null it out before any module loads so the guard passes.
 try {
-    if (typeof (globalThis as any).localStorage !== 'undefined') {
-        Object.defineProperty(globalThis, 'localStorage', {
-            value: null,
-            configurable: true,
-            writable: true,
-        })
-    }
-    if (typeof (globalThis as any).sessionStorage !== 'undefined') {
-        Object.defineProperty(globalThis, 'sessionStorage', {
-            value: null,
-            configurable: true,
-            writable: true,
-        })
+    for (const storageName of ['localStorage', 'sessionStorage'] as const) {
+        // Reading Node's experimental getter emits a warning before Nuxt even
+        // starts. Inspect the descriptor and replace it without invoking it.
+        const descriptor = Object.getOwnPropertyDescriptor(globalThis, storageName)
+        if (!descriptor || descriptor.configurable) {
+            Object.defineProperty(globalThis, storageName, {
+                value: null,
+                configurable: true,
+                writable: true,
+            })
+        }
     }
 } catch { /* no-op */ }
 
@@ -32,9 +30,13 @@ export default defineNuxtConfig({
     // debug: true,
     runtimeConfig: {
         //         private
-        AiGatewayApiKey: '',
-        authUser: '',
-        authPassword: '',
+         AiGatewayApiKey: '',
+         authUser: '',
+         authPassword: '',
+         imageGenerationConcurrency: 3,
+         imageGenerationMaxQueue: 25,
+         imageGenerationTimeoutMs: 180_000,
+         imageGenerationStaleTtlMs: 15 * 60_000,
         //     public
         public: {}
     },

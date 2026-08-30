@@ -1,5 +1,10 @@
 import {sql} from "drizzle-orm";
-import {sqliteTable, integer, text} from "drizzle-orm/sqlite-core";
+import {sqliteTable, integer, text, index} from "drizzle-orm/sqlite-core";
+import type {
+    OutputMetadata,
+    StoredGenerationConfig,
+    StoredGenerationError,
+} from "~~/schemas/image-generation";
 
 export const systemPrompt = sqliteTable("systemPrompt", {
     id: integer("id").primaryKey({autoIncrement: true}),
@@ -21,7 +26,17 @@ export const systemPrompt = sqliteTable("systemPrompt", {
     createdAt: text("createdAt").default(sql`CURRENT_TIMESTAMP`).notNull(),
     updatedAt: text("updatedAt").default(sql`CURRENT_TIMESTAMP`).notNull(),
     errors: text("errors"),
-});
+    status: text("status").$type<'pending' | 'succeeded' | 'failed'>(),
+    batchId: text("batchId"),
+    parentSystemPromptId: integer("parentSystemPromptId"),
+    generationConfig: text("generationConfig", {mode: "json"}).$type<StoredGenerationConfig>(),
+    outputMetadata: text("outputMetadata", {mode: "json"}).$type<OutputMetadata>(),
+    errorJson: text("errorJson", {mode: "json"}).$type<StoredGenerationError>(),
+}, (table) => [
+    index("systemPrompt_batchId_idx").on(table.batchId),
+    index("systemPrompt_parentSystemPromptId_idx").on(table.parentSystemPromptId),
+    index("systemPrompt_status_updatedAt_idx").on(table.status, table.updatedAt),
+]);
 
 export const aiGatewayLog = sqliteTable("aiGatewayLog", {
     id: integer("id").primaryKey({autoIncrement: true}),
@@ -43,8 +58,17 @@ export const aiGatewayLog = sqliteTable("aiGatewayLog", {
     responseJson: text("responseJson", {mode: "json"}).$type<Record<string, unknown>>(),
     error: text("error"),
     durationMs: integer("durationMs"),
+    batchId: text("batchId"),
+    attemptNumber: integer("attemptNumber"),
+    providerRequestId: text("providerRequestId"),
+    resolvedConfigJson: text("resolvedConfigJson", {mode: "json"}).$type<StoredGenerationConfig>(),
+    errorJson: text("errorJson", {mode: "json"}).$type<StoredGenerationError>(),
     createdAt: text("createdAt").default(sql`CURRENT_TIMESTAMP`).notNull(),
-});
+}, (table) => [
+    index("aiGatewayLog_systemPromptId_idx").on(table.systemPromptId),
+    index("aiGatewayLog_batchId_idx").on(table.batchId),
+    index("aiGatewayLog_gatewayGenerationId_idx").on(table.gatewayGenerationId),
+]);
 
 export type SystemPrompt = typeof systemPrompt.$inferSelect;
 export type NewSystemPrompt = typeof systemPrompt.$inferInsert;

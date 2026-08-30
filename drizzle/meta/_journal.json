@@ -36,6 +36,20 @@
       "when": 1779559239843,
       "tag": "0004_ai_gateway_log_and_priceSource",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1786711673375,
+      "tag": "0005_generation_metadata",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1786720096900,
+      "tag": "0006_pending_generation_lease_index",
+      "breakpoints": true
     }
   ]
 }

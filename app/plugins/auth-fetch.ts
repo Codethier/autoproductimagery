@@ -2,14 +2,17 @@ export default defineNuxtPlugin(() => {
   if (!import.meta.client) return
 
   const router = useRouter()
+  const authenticated = useState<boolean | undefined>('auth-session', () => undefined)
+  const baseFetch = $fetch
   let loggingOut = false
 
   async function logout(reason: 'unauthorized' | 'forbidden') {
     if (loggingOut) return
     loggingOut = true
+    authenticated.value = false
 
-    const auth = useCookie<string | null>('auth', { path: '/' })
-    auth.value = null
+    // Only the server can clear the HttpOnly session cookie.
+    await baseFetch('/api/logout', { method: 'POST' }).catch(() => undefined)
 
     const current = router.currentRoute.value
     if (current.path === '/login') {
@@ -31,16 +34,11 @@ export default defineNuxtPlugin(() => {
     loggingOut = false
   }
 
-  globalThis.$fetch = $fetch.create({
+  globalThis.$fetch = baseFetch.create({
     onResponseError({ response }) {
       const status = response?.status
       if (status === 401) return logout('unauthorized')
       if (status === 403) return logout('forbidden')
     }
   })
-
-  const auth = useCookie<string | null>('auth', { path: '/' })
-  if (auth.value && router.currentRoute.value.path !== '/login') {
-    $fetch('/api/testCredentials').catch(() => {})
-  }
 })

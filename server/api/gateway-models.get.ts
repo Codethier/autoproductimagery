@@ -1,14 +1,16 @@
 import {z} from 'zod'
 import {type GatewayModelInfo, useGateway} from '~~/server/utils/useGateway'
+import {SUPPORTED_IMAGE_MODEL_IDS} from '~~/schemas/image-generation'
 
 const QuerySchema = z.object({
-    type: z.enum(['language', 'image', 'embedding', 'reranking', 'video']).optional(),
+    type: z.enum(['language', 'image']).optional(),
     search: z.string().min(1).max(200).optional(),
     refresh: z.union([z.literal('1'), z.literal('true')]).optional(),
 })
 
 let cache: { at: number; items: GatewayModelInfo[] } | null = null
 const CACHE_TTL_MS = 10 * 60 * 1000
+const CURATED_IMAGE_MODELS = new Set<string>(SUPPORTED_IMAGE_MODEL_IDS)
 
 export default defineEventHandler(async (event) => {
     useAuth(event)
@@ -27,7 +29,7 @@ export default defineEventHandler(async (event) => {
         cached = true
     } else {
         const gw = await useGateway()
-        items = await gw.listModels()
+        items = (await gw.listModels()).filter(model => CURATED_IMAGE_MODELS.has(model.id))
         cache = {at: Date.now(), items}
     }
 

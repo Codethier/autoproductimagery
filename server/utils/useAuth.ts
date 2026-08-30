@@ -1,13 +1,13 @@
-import { H3Event, getCookie, createError, getHeader } from 'h3'
+import type { H3Event } from 'h3'
+import { createError, getCookie } from 'h3'
 import { useRuntimeConfig } from '#imports'
+import { AUTH_COOKIE_NAME, verifyAuthSessionToken } from './authSession'
 
 /**
  * Validates incoming request against credentials stored in env (runtimeConfig).
  *
- * Sources (checked in order):
- * - Cookie named "auth" with value "user:pass"
- *
- * Throws 401 Unauthorized if validation fails. Returns void on success.
+ * Validates the opaque, signed session cookie issued by /api/login.
+ * Throws 401 Unauthorized if validation fails.
  */
 export function useAuth(event: H3Event): void {
   const { authUser, authPassword } = useRuntimeConfig()
@@ -20,11 +20,8 @@ export function useAuth(event: H3Event): void {
     throw createError({ statusCode: 500, statusMessage: 'Server auth not configured' })
   }
 
-  // 1) Try cookie: "auth" = "user:pass"
-  const rawCookie = getCookie(event, 'auth') || ''
-    if (rawCookie === `${expectedUser}:${expectedPass}`) {
-      return
-    }
+  const sessionToken = getCookie(event, AUTH_COOKIE_NAME) || ''
+  if (verifyAuthSessionToken(sessionToken, expectedUser, expectedPass)) return
 
   throw createError({ statusCode: 401, statusMessage: 'Unauthorized' })
 }

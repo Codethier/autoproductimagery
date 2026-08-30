@@ -21,19 +21,24 @@ async function onSubmit() {
   try {
     loading.value = true
 
-    // Set the cookie expected by server-side useAuth: "auth" = "user:pass"
-    const auth = useCookie<string>('auth', { path: '/', sameSite: 'lax' })
-    auth.value = `${form.username}:${form.password}`
-    await nextTick()
-
-    // test credentials
-    const ok = await $fetch('/api/testCredentials')
+    // The server verifies credentials and issues an opaque HttpOnly session cookie.
+    const ok = await $fetch('/api/login', {
+      method: 'POST',
+      body: {
+        username: form.username,
+        password: form.password
+      }
+    })
     if (ok !== true) {
       throw new Error('Invalid credentials')
     }
+    useState<boolean | undefined>('auth-session', () => undefined).value = true
 
     // Navigate to intended destination
-    const target = (route.query.redirect as string) || '/'
+    const requestedTarget = typeof route.query.redirect === 'string' ? route.query.redirect : '/'
+    const target = requestedTarget.startsWith('/') && !requestedTarget.startsWith('//')
+      ? requestedTarget
+      : '/'
     await router.replace(target)
     toast.add({ title: 'Signed in', description: 'You have been signed in.' })
   } catch (e) {
