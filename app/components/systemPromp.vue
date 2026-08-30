@@ -1,12 +1,21 @@
 <script setup lang="ts">
 import { refreshNuxtData } from '#app'
+import {
+  ImageModelIdSchema,
+  StoredGenerationConfigSchema,
+  canonicalizeImageModelId,
+  createDefaultSettings,
+  getImageModelProfile,
+  type OutputMetadata,
+  type StoredGenerationConfig,
+} from '~~/schemas/image-generation'
 
 type SystemPrompt = {
   id: number
   TextPrompt: string
   serverImages?: string[] | null
   modelImages?: string[] | null
-  outputImage: string
+  outputImage: string | null
   generationModel?: string | null
   inputTokens?: number | null
   outputTokens?: number | null
@@ -16,10 +25,18 @@ type SystemPrompt = {
   gatewayGenerationId?: string | null
   createdAt: string
   errors?: string | null
+  status?: 'pending' | 'succeeded' | 'failed' | null
+  parentSystemPromptId?: number | null
+  generationConfig?: StoredGenerationConfig | null
+  outputMetadata?: OutputMetadata | null
 }
 
 const props = defineProps<{ data: SystemPrompt }>()
-const dataStore = useDataStore()
+const historyData = useNuxtData<{items?: SystemPrompt[]}>('systemPrompts')
+const detailData = ref<SystemPrompt | null>(null)
+const detailLoading = ref(false)
+const detailLoaded = ref(false)
+const outputMetadata = computed(() => detailData.value?.outputMetadata ?? props.data?.outputMetadata)
 
 const createdAt = computed(() => {
   const d = props.data?.createdAt ? new Date(props.data.createdAt) : null
@@ -27,6 +44,56 @@ const createdAt = computed(() => {
 })
 
 const generationModelText = computed(() => props.data?.generationModel || '')
+const replayConfig = computed<StoredGenerationConfig | null>(() => {
+  const stored = StoredGenerationConfigSchema.safeParse(props.data?.generationConfig)
+  if (stored.success) return stored.data
+  const canonical = canonicalizeImageModelId(props.data?.generationModel)
+  const model = ImageModelIdSchema.safeParse(canonical)
+  if (!model.success) return null
+  const profile = getImageModelProfile(model.data)
+  if (!profile) return null
+  return {
+    schemaVersion: 1,
+    profileVersion: profile.profileVersion,
+    requestedModel: props.data?.generationModel || model.data,
+    effectiveModel: model.data,
+    settings: createDefaultSettings(model.data),
+    storeInputImages: true,
+  }
+})
+const isLegacyConfig = computed(() => !StoredGenerationConfigSchema.safeParse(props.data?.generationConfig).success)
+const replayUnavailableReason = computed(() => {
+  const config = replayConfig.value
+  if (!config) return 'The original model is no longer in the curated catalog.'
+  const storedInputs = Array.isArray(props.data?.serverImages) ? props.data.serverImages : []
+  const sharedInputs = Array.isArray(props.data?.modelImages) ? props.data.modelImages : []
+  if (!config.storeInputImages
+      && storedInputs.length === 0
+      && sharedInputs.length === 0
+      && !props.data?.parentSystemPromptId) {
+    return 'The original source image was not retained, so this edit cannot be replayed exactly.'
+  }
+  return ''
+})
+const settingsSummary = computed(() => {
+  const settings = replayConfig.value?.settings
+  if (!settings) return ''
+  if (settings.kind === 'openai-gpt-image-2') {
+    return `${settings.size || 'auto size'} · ${settings.quality} · ${settings.outputFormat.toUpperCase()}`
+  }
+  const size = 'imageSize' in settings ? settings.imageSize : '1K'
+  return `${settings.aspectRatio || 'input/default ratio'} · ${size}`
+})
+const outputDimensions = computed(() => {
+  const metadata = outputMetadata.value
+  return metadata?.width && metadata?.height ? `${metadata.width}×${metadata.height}` : ''
+})
+const grounding = computed(() => outputMetadata.value?.grounding)
+function singleOutputDerivativeSettings(settings: StoredGenerationConfig['settings']) {
+  return settings.kind === 'openai-gpt-image-2'
+    ? {...settings, numberOfImages: 1 as const}
+    : settings
+}
 const tokenUsageText = computed(() => {
   const total = props.data?.totalTokens
   const input = props.data?.inputTokens
@@ -55,6 +122,24 @@ const regenCount = ref<number>(1)
 const toast = useToast()
 const billingLoading = ref(false)
 
+async function loadOutputDetails() {
+  if (detailLoading.value || detailLoaded.value) return
+  detailLoading.value = true
+  try {
+    const response = await $fetch<{ok: true; item: SystemPrompt}>(`/api/systemprompts/${props.data.id}`)
+    detailData.value = response.item
+    detailLoaded.value = true
+  } catch (error: any) {
+    toast.add({
+      title: 'Could not load output details',
+      description: error?.data?.statusMessage || error?.message || 'Try again later.',
+      color: 'warning',
+    })
+  } finally {
+    detailLoading.value = false
+  }
+}
+
 const chatInput = ref('')
 const chatLoading = ref(false)
 // Current output for this card. Regenerate can advance this value.
@@ -75,6 +160,11 @@ async function sendRefine() {
     return
   }
   const sourceImage = currentImage.value
+  const config = replayConfig.value
+  if (!config) {
+    toast.add({ title: 'Original model is unavailable', description: 'This legacy item cannot be refined safely without choosing a replacement explicitly.', color: 'warning' })
+    return
+  }
   chatInput.value = ''
   chatLoading.value = true
   try {
@@ -84,9 +174,14 @@ async function sendRefine() {
         prompt: text,
         inputImages: [sourceImage],
         modelImages: [],
-        storeInputImages: false,
-        model: dataStore.selectedModel || undefined,
-        responseModalities: ['IMAGE'],
+        // Preserve the exact edit source so replay means replay, not another
+        // edit of whatever output happens to be displayed later.
+        storeInputImages: true,
+        model: config.effectiveModel,
+        // Refinement is intentionally a single-output derivative. Regenerate
+        // below preserves the stored output-count setting exactly.
+        settings: singleOutputDerivativeSettings(config.settings),
+        parentSystemPromptId: props.data.id,
       },
     })
     const row = res?.obj?.[0]
@@ -134,12 +229,38 @@ async function regenerate() {
     regenLoading.value = true
     const storedInputImages = Array.isArray(props.data?.serverImages) ? props.data.serverImages : []
     const modelImages = Array.isArray(props.data?.modelImages) ? props.data.modelImages : []
-    let chainInput = currentImage.value || storedInputImages[0]
-
-    if (!chainInput && storedInputImages.length === 0 && !props.data?.outputImage) {
-      toast.add({ title: 'Cannot regenerate', description: 'No source image stored for this item.', color: 'warning' })
+    const config = replayConfig.value
+    if (!config || replayUnavailableReason.value) {
+      toast.add({
+        title: 'Cannot regenerate',
+        description: replayUnavailableReason.value || 'The original generation configuration is unavailable.',
+        color: 'warning',
+      })
       return
     }
+    let replayInputs = storedInputImages
+    if (replayInputs.length === 0 && props.data.parentSystemPromptId) {
+      // Backward-compatible replay for refinements created before exact source
+      // images were retained: their parent output was the refinement source.
+      let parent = historyData.data.value?.items?.find(item => item.id === props.data.parentSystemPromptId)
+      if (!parent?.outputImage) {
+        const response = await $fetch<{ok: true; item: SystemPrompt}>(`/api/systemprompts/${props.data.parentSystemPromptId}`)
+          .catch(() => undefined)
+        parent = response?.item
+      }
+      if (!parent?.outputImage) {
+        toast.add({
+          title: 'Cannot reproduce this refinement',
+          description: 'Its exact source image is no longer available.',
+          color: 'warning',
+        })
+        return
+      }
+      replayInputs = [parent.outputImage]
+    }
+    const replayMask = replayInputs.length > 0 || modelImages.length > 0
+        ? config.maskImage
+        : undefined
 
     // Ask the user to edit/confirm the prompt before regenerating
     const currentPrompt = props.data?.TextPrompt || ''
@@ -153,21 +274,22 @@ async function regenerate() {
 
     // Run the job count times
     for (let i = 0; i < count; i++) {
-      const inputImages = chainInput ? [chainInput] : storedInputImages
       const res = await $fetch<{ ok: boolean; obj: SystemPrompt[] }>('/api/image-generate', {
         method: 'POST',
         body: {
           prompt: editedPrompt,
-          inputImages,
+          inputImages: replayInputs,
           modelImages,
-          model: props.data?.generationModel || dataStore.selectedModel || undefined,
-          responseModalities: ['IMAGE']
+          maskImage: replayMask,
+          model: config.effectiveModel,
+          settings: config.settings,
+          storeInputImages: true,
+          parentSystemPromptId: props.data.id,
         }
       })
       const row = res?.obj?.[0]
       if (row?.outputImage && !row.errors) {
         currentImage.value = row.outputImage
-        chainInput = row.outputImage
       } else {
         throw new Error(row?.errors || 'Unknown generation error')
       }
@@ -211,12 +333,21 @@ async function regenerate() {
       </p>
 
       <div
-        v-if="generationModelText || tokenUsageText || priceText"
+        v-if="generationModelText || tokenUsageText || priceText || settingsSummary || outputDimensions"
         class="grid grid-cols-1 gap-1 text-[11px] text-gray-600 dark:text-gray-400 bg-gray-50 dark:bg-gray-800/70 rounded p-2"
       >
         <div v-if="generationModelText">
           <span class="font-medium text-gray-700 dark:text-gray-300">Model:</span>
           {{ generationModelText }}
+        </div>
+        <div v-if="settingsSummary">
+          <span class="font-medium text-gray-700 dark:text-gray-300">Settings:</span>
+          {{ settingsSummary }}
+          <span v-if="isLegacyConfig" class="text-amber-600 dark:text-amber-300"> (legacy defaults inferred)</span>
+        </div>
+        <div v-if="outputDimensions">
+          <span class="font-medium text-gray-700 dark:text-gray-300">Output:</span>
+          {{ outputDimensions }}
         </div>
         <div v-if="tokenUsageText">
           <span class="font-medium text-gray-700 dark:text-gray-300">Tokens:</span>
@@ -250,6 +381,57 @@ async function regenerate() {
         <span class="whitespace-pre-line">{{ props.data.errors }}</span>
       </div>
 
+      <UButton
+        v-if="props.data?.outputImage && !outputMetadata && !detailLoaded"
+        size="xs"
+        variant="soft"
+        color="neutral"
+        :loading="detailLoading"
+        @click="loadOutputDetails"
+      >
+        Load output details
+      </UButton>
+
+      <div
+        v-if="outputMetadata?.responseText"
+        class="rounded border border-gray-200 bg-gray-50 p-2 text-xs whitespace-pre-wrap text-gray-700 dark:border-gray-800 dark:bg-gray-800/60 dark:text-gray-200"
+      >
+        {{ outputMetadata.responseText }}
+      </div>
+
+      <details v-if="outputMetadata?.reasoningText" class="text-xs text-gray-600 dark:text-gray-300">
+        <summary class="cursor-pointer">Thought summary</summary>
+        <div class="mt-1 whitespace-pre-wrap rounded bg-gray-50 p-2 dark:bg-gray-800/60">{{ outputMetadata.reasoningText }}</div>
+      </details>
+
+      <details v-if="outputMetadata?.warnings?.length" class="text-xs text-amber-700 dark:text-amber-300">
+        <summary class="cursor-pointer">Provider warnings ({{ outputMetadata.warnings.length }})</summary>
+        <ul class="mt-1 list-disc space-y-1 pl-5">
+          <li v-for="warning in outputMetadata.warnings" :key="warning">{{ warning }}</li>
+        </ul>
+      </details>
+
+      <div v-if="grounding" class="rounded border border-blue-200 bg-blue-50 p-2 text-xs dark:border-blue-900 dark:bg-blue-950/30">
+        <div class="font-medium text-blue-900 dark:text-blue-100">Google Search grounding</div>
+        <div v-if="grounding.sources.length" class="mt-1 flex flex-wrap gap-x-3 gap-y-1">
+          <a
+            v-for="source in grounding.sources"
+            :key="source.url"
+            :href="source.url"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="text-blue-700 underline dark:text-blue-300"
+          >{{ source.title || source.url }}</a>
+        </div>
+        <iframe
+          v-if="grounding.searchEntryPointHtml"
+          :srcdoc="grounding.searchEntryPointHtml"
+          sandbox="allow-popups allow-popups-to-escape-sandbox"
+          title="Google Search suggestions"
+          class="mt-2 h-16 w-full rounded border-0 bg-white"
+        />
+      </div>
+
       <div v-if="props.data?.serverImages?.length" class="mt-1">
         <div class="text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Input image(s)</div>
         <div class="grid grid-cols-5 gap-1">
@@ -278,7 +460,7 @@ async function regenerate() {
 
       <div class="flex items-center justify-between">
         <div class="flex items-center gap-2">
-          <UButton size="xs" :loading="regenLoading" :disabled="regenLoading || (!currentImage && !(props.data?.serverImages?.length))" @click="regenerate">
+          <UButton size="xs" :loading="regenLoading" :disabled="regenLoading || !!replayUnavailableReason" @click="regenerate">
             Regenerate
           </UButton>
           <div class="flex items-center gap-1 text-[11px] text-gray-600 dark:text-gray-300">
@@ -286,6 +468,9 @@ async function regenerate() {
             <UInput v-model.number="regenCount" type="number" size="xs" class="w-14" min="1" :disabled="regenLoading" />
             <span>times</span>
           </div>
+          <p v-if="replayUnavailableReason" class="text-xs text-amber-700 dark:text-amber-300">
+            {{ replayUnavailableReason }}
+          </p>
         </div>
         <span class="text-[11px] text-gray-500 dark:text-gray-400">{{ createdAt }}</span>
       </div>

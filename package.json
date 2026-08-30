@@ -7,6 +7,7 @@
     "dev": "nuxt dev",
     "generate": "nuxt generate",
     "preview": "nuxt preview",
+    "test": "node --test tests/*.test.ts",
     "postinstall": "nuxt prepare",
     "drizzle:generate": "drizzle-kit generate",
     "drizzle:push": "drizzle-kit push",
@@ -14,11 +15,13 @@
     "drizzle:migrate": "drizzle-kit migrate"
   },
   "dependencies": {
+    "@ai-sdk/provider-utils": "^4.0.27",
     "@ai-sdk/vue": "^3.0.177",
+    "@fastify/busboy": "^3.2.0",
     "@libsql/client": "^0.15.15",
     "@nuxt/image": "^1.11.0",
     "@nuxt/scripts": "^0.11.13",
-    "@nuxt/ui": "^4.0.0",
+    "@nuxt/ui": "^4.10.0",
     "@unhead/vue": "^2.0.14",
     "ai": "^6.0.177",
     "dotenv": "^17.2.1",
@@ -26,20 +29,22 @@
     "mime": "^4.0.7",
     "mime-types": "^3.0.1",
     "nuxt": "^4.4.2",
+    "sharp": "^0.32.6",
     "typescript": "^5.9.2",
     "unstorage": "^1.17.1",
     "vue": "^3.5.20",
-    "vue-router": "^4.5.1",
+    "vue-router": "^5.0.3",
     "yup": "^1.7.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@pinia/nuxt": "^0.11.2",
     "@types/mime-types": "^3.0.1",
-    "@types/node": "^24.3.0",
-    "drizzle-kit": "^0.31.4"
+    "@types/node": "^26.2.0",
+    "drizzle-kit": "^0.31.4",
+    "vue-tsc": "^3.3.9"
   },
   "engines": {
-    "node": "24.x"
+    "node": "26.x"
   }
 }

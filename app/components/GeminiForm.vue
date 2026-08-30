@@ -1,4 +1,19 @@
 <script setup lang="ts">
+import type { Component } from 'vue'
+import {
+  IMAGE_MODEL_PROFILES,
+  ImageGenerationRequestSchema,
+  SUPPORTED_IMAGE_MODEL_IDS,
+  createDefaultSettings,
+  type ImageModelProfile,
+  type ImageModelId,
+} from '~~/schemas/image-generation'
+import Gemini31FlashImageSettings from './generation-settings/Gemini31FlashImageSettings.vue'
+import Gemini3ProImageSettings from './generation-settings/Gemini3ProImageSettings.vue'
+import Gemini31FlashLiteImageSettings from './generation-settings/Gemini31FlashLiteImageSettings.vue'
+import Gemini25FlashImageSettings from './generation-settings/Gemini25FlashImageSettings.vue'
+import OpenAiGptImage2Settings from './generation-settings/OpenAiGptImage2Settings.vue'
+
 const data = useDataStore()
 const prompt = ref('')
 const errorMsg = ref<string | null>(null)
@@ -29,6 +44,7 @@ type PricingDetails = {
 }
 
 type ModelCapabilities = {
+  referenceInputScope: 'images-only'
   output: Array<'image' | 'text'>
   input: Array<'text' | 'image' | 'multiple-images'>
   operations: Array<'text-to-image' | 'image-edit' | 'image-to-image' | 'multi-reference'>
@@ -44,6 +60,10 @@ type ImageModelInfo = {
   pricing?: ModelPricing
   pricingDetails?: PricingDetails
   capabilities?: ModelCapabilities
+  profile: ImageModelProfile
+  available: boolean
+  catalogStatus: 'available' | 'unavailable' | 'unknown'
+  availabilityNote?: string
 }
 
 type AiGatewayLog = {
@@ -91,70 +111,55 @@ function fmtPerMillion(perTokenUsd?: string) {
   return v < 1 ? `$${v.toFixed(3)}` : `$${v.toFixed(2)}`
 }
 
-function pricingLabel(p?: ModelPricing) {
-  if (!p) return ''
-  const inp = fmtPerMillion(p.input)
-  const out = fmtPerMillion(p.output)
-  if (!inp && !out) return ''
-  return ` - ${inp ?? '?'} in / ${out ?? '?'} out per 1M tok`
-}
-
-function priceScore(p?: ModelPricing) {
-  if (!p) return -1
-  const inp = Number(p.input) || 0
-  const out = Number(p.output) || 0
-  // Weight output 4x - typical chat ratio, also avoids zero-input image models tying.
-  const score = inp + out * 4
-  return score > 0 ? score : -1
-}
-
-function modelPriceScore(m: ImageModelInfo) {
-  const fixed = m.pricingDetails?.components.find(c => c.kind === 'fixed-image' && c.amountUsd != null)
-  if (fixed?.amountUsd) return fixed.amountUsd
-  const perMp = m.pricingDetails?.components.find(c => c.kind === 'megapixel' && c.amountUsd != null)
-  if (perMp?.amountUsd) return perMp.amountUsd / 2
-  return priceScore(m.pricing)
-}
-
-function acceptsImageInput(m: ImageModelInfo) {
-  return !!m.capabilities?.input?.includes('image')
-}
-
-const sortedModels = computed<ImageModelInfo[]>(() => {
-  const items = [...(modelsFetch.data.value?.items || [])]
-  items.sort((a, b) => {
-    const aImageInput = acceptsImageInput(a) ? 1 : 0
-    const bImageInput = acceptsImageInput(b) ? 1 : 0
-    if (bImageInput !== aImageInput) return bImageInput - aImageInput
-
-    const da = modelPriceScore(a)
-    const db = modelPriceScore(b)
-    if (db !== da) return db - da // expensive first within capability group; unpriced (-1) sinks.
-
-    return a.id.localeCompare(b.id)
-  })
-  return items
-})
-
-type ModelOption = { label: string; value: string; icon: string }
-const modelOptions = computed<ModelOption[]>(() => {
-  return sortedModels.value.map(m => ({
-    label: `${m.provider} - ${m.name || m.id.split('/').pop()}`,
-    value: m.id,
-    icon: acceptsImageInput(m) ? 'i-lucide-images' : 'i-lucide-type'
-  }))
-})
+type ModelOption = { label: string; value: ImageModelId; icon: string; disabled: boolean }
+const modelOptions = computed<ModelOption[]>(() => SUPPORTED_IMAGE_MODEL_IDS.map((id) => {
+  const item = modelsFetch.data.value?.items.find(model => model.id === id)
+  const profile = item?.profile ?? IMAGE_MODEL_PROFILES[id]
+  const usable = !!item && item.catalogStatus !== 'unavailable'
+  const statusLabel = item?.catalogStatus === 'unknown'
+      ? ' — unverified'
+      : usable
+          ? ''
+          : ' — unavailable'
+  return {
+    label: `${profile.shortName}${profile.lifecycle === 'recommended' ? ' (Recommended)' : ''}${statusLabel}`,
+    value: id,
+    icon: profile.provider === 'openai' ? 'i-lucide-image' : 'i-lucide-sparkles',
+    disabled: !usable,
+  }
+}))
 
 const selectedModelInfo = computed<ImageModelInfo | undefined>(() => {
   const items = modelsFetch.data.value?.items || []
   return items.find(m => m.id === data.selectedModel)
 })
-const selectedModelValue = computed<string | undefined>({
-  get: () => data.selectedModel || undefined,
+const selectedProfile = computed(() => selectedModelInfo.value?.profile ?? IMAGE_MODEL_PROFILES[data.selectedModel])
+// A catalog outage is not proof that the exact, curated model is unavailable.
+// Keep generation usable while showing that live availability is unverified.
+const selectedModelAvailable = computed(() => !!selectedModelInfo.value
+    && selectedModelInfo.value.catalogStatus !== 'unavailable')
+const selectedModelValue = computed<ImageModelId | undefined>({
+  get: () => data.selectedModel,
   set: (value) => {
-    data.selectedModel = value || null
+    if (value && SUPPORTED_IMAGE_MODEL_IDS.includes(value)) {
+      data.selectedModel = value
+    }
   }
 })
+
+const settingsComponents: Record<ImageModelProfile['settingsComponent'], Component> = {
+  Gemini31FlashImageSettings,
+  Gemini3ProImageSettings,
+  Gemini31FlashLiteImageSettings,
+  Gemini25FlashImageSettings,
+  OpenAiGptImage2Settings,
+}
+const selectedSettingsComponent = computed(() => settingsComponents[selectedProfile.value.settingsComponent])
+
+watch(() => data.selectedModel, (model, previousModel) => {
+  if (model !== previousModel) data.generationSettings = createDefaultSettings(model)
+  if (!selectedProfile.value.supportsMask) data.maskImage = null
+}, {flush: 'sync'})
 
 const selectedPricingText = computed(() => {
   const details = selectedModelInfo.value?.pricingDetails
@@ -175,7 +180,10 @@ const selectedPricingText = computed(() => {
 const selectedPricingMethod = computed(() => selectedModelInfo.value?.pricingDetails?.method || 'unknown')
 const selectedPricingComponents = computed(() => selectedModelInfo.value?.pricingDetails?.components || [])
 const selectedCapabilities = computed(() => selectedModelInfo.value?.capabilities)
-const selectedWarnings = computed(() => selectedCapabilities.value?.warnings || [])
+const selectedWarnings = computed(() => Array.from(new Set([
+  ...selectedProfile.value.warnings,
+  ...(selectedCapabilities.value?.warnings || []),
+])))
 const selectedCapabilityPills = computed(() => {
   const caps = selectedCapabilities.value
   if (!caps) return []
@@ -185,7 +193,10 @@ const selectedCapabilityPills = computed(() => {
     ...caps.output.filter(v => v !== 'image').map(v => v + ' output')
   ]
 })
-const estimatedOutputCount = computed(() => Math.max(1, data.inputImages.length))
+const outputsPerJob = computed(() => data.generationSettings.kind === 'openai-gpt-image-2'
+    ? data.generationSettings.numberOfImages
+    : 1)
+const estimatedOutputCount = computed(() => Math.max(1, data.inputImages.length) * outputsPerJob.value)
 const selectedCostEstimate = computed(() => {
   const components = selectedPricingComponents.value
   const fixed = components.find(c => c.kind === 'fixed-image' && c.amountUsd != null)
@@ -208,55 +219,19 @@ const inputCapabilityWarning = computed(() => {
       : 'Selected images may be rejected because this model is text-to-image only.'
 })
 
-// Default selection = most expensive priced model. Falls back to first listed.
-const defaultModel = computed(() => sortedModels.value[0]?.id)
-
-// Set a default once the list arrives.
-watch(defaultModel, (v) => {
-  if (v && !data.selectedModel) data.selectedModel = v
-}, { immediate: true })
-
-type Option = { label: string; value: string }
-// Radix Select (used by USelect) does not allow an empty string as an item value.
-// Use a non-empty sentinel to represent "model default" and map it to undefined on submit.
-const DEFAULT_ASPECT_RATIO = '__DEFAULT__'
-const aspectRatioOptions: Option[] = [
-  { label: 'Default (model decides)', value: DEFAULT_ASPECT_RATIO },
-  { label: '1:1 (Square)', value: '1:1' },
-  { label: '16:9 (Widescreen)', value: '16:9' },
-  { label: '4:3', value: '4:3' },
-  { label: '9:16 (Portrait)', value: '9:16' },
-  { label: '3:2', value: '3:2' },
-  { label: '2:3', value: '2:3' }
-]
-const imageSizeOptions: Option[] = [
-  { label: '1K', value: '1K' },
-  { label: '2K', value: '2K' },
-  { label: '4K', value: '4K' }
-]
-const exactSizeOptions: Option[] = [
-  { label: '512x512', value: '512x512' },
-  { label: '1024x1024', value: '1024x1024' },
-  { label: '1024x1536', value: '1024x1536' },
-  { label: '1536x1024', value: '1536x1024' },
-  { label: '1024x1792', value: '1024x1792' },
-  { label: '1792x1024', value: '1792x1024' },
-  { label: '2048x2048', value: '2048x2048' },
-  { label: '864x1536', value: '864x1536' },
-  { label: '1536x864', value: '1536x864' }
-]
-
-function buildImageConfig() {
-  const aspectRatio = (!data.imageConfig.aspectRatio || data.imageConfig.aspectRatio === DEFAULT_ASPECT_RATIO)
-      ? undefined
-      : data.imageConfig.aspectRatio
-  const config = {
-    aspectRatio,
-    size: data.imageConfig.size || undefined,
-    imageSize: data.imageConfig.imageSize || undefined
-  }
-  return Object.values(config).some(Boolean) ? config : undefined
-}
+const referenceCount = computed(() => (data.inputImages.length > 0 ? 1 : 0) + data.models.length)
+const referenceOverflow = computed(() => Math.max(0, referenceCount.value - selectedProfile.value.maxReferenceImages))
+const maskWithoutReference = computed(() => !!data.maskImage && referenceCount.value === 0)
+const maskFileNotPng = computed(() => !!data.maskImage && !/\.png(?:$|[?#])/i.test(data.maskImage))
+const maskSources = computed(() => data.inputImages.length > 0
+    ? data.inputImages
+    : data.models.slice(0, 1))
+const maskSourceNotPng = computed(() => !!data.maskImage
+    && maskSources.value.some(source => !/\.png(?:$|[?#])/i.test(source)))
+const referenceSummary = computed(() => {
+  const inputPart = data.inputImages.length > 0 ? '1 per input job' : 'no per-job input'
+  return `${referenceCount.value}/${selectedProfile.value.maxReferenceImages} references per generation (${inputPart} + ${data.models.length} shared)`
+})
 
 let pastPrompts = useFetch('/api/systemprompts', {deep: true, key: () => 'systemPrompts',})
 const gatewayLogs = useFetch<{ ok: boolean; items: AiGatewayLog[] }>('/api/ai-gateway-logs?limit=25', {
@@ -350,6 +325,10 @@ function clearInputImages() {
   }
 }
 
+function clearMaskImage() {
+  data.maskImage = null
+}
+
 function elapsedLabel(startedAt: number) {
   const totalSeconds = Math.max(0, Math.floor((pendingTick.value - startedAt) / 1000))
   const minutes = Math.floor(totalSeconds / 60)
@@ -375,6 +354,27 @@ async function submit() {
     errorMsg.value = 'Prompt is required'
     return
   }
+  if (!selectedModelAvailable.value) {
+    errorMsg.value = selectedModelInfo.value?.availabilityNote || 'This model is not currently available through AI Gateway.'
+    return
+  }
+
+  const maskImage = data.maskImage || undefined
+  const settings = structuredClone(toRaw(data.generationSettings))
+  const requestBody = {
+    prompt: promptText,
+    inputImages: [...data.inputImages],
+    modelImages: [...data.models],
+    model: data.selectedModel,
+    settings,
+    maskImage,
+    storeInputImages: true,
+  }
+  const validation = ImageGenerationRequestSchema.safeParse(requestBody)
+  if (!validation.success) {
+    errorMsg.value = validation.error.issues.map(issue => issue.message).join(' ')
+    return
+  }
 
   errorMsg.value = null
   const job: PendingGeneration = {
@@ -391,6 +391,7 @@ async function submit() {
     prompt.value = ''
     clearInputImages()
     clearModels()
+    clearMaskImage()
   }
   let serverCreatedRows = false
 
@@ -399,14 +400,7 @@ async function submit() {
         '/api/image-generate',
         {
           method: 'POST',
-          body: {
-            prompt: promptText,
-            inputImages: job.inputImages,
-            modelImages: job.modelImages,
-            model: data.selectedModel || undefined,
-            responseModalities: ['IMAGE'],
-            imageConfig: buildImageConfig()
-          }
+          body: validation.data
         }
     )
     serverCreatedRows = true
@@ -439,14 +433,14 @@ async function submit() {
     <div class="flex flex-col gap-2">
       <UModal :ui="{ content: 'max-w-7xl'}">
         <UButton color="primary" variant="solid">
-          Select Models ({{ data.models.length }})
+          Select Shared References ({{ data.models.length }})
         </UButton>
         <template #content>
           <Files :is-model-select="true" class="overflow-y-auto"/>
         </template>
       </UModal>
       <div class="flex items-center justify-between">
-        <p class="text-sm text-gray-600 dark:text-gray-300">Selected model image(s)</p>
+        <p class="text-sm text-gray-600 dark:text-gray-300">Shared reference image(s)</p>
         <UButton v-if="data.models.length > 0" size="xs" variant="ghost" @click="clearModels">Clear</UButton>
       </div>
       <div v-if="data.models.length > 0"
@@ -471,9 +465,47 @@ async function submit() {
         <DownloadableImage v-for="i in data.inputImages" :key="i" :src="i"
                            class="w-full object-contain rounded-md border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800"/>
       </div>
+      <div v-if="selectedProfile.supportsMask" class="rounded-lg border border-gray-200 p-3 dark:border-gray-800">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <p class="text-sm font-medium text-gray-800 dark:text-gray-100">GPT edit mask</p>
+            <p class="text-xs text-gray-500 dark:text-gray-400">Optional PNG with an alpha channel. The first reference must also be PNG with identical dimensions. The mask guides, rather than precisely bounds, the edit.</p>
+          </div>
+          <div class="flex gap-2">
+            <UModal :ui="{ content: 'max-w-7xl'}">
+              <UButton size="sm" variant="outline">{{ data.maskImage ? 'Change mask' : 'Select mask' }}</UButton>
+              <template #content>
+                <Files :is-mask-select="true" class="overflow-y-auto"/>
+              </template>
+            </UModal>
+            <UButton v-if="data.maskImage" size="sm" variant="ghost" color="neutral" @click="clearMaskImage">Clear</UButton>
+          </div>
+        </div>
+        <div v-if="data.maskImage" class="mt-3 flex items-center gap-3">
+          <DownloadableImage :src="data.maskImage" class="h-24 w-24 rounded-md border border-gray-200 bg-gray-50 object-contain dark:border-gray-700 dark:bg-gray-800"/>
+          <span class="break-all text-xs text-gray-500 dark:text-gray-400">{{ data.maskImage }}</span>
+        </div>
+      </div>
+      <div
+          class="rounded-lg border px-3 py-2 text-xs"
+          :class="referenceOverflow || maskWithoutReference || maskFileNotPng || maskSourceNotPng
+              ? 'border-red-300 bg-red-50 text-red-700 dark:border-red-800 dark:bg-red-950/30 dark:text-red-200'
+              : 'border-gray-200 bg-gray-50 text-gray-600 dark:border-gray-800 dark:bg-gray-900/60 dark:text-gray-300'"
+      >
+        <span class="font-medium">Reference usage:</span> {{ referenceSummary }}.
+        <span v-if="referenceOverflow"> Remove {{ referenceOverflow }} shared reference image{{ referenceOverflow === 1 ? '' : 's' }} before submitting.</span>
+        <span v-if="maskWithoutReference"> Select at least one input or shared reference image before using a mask.</span>
+        <span v-if="maskFileNotPng"> The mask itself must be a PNG image with an alpha channel.</span>
+        <span v-if="maskSourceNotPng"> Every per-job source must be PNG when a PNG mask is selected.</span>
+        <span v-if="data.maskImage && !maskSourceNotPng && !maskWithoutReference"> The server verifies the mask against every source's dimensions before starting the batch.</span>
+      </div>
+      <div class="rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-800 dark:border-blue-900 dark:bg-blue-950/30 dark:text-blue-200">
+        <span class="font-medium">Image-only references:</span>
+        this product accepts image files as model inputs. PDF, video, audio, and other document/media inputs are out of scope.
+      </div>
       <div class="grid grid-cols-1 xl:grid-cols-[minmax(520px,1fr)_360px] gap-4">
-        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 content-start">
-          <div class="sm:col-span-2">
+        <div class="space-y-4 content-start">
+          <div>
             <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Model</label>
             <USelect
                 v-model="selectedModelValue"
@@ -483,44 +515,23 @@ async function submit() {
                 :content="{ align: 'start', sideOffset: 6 }"
                 :ui="{ content: 'min-w-[min(720px,calc(100vw-2rem))]' }"
             />
-            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400 break-all">Using: {{ data.selectedModel }}</p>
+            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">{{ selectedProfile.description }}</p>
+            <p class="mt-1 break-all text-xs text-gray-400 dark:text-gray-500">{{ data.selectedModel }}</p>
           </div>
-          <div>
-            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Aspect ratio</label>
-            <USelect
-                v-model="data.imageConfig.aspectRatio"
-                :items="aspectRatioOptions"
-                placeholder="Default (model decides)"
-                clearable
-            />
-            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">Optional. Choose image aspect ratio.</p>
-          </div>
-          <div>
-            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Exact size</label>
-            <USelect
-                v-model="data.imageConfig.size"
-                :items="exactSizeOptions"
-                placeholder="Default (model decides)"
-                clearable
-            />
-            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">Optional. Sent to image models as width x height.</p>
-          </div>
-          <div>
-            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Gemini image size</label>
-            <USelect
-                v-model="data.imageConfig.imageSize"
-                :items="imageSizeOptions"
-                placeholder="Default (1K)"
-                clearable
-            />
-            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">Optional. Sent to Gemini image models as 1K, 2K, or 4K.</p>
-          </div>
+          <section class="rounded-lg border border-gray-200 bg-white/70 p-4 dark:border-gray-800 dark:bg-gray-900/60">
+            <div class="mb-4 flex items-center justify-between gap-2">
+              <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100">{{ selectedProfile.shortName }} settings</h2>
+              <UButton size="xs" variant="ghost" color="neutral" @click="data.generationSettings = createDefaultSettings(data.selectedModel)">Reset settings</UButton>
+            </div>
+            <component :is="selectedSettingsComponent" v-model="data.generationSettings"/>
+          </section>
         </div>
         <aside class="rounded-lg border border-gray-200 dark:border-gray-800 bg-white/70 dark:bg-gray-900/60 p-3 text-sm">
           <div class="flex items-start justify-between gap-3">
             <div>
               <div class="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400">Model info</div>
-              <div class="mt-1 font-semibold text-gray-900 dark:text-gray-100">{{ selectedModelInfo?.name || 'No model selected' }}</div>
+              <div class="mt-1 font-semibold text-gray-900 dark:text-gray-100">{{ selectedProfile.name }}</div>
+              <div class="mt-1 text-xs capitalize text-gray-500 dark:text-gray-400">{{ selectedProfile.lifecycle }}</div>
             </div>
             <span class="shrink-0 rounded border border-gray-200 dark:border-gray-700 px-2 py-0.5 text-xs text-gray-600 dark:text-gray-300 capitalize">
               {{ selectedPricingMethod }}
@@ -547,6 +558,15 @@ async function submit() {
             <div v-if="inputCapabilityWarning" class="rounded border border-amber-200 bg-amber-50 p-2 text-amber-800 dark:border-amber-800 dark:bg-amber-900/20 dark:text-amber-200">
               {{ inputCapabilityWarning }}
             </div>
+            <div v-if="!selectedModelAvailable" class="rounded border border-red-200 bg-red-50 p-2 text-red-700 dark:border-red-800 dark:bg-red-950/30 dark:text-red-200">
+              {{ selectedModelInfo?.availabilityNote || 'This model is not currently available through AI Gateway.' }}
+            </div>
+            <div v-else-if="selectedModelInfo?.catalogStatus === 'unknown'" class="rounded border border-amber-200 bg-amber-50 p-2 text-amber-800 dark:border-amber-800 dark:bg-amber-900/20 dark:text-amber-200">
+              {{ selectedModelInfo.availabilityNote || 'Live Gateway availability could not be verified; the request will still use this exact curated model ID.' }}
+            </div>
+            <div v-if="selectedProfile.lifecycleNote" class="rounded border border-amber-200 bg-amber-50 p-2 text-amber-800 dark:border-amber-800 dark:bg-amber-900/20 dark:text-amber-200">
+              {{ selectedProfile.lifecycleNote }}
+            </div>
             <div
                 v-for="warning in selectedWarnings"
                 :key="warning"
@@ -568,7 +588,7 @@ async function submit() {
           class="self-start"
       />
       <div class="flex items-center gap-2 justify-end">
-        <UButton class="w-full" @click="submit()" :disabled="!prompt.trim()">
+        <UButton class="w-full" @click="submit()" :disabled="!prompt.trim() || !!referenceOverflow || maskWithoutReference || maskFileNotPng || maskSourceNotPng || !selectedModelAvailable">
           Submit
         </UButton>
       </div>

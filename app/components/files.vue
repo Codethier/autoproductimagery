@@ -7,7 +7,12 @@ import type {FormSubmitEvent} from "#ui/types";
 const props = defineProps<{
   isModelSelect?: boolean
   isImageSelect?: boolean
+  isMaskSelect?: boolean
 }>()
+
+function isPngImage(file: SelectableFile) {
+  return /\.png$/i.test(file.name) || /\.png(?:$|[?#])/i.test(file.url)
+}
 
 const route = useRoute()
 const router = useRouter()
@@ -69,6 +74,7 @@ let items = await useFetch('/api/files', {
     input!.files.forEach((file) => {
       file.selectedImage = dataStore.inputImages.includes(file.url)
       file.selectedModel = dataStore.models.includes(file.url)
+      file.selectedMask = dataStore.maskImage === file.url
     })
     return input
   }
@@ -89,6 +95,16 @@ function syncSelectToStore(file: SelectableFile) {
     if (modelIdx === -1) dataStore.models.push(file.url)
   } else {
     if (modelIdx !== -1) dataStore.models.splice(modelIdx, 1)
+  }
+
+  // A mask is a single image, so selecting one clears the previous selection.
+  if (file.selectedMask) {
+    dataStore.maskImage = file.url
+    for (const item of items.data.value?.files || []) {
+      if (item.url !== file.url) item.selectedMask = false
+    }
+  } else if (dataStore.maskImage === file.url) {
+    dataStore.maskImage = null
   }
 }
 
@@ -151,13 +167,33 @@ async function createFolder() {
   }
 }
 
-async function deleteFileOrFolder(filename: string) {
+function removeDeletedSelections(pathOrPrefix: string, isPrefix: boolean) {
+  const matches = (value: string) => isPrefix ? value.startsWith(pathOrPrefix) : value === pathOrPrefix
+  for (const selection of [dataStore.inputImages, dataStore.models]) {
+    for (let index = selection.length - 1; index >= 0; index -= 1) {
+      if (matches(selection[index]!)) selection.splice(index, 1)
+    }
+  }
+  if (dataStore.maskImage && matches(dataStore.maskImage)) dataStore.maskImage = null
+}
+
+function imageUrlForRelativePath(relativePath: string) {
+  const encoded = relativePath.split('/').filter(Boolean).map(encodeURIComponent)
+  return `/images${encoded.length ? `/${encoded.join('/')}` : ''}`
+}
+
+async function deleteFileOrFolder(filename: string, selectedUrl?: string) {
   const confirmed = window.confirm(`Delete "${filename}"? This cannot be undone.`)
   if (!confirmed) return
   const base = path.value.endsWith('/') ? path.value.slice(0, -1) : path.value
   const pathToSubmit = `${base}/${filename}`
   try {
     await $fetch('/api/deleteFileOrFolder', { method: 'DELETE', body: { path: pathToSubmit } })
+    if (selectedUrl) {
+      removeDeletedSelections(selectedUrl, false)
+    } else {
+      removeDeletedSelections(`${imageUrlForRelativePath(pathToSubmit)}/`, true)
+    }
     await items.refresh()
     toast.add({ title: `Deleted "${filename}"`, color: 'success' })
   } catch (err: any) {
@@ -182,6 +218,14 @@ function clearImageSelection() {
   const files = items.data.value?.files
   if (files) {
     for (const f of files) f.selectedImage = false
+  }
+}
+
+function clearMaskSelection() {
+  dataStore.maskImage = null
+  const files = items.data.value?.files
+  if (files) {
+    for (const f of files) f.selectedMask = false
   }
 }
 
@@ -242,6 +286,7 @@ onBeforeUnmount(() => window.removeEventListener('paste', handlePaste))
         <div class="flex gap-2">
           <UButton v-if="props.isModelSelect" size="xs" variant="subtle" color="neutral" @click="clearModelSelection" :disabled="dataStore.models.length === 0">Clear model selection</UButton>
           <UButton v-if="props.isImageSelect" size="xs" variant="subtle" color="neutral" @click="clearImageSelection" :disabled="dataStore.inputImages.length === 0">Clear image selection</UButton>
+          <UButton v-if="props.isMaskSelect" size="xs" variant="subtle" color="neutral" @click="clearMaskSelection" :disabled="!dataStore.maskImage">Clear mask selection</UButton>
         </div>
 
       </div>
@@ -260,8 +305,12 @@ onBeforeUnmount(() => window.removeEventListener('paste', handlePaste))
                    @change="syncSelectToStore(file)"></UCheckbox>
         <UCheckbox v-if="props.isImageSelect" v-model="file.selectedImage"
                    @change="syncSelectToStore(file)"></UCheckbox>
+        <UCheckbox v-if="props.isMaskSelect" v-model="file.selectedMask"
+                   :disabled="!isPngImage(file)"
+                   :title="isPngImage(file) ? 'Use as PNG edit mask' : 'GPT Image 2 masks must be PNG files'"
+                   @change="syncSelectToStore(file)"></UCheckbox>
         <UIcon name="i-heroicons-trash" class="size-6 text-red-500 cursor-pointer"
-               @click="deleteFileOrFolder(file.name)"></UIcon>
+               @click="deleteFileOrFolder(file.name, file.url)"></UIcon>
       </div>
 
     </div>

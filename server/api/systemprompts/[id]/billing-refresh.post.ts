@@ -1,6 +1,10 @@
 import {z} from 'zod'
 import {useDB} from '~~/server/utils/useDB'
 import {useGateway} from '~~/server/utils/useGateway'
+import {
+    allocateGenerationBilling,
+    readGenerationAllocation,
+} from '~~/server/utils/generationBilling'
 
 const ParamsSchema = z.object({
     id: z.coerce.number().int().positive(),
@@ -32,6 +36,10 @@ export default defineEventHandler(async (event) => {
         })
     }
 
-    const updated = await db.updateSystemPromptBilling(row.id, billing)
+    const allocation = readGenerationAllocation(row.usageJson)
+    const effectiveBilling = allocation
+        ? allocateGenerationBilling(billing, allocation.outputIndex, allocation.outputCount)
+        : billing
+    const updated = await db.updateSystemPromptBilling(row.id, effectiveBilling)
     return {ok: true, item: updated}
 })
