@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import type { Component } from 'vue'
+import { isNewImageModel, orderImageModels } from '../../schemas/image-model-discovery'
+import { useImageModelFavourites } from '../composables/useImageModelFavourites'
 import { watchImageModelSelection } from '../utils/watchImageModelSelection'
 import {
   IMAGE_MODEL_PROFILES,
@@ -20,6 +22,8 @@ import OpenAiGptImageLegacySettings from './generation-settings/OpenAiGptImageLe
 import CatalogImageSettings from './generation-settings/CatalogImageSettings.vue'
 
 const data = useDataStore()
+const { favouriteModelIds, favouriteSet, persistent: favouritesPersistent, ready: favouritesReady, toggleFavourite } = useImageModelFavourites()
+const selectedIsFavourite = computed(() => favouriteSet.value.has(data.selectedModel))
 const prompt = ref('')
 const errorMsg = ref<string | null>(null)
 const keepSubmitInputs = ref(true)
@@ -116,8 +120,8 @@ function fmtPerMillion(perTokenUsd?: string) {
   return v < 1 ? `$${v.toFixed(3)}` : `$${v.toFixed(2)}`
 }
 
-type ModelOption = { label: string; value: ImageModelId; icon: string; disabled: boolean }
-const modelOptions = computed<ModelOption[]>(() => SUPPORTED_IMAGE_MODEL_IDS.map((id) => {
+type ModelOption = { label: string; value: ImageModelId; icon: string; disabled: boolean; isNew: boolean; isFavourite: boolean }
+const modelOptions = computed<ModelOption[]>(() => orderImageModels(SUPPORTED_IMAGE_MODEL_IDS, favouriteModelIds.value).map((id) => {
   const item = modelsFetch.data.value?.items.find(model => model.id === id)
   const profile = item?.profile ?? IMAGE_MODEL_PROFILES[id]
   const usable = !!item && item.catalogStatus !== 'unavailable'
@@ -131,6 +135,8 @@ const modelOptions = computed<ModelOption[]>(() => SUPPORTED_IMAGE_MODEL_IDS.map
     value: id,
     icon: profile.provider === 'openai' ? 'i-lucide-image' : 'i-lucide-sparkles',
     disabled: !usable,
+    isNew: isNewImageModel(id),
+    isFavourite: favouriteSet.value.has(id),
   }
 }))
 
@@ -512,15 +518,41 @@ async function submit() {
       <div class="grid grid-cols-1 xl:grid-cols-[minmax(520px,1fr)_360px] gap-4">
         <div class="space-y-4 content-start">
           <div>
-            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Model</label>
-            <USelect
-                v-model="selectedModelValue"
-                :items="modelOptions"
-                placeholder="Select model"
-                class="w-full"
-                :content="{ align: 'start', sideOffset: 6 }"
-                :ui="{ content: 'min-w-[min(720px,calc(100vw-2rem))]' }"
-            />
+            <label for="image-model-select" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Model</label>
+            <div class="flex items-center gap-2">
+              <USelect
+                  id="image-model-select"
+                  v-model="selectedModelValue"
+                  :items="modelOptions"
+                  placeholder="Select model"
+                  class="min-w-0 flex-1"
+                  :content="{ align: 'start', sideOffset: 6 }"
+                  :ui="{ content: 'min-w-[min(720px,calc(100vw-2rem))]' }"
+              >
+                <template #item-leading="{ item }">
+                  <svg v-if="item.isFavourite" aria-hidden="true" viewBox="0 0 24 24" class="size-4 shrink-0 fill-rose-500 text-rose-500" stroke="currentColor" stroke-width="2">
+                    <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78L12 21.23l8.84-8.84a5.5 5.5 0 0 0 0-7.78Z"/>
+                  </svg>
+                  <UIcon v-else :name="item.icon" class="size-4 shrink-0"/>
+                </template>
+                <template #item-trailing="{ item }">
+                  <span v-if="item.isFavourite" class="sr-only">Favourite</span>
+                  <UBadge v-if="item.isNew" size="xs" color="success" variant="subtle">New</UBadge>
+                </template>
+              </USelect>
+              <UBadge v-if="isNewImageModel(data.selectedModel)" size="xs" color="success" variant="subtle">New</UBadge>
+              <UButton type="button" variant="outline" :color="selectedIsFavourite ? 'error' : 'neutral'"
+                       :disabled="!favouritesReady" :aria-pressed="selectedIsFavourite"
+                       :aria-label="`${selectedIsFavourite ? 'Remove' : 'Add'} ${selectedProfile.shortName} ${selectedIsFavourite ? 'from' : 'to'} favourites`"
+                       :title="selectedIsFavourite ? 'Remove from favourites' : 'Add to favourites'"
+                       @click="toggleFavourite(data.selectedModel)">
+                <svg aria-hidden="true" viewBox="0 0 24 24" class="size-5" :fill="selectedIsFavourite ? 'currentColor' : 'none'" stroke="currentColor" stroke-width="2">
+                  <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78L12 21.23l8.84-8.84a5.5 5.5 0 0 0 0-7.78Z"/>
+                </svg>
+              </UButton>
+            </div>
+            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">Use the heart to pin a favourite. Favourites appear first, followed by new models.</p>
+            <p v-if="!favouritesPersistent" role="status" class="mt-1 text-xs text-amber-600 dark:text-amber-400">Browser storage is unavailable. Your favourites will last for this visit.</p>
             <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">{{ selectedProfile.description }}</p>
             <p class="mt-1 break-all text-xs text-gray-400 dark:text-gray-500">{{ data.selectedModel }}</p>
           </div>
