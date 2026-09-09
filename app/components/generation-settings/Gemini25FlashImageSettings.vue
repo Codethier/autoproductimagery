@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import GeminiCommonSettings from './GeminiCommonSettings.vue'
 import {
   GEMINI_STANDARD_ASPECT_RATIOS,
   type Gemini25FlashImageSettings,
