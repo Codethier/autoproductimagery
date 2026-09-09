@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.railpack.com",
-  "buildAptPackages": ["...", "libatomic1"],
+  "buildAptPackages": ["libatomic1"],
   "deploy": {
-    "aptPackages": ["...", "libatomic1"]
+    "aptPackages": ["libatomic1"]
   }
 }
