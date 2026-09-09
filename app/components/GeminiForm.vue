@@ -169,6 +169,19 @@ const settingsComponents: Record<ImageModelProfile['settingsComponent'], Compone
   CatalogImageSettings,
 }
 const selectedSettingsComponent = computed(() => settingsComponents[selectedProfile.value.settingsComponent])
+const settingsPanelRevision = ref(0)
+const settingsResetMessage = ref('')
+
+function resetModelSettings() {
+  data.generationSettings = createDefaultSettings(data.selectedModel)
+  // Recreate the controls as well as their values, including after a render error.
+  settingsPanelRevision.value += 1
+  settingsResetMessage.value = `${selectedProfile.value.shortName} settings restored to defaults.`
+}
+
+watch(() => [data.selectedModel, data.generationSettings], () => {
+  settingsResetMessage.value = ''
+}, {deep: true, flush: 'sync'})
 
 watchImageModelSelection(data)
 
@@ -559,9 +572,10 @@ async function submit() {
           <section class="rounded-lg border border-gray-200 bg-white/70 p-4 dark:border-gray-800 dark:bg-gray-900/60">
             <div class="mb-4 flex items-center justify-between gap-2">
               <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100">{{ selectedProfile.shortName }} settings</h2>
-              <UButton size="xs" variant="ghost" color="neutral" @click="data.generationSettings = createDefaultSettings(data.selectedModel)">Reset settings</UButton>
+              <UButton type="button" size="xs" variant="ghost" color="neutral" @click="resetModelSettings">Reset to defaults</UButton>
             </div>
-            <component :is="selectedSettingsComponent" v-model="data.generationSettings"/>
+            <p v-if="settingsResetMessage" role="status" class="mb-3 text-sm text-muted">{{ settingsResetMessage }}</p>
+            <component :is="selectedSettingsComponent" :key="`${data.selectedModel}:${settingsPanelRevision}`" v-model="data.generationSettings"/>
           </section>
         </div>
         <aside class="rounded-lg border border-gray-200 dark:border-gray-800 bg-white/70 dark:bg-gray-900/60 p-3 text-sm">
