@@ -8,6 +8,6 @@ if (!url) {
 }
 
 export const client = createClient({ url: url || "file:./prisma.db", });
-export const db = drizzle(client);
+export const db = drizzle({ client });
 
 export default db;

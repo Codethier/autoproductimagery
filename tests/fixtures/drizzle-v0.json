@@ -1,0 +1,58 @@
+[
+  {
+    "idx": 0,
+    "version": "6",
+    "when": 1758325349854,
+    "tag": "0000_light_maverick",
+    "breakpoints": true,
+    "sql": "CREATE TABLE `systemPrompt` (\r\n\t`id` integer PRIMARY KEY AUTOINCREMENT NOT NULL,\r\n\t`TextPrompt` text NOT NULL,\r\n\t`serverImages` text,\r\n\t`modelImages` text,\r\n\t`outputImage` text NOT NULL,\r\n\t`createdAt` text DEFAULT CURRENT_TIMESTAMP NOT NULL,\r\n\t`updatedAt` text DEFAULT CURRENT_TIMESTAMP NOT NULL\r\n);\r\n"
+  },
+  {
+    "idx": 1,
+    "version": "6",
+    "when": 1758363858680,
+    "tag": "0001_simple_rafael_vega",
+    "breakpoints": true,
+    "sql": "ALTER TABLE `systemPrompt` ADD `errors` text;"
+  },
+  {
+    "idx": 2,
+    "version": "6",
+    "when": 1778507210656,
+    "tag": "0002_chief_rocket_racer",
+    "breakpoints": true,
+    "sql": "ALTER TABLE `systemPrompt` ADD `generationModel` text;--> statement-breakpoint\r\nALTER TABLE `systemPrompt` ADD `inputTokens` integer;--> statement-breakpoint\r\nALTER TABLE `systemPrompt` ADD `outputTokens` integer;--> statement-breakpoint\r\nALTER TABLE `systemPrompt` ADD `totalTokens` integer;--> statement-breakpoint\r\nALTER TABLE `systemPrompt` ADD `cachedInputTokens` integer;--> statement-breakpoint\r\nALTER TABLE `systemPrompt` ADD `reasoningTokens` integer;--> statement-breakpoint\r\nALTER TABLE `systemPrompt` ADD `priceUsd` text;--> statement-breakpoint\r\nALTER TABLE `systemPrompt` ADD `gatewayGenerationId` text;--> statement-breakpoint\r\nALTER TABLE `systemPrompt` ADD `usageJson` text;"
+  },
+  {
+    "idx": 3,
+    "version": "6",
+    "when": 1778953200000,
+    "tag": "0003_price_source",
+    "breakpoints": true,
+    "sql": "ALTER TABLE `systemPrompt` ADD `priceSource` text;\r\n"
+  },
+  {
+    "idx": 4,
+    "version": "6",
+    "when": 1779559239843,
+    "tag": "0004_ai_gateway_log_and_priceSource",
+    "breakpoints": true,
+    "sql": "CREATE TABLE IF NOT EXISTS `aiGatewayLog` (\n\t`id` integer PRIMARY KEY AUTOINCREMENT NOT NULL,\n\t`systemPromptId` integer,\n\t`status` text NOT NULL,\n\t`model` text NOT NULL,\n\t`prompt` text NOT NULL,\n\t`inputImages` text,\n\t`modelImages` text,\n\t`outputImage` text,\n\t`outputMimeType` text,\n\t`inputTokens` integer,\n\t`outputTokens` integer,\n\t`totalTokens` integer,\n\t`priceUsd` text,\n\t`priceSource` text,\n\t`gatewayGenerationId` text,\n\t`requestJson` text,\n\t`responseJson` text,\n\t`error` text,\n\t`durationMs` integer,\n\t`createdAt` text DEFAULT CURRENT_TIMESTAMP NOT NULL\n);\n"
+  },
+  {
+    "idx": 5,
+    "version": "6",
+    "when": 1786711673375,
+    "tag": "0005_generation_metadata",
+    "breakpoints": true,
+    "sql": "ALTER TABLE `aiGatewayLog` ADD `batchId` text;--> statement-breakpoint\r\nALTER TABLE `aiGatewayLog` ADD `attemptNumber` integer;--> statement-breakpoint\r\nALTER TABLE `aiGatewayLog` ADD `providerRequestId` text;--> statement-breakpoint\r\nALTER TABLE `aiGatewayLog` ADD `resolvedConfigJson` text;--> statement-breakpoint\r\nALTER TABLE `aiGatewayLog` ADD `errorJson` text;--> statement-breakpoint\r\nCREATE INDEX `aiGatewayLog_systemPromptId_idx` ON `aiGatewayLog` (`systemPromptId`);--> statement-breakpoint\r\nCREATE INDEX `aiGatewayLog_batchId_idx` ON `aiGatewayLog` (`batchId`);--> statement-breakpoint\r\nCREATE INDEX `aiGatewayLog_gatewayGenerationId_idx` ON `aiGatewayLog` (`gatewayGenerationId`);--> statement-breakpoint\r\nALTER TABLE `systemPrompt` ADD `status` text;--> statement-breakpoint\r\nALTER TABLE `systemPrompt` ADD `batchId` text;--> statement-breakpoint\r\nALTER TABLE `systemPrompt` ADD `parentSystemPromptId` integer;--> statement-breakpoint\r\nALTER TABLE `systemPrompt` ADD `generationConfig` text;--> statement-breakpoint\r\nALTER TABLE `systemPrompt` ADD `outputMetadata` text;--> statement-breakpoint\r\nALTER TABLE `systemPrompt` ADD `errorJson` text;--> statement-breakpoint\r\nCREATE INDEX `systemPrompt_batchId_idx` ON `systemPrompt` (`batchId`);--> statement-breakpoint\r\nCREATE INDEX `systemPrompt_parentSystemPromptId_idx` ON `systemPrompt` (`parentSystemPromptId`);"
+  },
+  {
+    "idx": 6,
+    "version": "6",
+    "when": 1786720096900,
+    "tag": "0006_pending_generation_lease_index",
+    "breakpoints": true,
+    "sql": "CREATE INDEX `systemPrompt_status_updatedAt_idx` ON `systemPrompt` (`status`,`updatedAt`);"
+  }
+]

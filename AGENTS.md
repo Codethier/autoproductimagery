@@ -52,6 +52,8 @@
 - NEVER hand-edit generated files under `drizzle/` or `drizzle/meta/`.
 - Change `server/db/schema.ts`, then generate with `npm run drizzle:generate -- --name=<name>` and review the generated SQL.
 - Test migrations on a disposable/local database before applying them. Use `npm run drizzle:migrate`; do not use `drizzle:push` for schema changes in this project.
+- Keep `drizzle-orm` and `drizzle-kit` pinned to the same tested v1 release, currently `1.0.0-rc.4`. Migration SQL and snapshots live together in timestamped folders under `drizzle/`. Use `npm run drizzle:up` for a migration-format upgrade, review generated changes, and preserve existing SQL and migration timestamps. It is not a routine startup command.
+- For a Drizzle upgrade, test fresh databases and existing v0 migration histories, including pending migrations, data preservation, repeated migration runs, and conditional generation updates. The v1 SQLite migrator upgrades its bookkeeping table when `npm run drizzle:migrate` runs.
 - List/history endpoints must paginate in SQL and should not deserialize large per-generation metadata unless the caller requests details.
 
 ## Verification
