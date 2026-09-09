@@ -1,6 +1,9 @@
 import { randomUUID } from 'node:crypto'
 import {
     ImageGenerationRequestSchema,
+    isOpenAiImageSettings,
+    isGeminiImageSettings,
+    generationOutputCount,
     ImageModelIdSchema,
     canonicalizeImageModelId,
     createDefaultSettings,
@@ -22,7 +25,7 @@ import {
 import {installBoundedRawBody} from '~~/server/utils/boundedRequestBody'
 import { allocateGenerationBilling } from '~~/server/utils/generationBilling'
 import { sanitizeProviderMetadata } from '~~/server/utils/gatewayMetadata'
-import { validateGptImageMaskPair } from '~~/server/utils/gptImageMask'
+import { validateGptImageMaskPair, validateBflFillMaskPair } from '~~/server/utils/gptImageMask'
 
 type RawBody = Record<string, unknown>
 const MAX_GENERATION_REQUEST_BYTES = 512 * 1024
@@ -37,12 +40,13 @@ function translateLegacySettings(
     const legacy = raw.imageConfig && typeof raw.imageConfig === 'object'
         ? raw.imageConfig as Record<string, unknown>
         : {}
-    if (defaults.kind === 'openai-gpt-image-2') {
+    if (isOpenAiImageSettings(defaults)) {
         return {
             ...defaults,
             ...(typeof legacy.size === 'string' ? {size: legacy.size} : {}),
-        }
+        } as ImageGenerationSettings
     }
+    if (!isGeminiImageSettings(defaults)) return defaults
     return {
         ...defaults,
         ...(typeof legacy.aspectRatio === 'string' ? {aspectRatio: legacy.aspectRatio} : {}),
@@ -59,7 +63,7 @@ function parseRequest(raw: RawBody) {
     if (!parsedModel.success) {
         throw createError({
             statusCode: 400,
-            statusMessage: `Unsupported image model '${canonicalModel}'. Choose one of the curated OpenAI or Gemini models.`,
+            statusMessage: `Unsupported image model '${canonicalModel}'. Choose one of the supported image models.`,
         })
     }
     const candidate = {
@@ -184,9 +188,7 @@ export default defineEventHandler(async (event) => {
     }
     const imageFs = await useFS()
     const batchId = randomUUID()
-    const expectedOutputs = request.settings.kind === 'openai-gpt-image-2'
-        ? request.settings.numberOfImages
-        : 1
+    const expectedOutputs = generationOutputCount(request.settings)
     const sourceImages: Array<string | null> = request.inputImages.length
         ? request.inputImages
         : [null]
@@ -231,7 +233,9 @@ export default defineEventHandler(async (event) => {
         for (const inputImage of sourceImages) {
             const firstSource = inputImage ?? request.modelImages[0]
             const source = firstSource ? await imageFs.getImageFile(firstSource) : undefined
-            const validationError = validateGptImageMaskPair(maskDescriptor, source ? {
+            const validateMask = getImageModelProfile(request.model)?.maskMode === 'luminance'
+                ? validateBflFillMaskPair : validateGptImageMaskPair
+            const validationError = validateMask(maskDescriptor, source ? {
                 mimeType: source.mimeType,
                 bytes: source.buffer.length,
                 width: source.width,

@@ -1,11 +1,18 @@
 import { z } from 'zod'
+import { CATALOG_IMAGE_MODEL_IDS, CATALOG_IMAGE_DEFINITIONS, CatalogImageSettingsSchema, createCatalogImageDefaults, type CatalogImageModelId } from './catalog-image-models'
 
 export const SUPPORTED_IMAGE_MODEL_IDS = [
   'google/gemini-3.1-flash-image',
   'google/gemini-3-pro-image',
   'google/gemini-3.1-flash-lite-image',
   'google/gemini-2.5-flash-image',
+  'openai/gpt-image-2.5-sunburst',
+  'openai/gpt-image-2.5-flare',
   'openai/gpt-image-2',
+  'openai/gpt-image-1',
+  'openai/gpt-image-1-mini',
+  'openai/gpt-image-1.5',
+  ...CATALOG_IMAGE_MODEL_IDS,
 ] as const
 
 export const DEFAULT_IMAGE_MODEL_ID = 'google/gemini-3.1-flash-image' as const
@@ -143,11 +150,8 @@ export const GptImage2SizeSchema = z.string()
     message: 'Use WIDTHxHEIGHT with edges divisible by 16, max 3840, ratio at most 3:1, and 655,360–8,294,400 pixels.',
   })
 
-export const OpenAiGptImage2SettingsSchema = z.object({
-  kind: z.literal('openai-gpt-image-2'),
+const OpenAiImageBaseSettingsSchema = z.object({
   size: GptImage2SizeSchema.optional(),
-  quality: z.enum(['auto', 'low', 'medium', 'high']).default('auto'),
-  background: z.enum(['auto', 'opaque']).default('auto'),
   outputFormat: z.enum(['png', 'jpeg', 'webp']).default('png'),
   outputCompression: z.number().int().min(0).max(100).optional(),
   moderation: z.enum(['auto', 'low']).default('auto'),
@@ -162,7 +166,47 @@ export const OpenAiGptImage2SettingsSchema = z.object({
     })
   }
 })
+export const OpenAiGptImage2SettingsSchema = OpenAiImageBaseSettingsSchema.safeExtend({
+  kind: z.literal('openai-gpt-image-2'),
+  quality: z.enum(['auto', 'low', 'medium', 'high']).default('auto'),
+  background: z.enum(['auto', 'opaque']).default('auto'),
+})
 export type OpenAiGptImage2Settings = z.infer<typeof OpenAiGptImage2SettingsSchema>
+
+// Verified against OpenAI's image generation guide and the Gateway catalog on
+// 2026-09-09: https://developers.openai.com/api/docs/guides/image-generation
+const OpenAiGptImage25BaseSettingsSchema = OpenAiImageBaseSettingsSchema.safeExtend({
+  quality: z.enum(['auto', 'low', 'medium', 'high', 'xhigh', 'max']).default('auto'),
+  background: z.enum(['auto', 'opaque', 'transparent']).default('auto'),
+}).superRefine((value, context) => {
+  if (value.background === 'transparent' && value.outputFormat === 'jpeg') {
+    context.addIssue({
+      code: 'custom',
+      path: ['outputFormat'],
+      message: 'Transparent backgrounds require PNG or WebP.',
+    })
+  }
+})
+export const OpenAiGptImage25SunburstSettingsSchema = OpenAiGptImage25BaseSettingsSchema.safeExtend({
+  kind: z.literal('openai-gpt-image-2.5-sunburst'),
+})
+export const OpenAiGptImage25FlareSettingsSchema = OpenAiGptImage25BaseSettingsSchema.safeExtend({
+  kind: z.literal('openai-gpt-image-2.5-flare'),
+})
+export type OpenAiGptImage25Settings = z.infer<typeof OpenAiGptImage25SunburstSettingsSchema>
+  | z.infer<typeof OpenAiGptImage25FlareSettingsSchema>
+export const GPT_IMAGE_LEGACY_SIZES = ['1024x1024', '1536x1024', '1024x1536'] as const
+const OpenAiGptImageLegacyBaseSchema = OpenAiGptImage25BaseSettingsSchema.safeExtend({
+  size: z.enum(GPT_IMAGE_LEGACY_SIZES).optional(),
+  quality: z.enum(['auto', 'low', 'medium', 'high']).default('auto'),
+})
+export const OpenAiGptImage1SettingsSchema = OpenAiGptImageLegacyBaseSchema.safeExtend({kind: z.literal('openai-gpt-image-1')})
+export const OpenAiGptImage1MiniSettingsSchema = OpenAiGptImageLegacyBaseSchema.safeExtend({kind: z.literal('openai-gpt-image-1-mini')})
+export const OpenAiGptImage15SettingsSchema = OpenAiGptImageLegacyBaseSchema.safeExtend({kind: z.literal('openai-gpt-image-1.5')})
+export type OpenAiGptImageLegacySettings = z.infer<typeof OpenAiGptImage1SettingsSchema>
+  | z.infer<typeof OpenAiGptImage1MiniSettingsSchema> | z.infer<typeof OpenAiGptImage15SettingsSchema>
+
+export type OpenAiImageGenerationSettings = OpenAiGptImage2Settings | OpenAiGptImage25Settings | OpenAiGptImageLegacySettings
 
 export const ImageGenerationSettingsSchema = z.discriminatedUnion('kind', [
   Gemini31FlashImageSettingsSchema,
@@ -177,9 +221,33 @@ export const ImageGenerationSettingsSchema = z.discriminatedUnion('kind', [
   }).strict(),
   Gemini25FlashImageSettingsSchema,
   OpenAiGptImage2SettingsSchema,
+  OpenAiGptImage25SunburstSettingsSchema,
+  OpenAiGptImage25FlareSettingsSchema,
+  OpenAiGptImage1SettingsSchema,
+  OpenAiGptImage1MiniSettingsSchema,
+  OpenAiGptImage15SettingsSchema,
+  ...CatalogImageSettingsSchema.options,
 ])
 export type ImageGenerationSettings = z.infer<typeof ImageGenerationSettingsSchema>
-export type GeminiImageGenerationSettings = Exclude<ImageGenerationSettings, OpenAiGptImage2Settings>
+export type GeminiImageGenerationSettings = Gemini31FlashImageSettings | Gemini3ProImageSettings | Gemini31FlashLiteImageSettings | Gemini25FlashImageSettings
+
+export function isOpenAiImageSettings(settings: ImageGenerationSettings): settings is OpenAiImageGenerationSettings {
+  return settings.kind === 'openai-gpt-image-2'
+    || settings.kind === 'openai-gpt-image-2.5-sunburst'
+    || settings.kind === 'openai-gpt-image-2.5-flare'
+    || settings.kind === 'openai-gpt-image-1'
+    || settings.kind === 'openai-gpt-image-1-mini'
+    || settings.kind === 'openai-gpt-image-1.5'
+}
+
+export function isGeminiImageSettings(settings: ImageGenerationSettings): settings is GeminiImageGenerationSettings {
+  return settings.kind === 'gemini-3.1-flash-image' || settings.kind === 'gemini-3-pro-image'
+    || settings.kind === 'gemini-3.1-flash-lite-image' || settings.kind === 'gemini-2.5-flash-image'
+}
+
+export function generationOutputCount(settings: ImageGenerationSettings): number {
+  return 'numberOfImages' in settings ? settings.numberOfImages : 1
+}
 
 // Google accounts for the image itself inside maxOutputTokens. Values below
 // these documented per-tier costs cannot contain a complete requested image.
@@ -193,7 +261,7 @@ export function minimumGeminiImageTokens(settings: ImageGenerationSettings): num
       return 1120
     case 'gemini-2.5-flash-image':
       return 1290
-    case 'openai-gpt-image-2':
+    default:
       return undefined
   }
 }
@@ -256,9 +324,8 @@ export const ImageGenerationRequestSchema = z.object({
   parentSystemPromptId: z.number().int().positive().optional(),
   settings: ImageGenerationSettingsSchema,
 }).strict().superRefine((value, context) => {
-  const expectedKind = value.model === 'openai/gpt-image-2'
-    ? 'openai-gpt-image-2'
-    : value.model.slice('google/'.length)
+  const profile = IMAGE_MODEL_PROFILES[value.model]
+  const expectedKind = profile.settingsKind
   if (value.settings.kind !== expectedKind) {
     context.addIssue({
       code: 'custom',
@@ -268,11 +335,7 @@ export const ImageGenerationRequestSchema = z.object({
   }
 
   const sourcesPerJob = (value.inputImages.length > 0 ? 1 : 0) + value.modelImages.length
-  const maximumReferences = value.model === 'openai/gpt-image-2'
-    ? 16
-    : value.model === 'google/gemini-2.5-flash-image'
-      ? 16
-      : 14
+  const maximumReferences = profile.maxReferenceImages
   if (sourcesPerJob > maximumReferences) {
     context.addIssue({
       code: 'custom',
@@ -281,11 +344,15 @@ export const ImageGenerationRequestSchema = z.object({
     })
   }
 
-  if (value.maskImage && value.model !== 'openai/gpt-image-2') {
+  if (profile.requiresMask && !value.maskImage) {
+    context.addIssue({code: 'custom', path: ['maskImage'], message: `${profile.name} requires a mask and source image.`})
+  }
+
+  if (value.maskImage && !profile.supportsMask) {
     context.addIssue({
       code: 'custom',
       path: ['maskImage'],
-      message: 'Masks are only supported by GPT Image 2.',
+      message: `${profile.name} does not support masks.`,
     })
   }
   if (value.maskImage && value.inputImages.length === 0 && value.modelImages.length === 0) {
@@ -296,9 +363,7 @@ export const ImageGenerationRequestSchema = z.object({
     })
   }
 
-  const outputsPerJob = value.settings.kind === 'openai-gpt-image-2'
-    ? value.settings.numberOfImages
-    : 1
+  const outputsPerJob = generationOutputCount(value.settings)
   const providerJobs = Math.max(1, value.inputImages.length)
   if (providerJobs * outputsPerJob > 50) {
     context.addIssue({
@@ -317,7 +382,7 @@ export const ImageGenerationRequestSchema = z.object({
     })
   }
 
-  if (value.settings.kind !== 'openai-gpt-image-2') {
+  if (isGeminiImageSettings(value.settings)) {
     const minimum = minimumGeminiImageTokens(value.settings)
     const requestedMaximum = value.settings.sampling.maxOutputTokens
     if (minimum != null && requestedMaximum != null && requestedMaximum < minimum) {
@@ -331,31 +396,86 @@ export const ImageGenerationRequestSchema = z.object({
 })
 export type ImageGenerationRequest = z.infer<typeof ImageGenerationRequestSchema>
 
+export const IMAGE_MODEL_PROVIDERS = ['google', 'openai', 'bfl', 'bytedance', 'meta', 'spacexai'] as const
+
 export type ImageModelProfile = {
   id: ImageModelId
   profileVersion: number
   name: string
   shortName: string
-  provider: 'google' | 'openai'
+  provider: typeof IMAGE_MODEL_PROVIDERS[number]
   adapter: 'gateway-language-image' | 'gateway-image'
+  settingsKind: ImageGenerationSettings['kind']
   settingsComponent: 'Gemini31FlashImageSettings'
     | 'Gemini3ProImageSettings'
     | 'Gemini31FlashLiteImageSettings'
     | 'Gemini25FlashImageSettings'
     | 'OpenAiGptImage2Settings'
+    | 'OpenAiGptImage25Settings'
+    | 'OpenAiGptImageLegacySettings'
+    | 'CatalogImageSettings'
   lifecycle: 'recommended' | 'current' | 'legacy'
   lifecycleNote?: string
   description: string
   maxReferenceImages: number
+  referenceMode?: 'images' | 'image-prompt'
   referenceInputs: readonly ['image']
   supportsMask: boolean
+  requiresMask?: boolean
+  maskMode?: 'alpha' | 'luminance'
   supportsTextOutput: boolean
-  aspectRatios: readonly GeminiAspectRatio[]
+  aspectRatios: readonly string[]
   imageSizes: readonly string[]
   warnings: readonly string[]
 }
 
+const catalogProfiles = Object.fromEntries(CATALOG_IMAGE_MODEL_IDS.map(id => {
+  const definition = CATALOG_IMAGE_DEFINITIONS[id]
+  const profile: ImageModelProfile = {
+    id, profileVersion: 1, name: definition.name, shortName: definition.name,
+    provider: definition.provider, adapter: 'gateway-image', settingsKind: id,
+    settingsComponent: 'CatalogImageSettings', lifecycle: 'current',
+    description: `${definition.name} generates product imagery from text and uploaded pictures.`,
+    maxReferenceImages: definition.maxReferenceImages, referenceInputs: ['image'], referenceMode: definition.referenceMode,
+    supportsMask: definition.requiresMask, requiresMask: definition.requiresMask,
+    ...(definition.requiresMask ? {maskMode: 'luminance' as const} : {}),
+    supportsTextOutput: false,
+    aspectRatios: definition.controls.find(control => control.key === 'aspectRatio')?.options ?? [],
+    imageSizes: definition.controls.find(control => control.key === 'size' || control.key === 'resolution')?.options ?? [],
+    warnings: definition.warnings,
+  }
+  return [id, profile]
+})) as Record<CatalogImageModelId, ImageModelProfile>
+
 export const IMAGE_MODEL_PROFILES: Readonly<Record<ImageModelId, ImageModelProfile>> = {
+  ...catalogProfiles,
+  'openai/gpt-image-1': {
+    id: 'openai/gpt-image-1', profileVersion: 1, name: 'GPT Image 1', shortName: 'GPT Image 1',
+    provider: 'openai', adapter: 'gateway-image', settingsComponent: 'OpenAiGptImageLegacySettings',
+    settingsKind: 'openai-gpt-image-1', lifecycle: 'legacy',
+    description: 'OpenAI image generation and editing with fixed sizes, transparency, masks, and up to ten outputs.',
+    maxReferenceImages: 16, referenceInputs: ['image'], supportsMask: true, supportsTextOutput: false,
+    aspectRatios: [], imageSizes: GPT_IMAGE_LEGACY_SIZES,
+    warnings: ['Reference inputs are image files only; use PNG, JPEG, or WebP.', 'Transparent backgrounds require PNG or WebP output.'],
+  },
+  'openai/gpt-image-1-mini': {
+    id: 'openai/gpt-image-1-mini', profileVersion: 1, name: 'GPT Image 1 Mini', shortName: 'GPT Image 1 Mini',
+    provider: 'openai', adapter: 'gateway-image', settingsComponent: 'OpenAiGptImageLegacySettings',
+    settingsKind: 'openai-gpt-image-1-mini', lifecycle: 'legacy',
+    description: 'OpenAI image generation and editing with fixed sizes, transparency, masks, and up to ten outputs.',
+    maxReferenceImages: 16, referenceInputs: ['image'], supportsMask: true, supportsTextOutput: false,
+    aspectRatios: [], imageSizes: GPT_IMAGE_LEGACY_SIZES,
+    warnings: ['Reference inputs are image files only; use PNG, JPEG, or WebP.', 'Transparent backgrounds require PNG or WebP output.'],
+  },
+  'openai/gpt-image-1.5': {
+    id: 'openai/gpt-image-1.5', profileVersion: 1, name: 'GPT Image 1.5', shortName: 'GPT Image 1.5',
+    provider: 'openai', adapter: 'gateway-image', settingsComponent: 'OpenAiGptImageLegacySettings',
+    settingsKind: 'openai-gpt-image-1.5', lifecycle: 'legacy',
+    description: 'OpenAI image generation and editing with fixed sizes, transparency, masks, and up to ten outputs.',
+    maxReferenceImages: 16, referenceInputs: ['image'], supportsMask: true, supportsTextOutput: false,
+    aspectRatios: [], imageSizes: GPT_IMAGE_LEGACY_SIZES,
+    warnings: ['Reference inputs are image files only; use PNG, JPEG, or WebP.', 'Transparent backgrounds require PNG or WebP output.'],
+  },
   'google/gemini-3.1-flash-image': {
     id: 'google/gemini-3.1-flash-image',
     profileVersion: 1,
@@ -364,6 +484,7 @@ export const IMAGE_MODEL_PROFILES: Readonly<Record<ImageModelId, ImageModelProfi
     provider: 'google',
     adapter: 'gateway-language-image',
     settingsComponent: 'Gemini31FlashImageSettings',
+    settingsKind: 'gemini-3.1-flash-image',
     lifecycle: 'recommended',
     description: 'Best general-purpose Gemini image model; supports 512–4K, thinking, and web/image grounding.',
     maxReferenceImages: 14,
@@ -388,6 +509,7 @@ export const IMAGE_MODEL_PROFILES: Readonly<Record<ImageModelId, ImageModelProfi
     provider: 'google',
     adapter: 'gateway-language-image',
     settingsComponent: 'Gemini3ProImageSettings',
+    settingsKind: 'gemini-3-pro-image',
     lifecycle: 'current',
     description: 'Premium Gemini model for complex professional assets, text rendering, and high-fidelity edits.',
     maxReferenceImages: 14,
@@ -411,6 +533,7 @@ export const IMAGE_MODEL_PROFILES: Readonly<Record<ImageModelId, ImageModelProfi
     provider: 'google',
     adapter: 'gateway-language-image',
     settingsComponent: 'Gemini31FlashLiteImageSettings',
+    settingsKind: 'gemini-3.1-flash-lite-image',
     lifecycle: 'current',
     description: 'Lowest-latency, low-cost Gemini image generation and editing; fixed to 1K output.',
     maxReferenceImages: 14,
@@ -435,6 +558,7 @@ export const IMAGE_MODEL_PROFILES: Readonly<Record<ImageModelId, ImageModelProfi
     provider: 'google',
     adapter: 'gateway-language-image',
     settingsComponent: 'Gemini25FlashImageSettings',
+    settingsKind: 'gemini-2.5-flash-image',
     lifecycle: 'legacy',
     lifecycleNote: 'Scheduled to retire October 2, 2026. Prefer Gemini 3.1 Flash Lite or Flash.',
     description: 'Legacy 1024-class Gemini model retained for comparison and reproducibility.',
@@ -451,6 +575,54 @@ export const IMAGE_MODEL_PROFILES: Readonly<Record<ImageModelId, ImageModelProfi
       'All generated images include SynthID.',
     ],
   },
+  'openai/gpt-image-2.5-sunburst': {
+    id: 'openai/gpt-image-2.5-sunburst',
+    profileVersion: 1,
+    name: 'GPT Image 2.5 Sunburst',
+    shortName: 'GPT Image 2.5 Sunburst',
+    provider: 'openai',
+    adapter: 'gateway-image',
+    settingsComponent: 'OpenAiGptImage25Settings',
+    settingsKind: 'openai-gpt-image-2.5-sunburst',
+    lifecycle: 'recommended',
+    description: 'OpenAI image generation from text and pictures, focused on precise product edits.',
+    maxReferenceImages: 16,
+    referenceInputs: ['image'],
+    supportsMask: true,
+    supportsTextOutput: false,
+    aspectRatios: [],
+    imageSizes: [],
+    warnings: [
+      'Reference inputs are image files only; use PNG, JPEG, or WebP.',
+      'Transparent backgrounds require PNG or WebP output.',
+      'Resolutions above 2560x1440 are experimental.',
+      'Higher quality settings can increase generation time and cost.',
+    ],
+  },
+  'openai/gpt-image-2.5-flare': {
+    id: 'openai/gpt-image-2.5-flare',
+    profileVersion: 1,
+    name: 'GPT Image 2.5 Flare',
+    shortName: 'GPT Image 2.5 Flare',
+    provider: 'openai',
+    adapter: 'gateway-image',
+    settingsComponent: 'OpenAiGptImage25Settings',
+    settingsKind: 'openai-gpt-image-2.5-flare',
+    lifecycle: 'current',
+    description: 'OpenAI image generation and editing from text and pictures, optimized for fast everyday work.',
+    maxReferenceImages: 16,
+    referenceInputs: ['image'],
+    supportsMask: true,
+    supportsTextOutput: false,
+    aspectRatios: [],
+    imageSizes: [],
+    warnings: [
+      'Reference inputs are image files only; use PNG, JPEG, or WebP.',
+      'Transparent backgrounds require PNG or WebP output.',
+      'Resolutions above 2560x1440 are experimental.',
+      'Higher quality settings can increase generation time and cost.',
+    ],
+  },
   'openai/gpt-image-2': {
     id: 'openai/gpt-image-2',
     profileVersion: 1,
@@ -459,8 +631,9 @@ export const IMAGE_MODEL_PROFILES: Readonly<Record<ImageModelId, ImageModelProfi
     provider: 'openai',
     adapter: 'gateway-image',
     settingsComponent: 'OpenAiGptImage2Settings',
+    settingsKind: 'openai-gpt-image-2',
     lifecycle: 'current',
-    description: 'OpenAI’s current image generation/editing model with custom dimensions, masks, and up to ten outputs.',
+    description: 'OpenAI image generation and editing with custom dimensions, masks, and up to ten outputs.',
     maxReferenceImages: 16,
     referenceInputs: ['image'],
     supportsMask: true,
@@ -496,7 +669,19 @@ export function createDefaultSettings(model: ImageModelId): ImageGenerationSetti
       return Gemini31FlashLiteImageSettingsSchema.parse({kind: 'gemini-3.1-flash-lite-image'})
     case 'google/gemini-2.5-flash-image':
       return Gemini25FlashImageSettingsSchema.parse({kind: 'gemini-2.5-flash-image'})
+    case 'openai/gpt-image-1':
+      return OpenAiGptImage1SettingsSchema.parse({kind: 'openai-gpt-image-1'})
+    case 'openai/gpt-image-1-mini':
+      return OpenAiGptImage1MiniSettingsSchema.parse({kind: 'openai-gpt-image-1-mini'})
+    case 'openai/gpt-image-1.5':
+      return OpenAiGptImage15SettingsSchema.parse({kind: 'openai-gpt-image-1.5'})
     case 'openai/gpt-image-2':
       return OpenAiGptImage2SettingsSchema.parse({kind: 'openai-gpt-image-2'})
+    case 'openai/gpt-image-2.5-sunburst':
+      return OpenAiGptImage25SunburstSettingsSchema.parse({kind: 'openai-gpt-image-2.5-sunburst'})
+    case 'openai/gpt-image-2.5-flare':
+      return OpenAiGptImage25FlareSettingsSchema.parse({kind: 'openai-gpt-image-2.5-flare'})
+    default:
+      return createCatalogImageDefaults(model)
   }
 }

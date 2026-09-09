@@ -1,4 +1,4 @@
-const SECRET_KEY_PATTERN = /authorization|api[-_]?key|cookie|credential|password|secret|access[-_]?token|refresh[-_]?token/i
+const SECRET_KEY_PATTERN = /authorization|api[-_]?key|cookie|credential|password|secret|access[-_]?token|refresh[-_]?token|image[_-]?prompt|input_image|requestBody/i
 
 export const MAX_STORED_PROVIDER_METADATA_BYTES = 32 * 1024
 

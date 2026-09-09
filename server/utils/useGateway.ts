@@ -4,10 +4,14 @@ import {z} from 'zod'
 import {
     IMAGE_MODEL_PROFILES,
     ImageGenerationRequestSchema,
+    isOpenAiImageSettings,
+    isGeminiImageSettings,
+    getImageModelProfile,
     type ImageGenerationRequest,
     type OutputMetadata,
     type StoredGenerationError,
 } from '../../schemas/image-generation'
+import { catalogImageOptions } from './catalogImageOptions'
 import {settleWithinMs} from './gatewayTimeout'
 import {
     getGatewayMetadataLookupPool,
@@ -108,7 +112,7 @@ const googleSearchTool = createProviderToolFactory<z.infer<typeof googleSearchIn
     inputSchema: googleSearchInputSchema,
 })
 
-const SECRET_KEY_PATTERN = /authorization|api[-_]?key|cookie|credential|password|secret|access[-_]?token|refresh[-_]?token/i
+const SECRET_KEY_PATTERN = /authorization|api[-_]?key|cookie|credential|password|secret|access[-_]?token|refresh[-_]?token|image[_-]?prompt|input_image|requestBody/i
 const RETRYABLE_STATUS_CODES = new Set([408, 409, 425, 429])
 export const DEFAULT_IMAGE_GENERATION_TIMEOUT_MS = 180_000
 export const MIN_IMAGE_GENERATION_TIMEOUT_MS = 10_000
@@ -312,40 +316,20 @@ function getGateway() {
     return _gateway
 }
 
-/**
- * Heuristic: language-class model that can output images.
- * Gemini image preview, Gemini 3 pro image, etc are all `modelType: 'language'`
- * but support IMAGE response modality via providerOptions.
- */
-export function isImageOutputLanguageModel(m: GatewayModelInfo): boolean {
-    if (m.modelType !== 'language') return false
-    const id = m.id.toLowerCase()
-    const name = m.name.toLowerCase()
-    const desc = (m.description || '').toLowerCase()
-    if (/image/.test(id) && /(preview|gemini|nano|banana)/.test(id)) return true
-    if (/imagen/.test(id) || /imagen/.test(name)) return true
-    if (/image generation/.test(desc)) return true
-    return false
+export function isImageOutputLanguageModel(model: GatewayModelInfo): boolean {
+    return getImageModelProfile(model.id)?.adapter === 'gateway-language-image'
 }
 
-export function isImageCapableModel(m: GatewayModelInfo): boolean {
-    return m.modelType === 'image' || isImageOutputLanguageModel(m)
+export function isImageCapableModel(model: GatewayModelInfo): boolean {
+    return !!getImageModelProfile(model.id)
 }
 
-// well, APi doesn't show shit in terms of which is image to image so it is manual.. https://vercel.com/ai-gateway/models
 export function supportsImageInput(model: GatewayModelInfo): boolean {
-    const id = model.id.toLowerCase()
-    if (isImageOutputLanguageModel(model)) return true
-    if (/gpt-image/.test(id)) return true
-    if (/flux-(?:2|kontext)/.test(id)) return true
-    return false
+    return (getImageModelProfile(model.id)?.maxReferenceImages ?? 0) > 0
 }
 
 export function supportsMultipleImageInputs(model: GatewayModelInfo): boolean {
-    const id = model.id.toLowerCase()
-    if (isImageOutputLanguageModel(model)) return true
-    if (/flux-(?:2|kontext)/.test(id)) return true
-    return false
+    return (getImageModelProfile(model.id)?.maxReferenceImages ?? 0) > 1
 }
 
 function usdPerMillion(perTokenUsd?: string) {
@@ -428,39 +412,16 @@ export function getImageModelPricingDetails(model: GatewayModelInfo): ImageModel
 }
 
 export function getImageModelCapabilities(model: GatewayModelInfo): ImageModelCapabilities {
-    const id = model.id.toLowerCase()
-    const name = model.name.toLowerCase()
-    const output: ImageModelCapabilities['output'] = ['image']
-    const input: ImageModelCapabilities['input'] = ['text']
-    const operations: ImageModelCapabilities['operations'] = ['text-to-image']
-    const warnings: string[] = []
-
-    if (isImageOutputLanguageModel(model)) {
-        output.push('text')
-        input.push('image', 'multiple-images')
-        operations.push('image-edit', 'image-to-image', 'multi-reference')
-    } else if (supportsImageInput(model)) {
-        input.push('image')
-        operations.push('image-edit', 'image-to-image')
-        if (supportsMultipleImageInputs(model)) {
-            input.push('multiple-images')
-            operations.push('multi-reference')
-        }
-    }
-
-    if (/imagen/.test(id) || /grok-imagine-image/.test(id) || /flux-fast-schnell/.test(id) || /recraft/.test(id) || /seedream/.test(id) || /bytedance/.test(id)) {
-        warnings.push('This model is treated as text-to-image only; selected input/model images may be ignored or rejected.')
-    }
-
-    if (model.modelType === 'image' && !model.pricingDetails?.components.some(c => c.kind !== 'unknown')) {
-        warnings.push('Exact image price is not exposed by the AI SDK model config; use post-generation cost refresh for the final charge.')
-    }
-
+    const profile = getImageModelProfile(model.id)
+    if (!profile) return {output: [], input: [], operations: [], warnings: []}
     return {
-        output: [...new Set(output)],
-        input: [...new Set(input)],
-        operations: [...new Set(operations)],
-        warnings,
+        output: profile.supportsTextOutput ? ['image', 'text'] : ['image'],
+        input: profile.maxReferenceImages > 1 ? ['text', 'image', 'multiple-images'] : ['text', 'image'],
+        operations: profile.requiresMask ? ['image-edit'] : profile.referenceMode === 'image-prompt'
+            ? ['text-to-image', 'image-to-image'] : profile.maxReferenceImages > 1
+            ? ['text-to-image', 'image-edit', 'image-to-image', 'multi-reference']
+            : ['text-to-image', 'image-edit', 'image-to-image'],
+        warnings: [...profile.warnings],
     }
 }
 
@@ -692,16 +653,18 @@ export async function useGateway() {
     async function loadInputFiles(opts: ImageGenerationRequest) {
         const paths = [...opts.inputImages, ...opts.modelImages]
         const files: Array<{buffer: Buffer; mediaType: string}> = []
-        const allowedMediaTypes = opts.model === 'openai/gpt-image-2'
-            ? new Set(['image/png', 'image/jpeg', 'image/webp'])
-            : new Set(['image/png', 'image/jpeg', 'image/webp', 'image/heic'])
+        const allowedMediaTypes = isGeminiImageSettings(opts.settings)
+            ? new Set(['image/png', 'image/jpeg', 'image/webp', 'image/heic'])
+            : isOpenAiImageSettings(opts.settings)
+                ? new Set(['image/png', 'image/jpeg', 'image/webp'])
+                : new Set(['image/png', 'image/jpeg'])
         let totalBytes = 0
         for (const imagePath of paths) {
             const image = await fs.getImageFile(imagePath)
             if (!allowedMediaTypes.has(image.mimeType)) {
                 throw createError({
                     statusCode: 415,
-                    statusMessage: `${opts.model} does not accept ${image.mimeType} reference images. Use PNG, JPEG, WebP${opts.model === 'openai/gpt-image-2' ? '' : ', or HEIC'}.`,
+                    statusMessage: `${opts.model} does not accept ${image.mimeType} reference images. Use ${[...allowedMediaTypes].join(', ')}.`,
                 })
             }
             totalBytes += image.buffer.length
@@ -837,7 +800,7 @@ export async function useGateway() {
      */
     async function generateImageViaLanguageModel(opts: ImageGenerationRequest): Promise<GeneratedImage[]> {
         const request = validateGenerationRequest(opts)
-        if (request.settings.kind === 'openai-gpt-image-2') {
+        if (!isGeminiImageSettings(request.settings)) {
             validationError([{
                 code: 'custom',
                 path: ['model'],
@@ -958,17 +921,16 @@ export async function useGateway() {
     }
 
     /**
-     * GPT Image 2 is a Gateway image model. Only schema-backed options are sent;
-     * unsupported aspectRatio, seed, inputFidelity, and transparency controls are
-     * intentionally absent.
+     * Native image models use the Gateway image adapter. Only options validated
+     * against the selected model settings schema are forwarded.
      */
     async function generateImageViaImageModel(opts: ImageGenerationRequest): Promise<GeneratedImage[]> {
         const request = validateGenerationRequest(opts)
-        if (request.settings.kind !== 'openai-gpt-image-2') {
+        if (isGeminiImageSettings(request.settings)) {
             validationError([{
                 code: 'custom',
                 path: ['model'],
-                message: `${request.model} is not the supported Gateway image model.`,
+                message: `${request.model} is not a supported Gateway image model.`,
                 input: request.model,
             }])
         }
@@ -986,21 +948,28 @@ export async function useGateway() {
         const settings = request.settings
         const files = await loadInputFiles(request)
         const mask = await loadMaskFile(request)
-        const prompt = files.length > 0 || mask
+        const imageOptions = isOpenAiImageSettings(settings)
+            ? {
+                referenceMode: 'images' as const,
+                ...(settings.size ? {size: settings.size as `${number}x${number}`} : {}),
+                providerOptions: {openai: {
+                    quality: settings.quality,
+                    background: settings.background,
+                    outputFormat: settings.outputFormat,
+                    moderation: settings.moderation,
+                    ...(settings.outputCompression != null ? {outputCompression: settings.outputCompression} : {}),
+                    ...(settings.user ? {user: settings.user} : {}),
+                }},
+            }
+            : catalogImageOptions(settings, files[0]?.buffer)
+        const {referenceMode, ...gatewayOptions} = imageOptions
+        const prompt = referenceMode === 'images' && (files.length > 0 || mask)
             ? {
                 text: request.prompt,
                 images: files.map(file => file.buffer),
                 ...(mask ? {mask} : {}),
             }
             : request.prompt
-        const openaiOptions = {
-            quality: settings.quality,
-            background: settings.background,
-            outputFormat: settings.outputFormat,
-            moderation: settings.moderation,
-            ...(settings.outputCompression != null ? {outputCompression: settings.outputCompression} : {}),
-            ...(settings.user ? {user: settings.user} : {}),
-        }
         const timeoutMs = getImageGenerationTimeoutMs()
         const abortSignal = AbortSignal.timeout(timeoutMs)
 
@@ -1012,14 +981,13 @@ export async function useGateway() {
                 prompt,
                 n: settings.numberOfImages,
                 abortSignal,
-                ...(settings.size ? {size: settings.size as `${number}x${number}`} : {}),
-                providerOptions: {openai: openaiOptions},
+                ...gatewayOptions,
             })
         } catch (error) {
             if (abortSignal.aborted || isTimeoutLikeError(error)) {
-                throwGatewayTimeout('Gateway GPT Image 2 request', timeoutMs, error)
+                throwGatewayTimeout('Gateway image request', timeoutMs, error)
             }
-            throwGatewayError('Gateway GPT Image 2 request failed', error)
+            throwGatewayError('Gateway image request failed', error)
         }
 
         if (response.images.length === 0) noImageError(request.model, 'no image files')
@@ -1031,9 +999,7 @@ export async function useGateway() {
             response.images.length,
         )
         const warnings = mergeWarnings(profile.warnings, formatWarnings(response.warnings))
-        const fallbackMimeType = settings.outputFormat === 'jpeg'
-            ? 'image/jpeg'
-            : `image/${settings.outputFormat}`
+        const fallbackMimeType = 'outputFormat' in settings ? `image/${settings.outputFormat}` : 'image/png'
 
         return response.images.map(image => ({
             buffer: toBufferView(image.uint8Array),

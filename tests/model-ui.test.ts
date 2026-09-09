@@ -39,9 +39,7 @@ test('every curated profile explicitly limits references to images', () => {
 test('model defaults keep their model-specific discriminant', () => {
   for (const id of SUPPORTED_IMAGE_MODEL_IDS) {
     const settings = createDefaultSettings(id)
-    const expectedKind = id === 'openai/gpt-image-2'
-      ? 'openai-gpt-image-2'
-      : id.slice('google/'.length)
+    const expectedKind = IMAGE_MODEL_PROFILES[id].settingsKind
     assert.equal(settings.kind, expectedKind)
   }
 })

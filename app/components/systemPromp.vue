@@ -2,6 +2,8 @@
 import { refreshNuxtData } from '#app'
 import {
   ImageModelIdSchema,
+  isOpenAiImageSettings,
+  isGeminiImageSettings,
   StoredGenerationConfigSchema,
   canonicalizeImageModelId,
   createDefaultSettings,
@@ -78,8 +80,13 @@ const replayUnavailableReason = computed(() => {
 const settingsSummary = computed(() => {
   const settings = replayConfig.value?.settings
   if (!settings) return ''
-  if (settings.kind === 'openai-gpt-image-2') {
+  if (isOpenAiImageSettings(settings)) {
     return `${settings.size || 'auto size'} · ${settings.quality} · ${settings.outputFormat.toUpperCase()}`
+  }
+  if (!isGeminiImageSettings(settings)) {
+    return [('size' in settings ? settings.size : undefined) || ('aspectRatio' in settings ? settings.aspectRatio : undefined),
+      'resolution' in settings ? settings.resolution : undefined,
+      'outputFormat' in settings ? settings.outputFormat.toUpperCase() : undefined].filter(Boolean).join(' � ') || 'Model defaults'
   }
   const size = 'imageSize' in settings ? settings.imageSize : '1K'
   return `${settings.aspectRatio || 'input/default ratio'} · ${size}`
@@ -90,7 +97,7 @@ const outputDimensions = computed(() => {
 })
 const grounding = computed(() => outputMetadata.value?.grounding)
 function singleOutputDerivativeSettings(settings: StoredGenerationConfig['settings']) {
-  return settings.kind === 'openai-gpt-image-2'
+  return 'numberOfImages' in settings
     ? {...settings, numberOfImages: 1 as const}
     : settings
 }

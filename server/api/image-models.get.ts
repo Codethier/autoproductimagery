@@ -1,17 +1,19 @@
 import { z } from 'zod'
 import {
     IMAGE_MODEL_PROFILES,
+    IMAGE_MODEL_PROVIDERS,
     SUPPORTED_IMAGE_MODEL_IDS,
     type ImageModelProfile,
 } from '~~/schemas/image-generation'
 import {
     enrichImageModelInfo,
+    getImageModelCapabilities,
     useGateway,
     type GatewayModelInfo,
 } from '~~/server/utils/useGateway'
 
 const QuerySchema = z.object({
-    provider: z.enum(['google', 'openai']).optional(),
+    provider: z.enum(IMAGE_MODEL_PROVIDERS).optional(),
     search: z.string().min(1).max(200).optional(),
     refresh: z.union([z.literal('1'), z.literal('true')]).optional(),
 })
@@ -19,13 +21,7 @@ const QuerySchema = z.object({
 function capabilitiesFor(profile: ImageModelProfile) {
     return {
         referenceInputScope: 'images-only' as const,
-        output: profile.supportsTextOutput ? ['image', 'text'] : ['image'],
-        input: profile.maxReferenceImages > 1
-            ? ['text', 'image', 'multiple-images']
-            : ['text', 'image'],
-        operations: profile.maxReferenceImages > 1
-            ? ['text-to-image', 'image-edit', 'image-to-image', 'multi-reference']
-            : ['text-to-image', 'image-edit', 'image-to-image'],
+        ...getImageModelCapabilities({id: profile.id, name: profile.name, provider: profile.provider}),
         warnings: [...profile.warnings, ...(profile.lifecycleNote ? [profile.lifecycleNote] : [])],
     }
 }
