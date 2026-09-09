@@ -96,13 +96,3 @@ function setOptionalNumber(key: keyof GeminiImageGenerationSettings['sampling'],
     </details>
   </div>
 </template>
-
-<style scoped>
-.setting-label { display: block; font-size: 0.875rem; font-weight: 500; color: rgb(55 65 81); }
-.setting-input { display: block; width: 100%; margin-top: 0.25rem; border: 1px solid rgb(209 213 219); border-radius: 0.375rem; padding: 0.5rem 0.625rem; background: transparent; font-weight: 400; }
-.setting-help { display: block; margin-top: 0.25rem; font-size: 0.75rem; line-height: 1.25rem; color: rgb(107 114 128); }
-.setting-card, .setting-section { border: 1px solid rgb(229 231 235); border-radius: 0.5rem; padding: 0.75rem; }
-:global(.dark) .setting-label { color: rgb(209 213 219); }
-:global(.dark) .setting-input, :global(.dark) .setting-card, :global(.dark) .setting-section { border-color: rgb(55 65 81); }
-:global(.dark) .setting-help { color: rgb(156 163 175); }
-</style>

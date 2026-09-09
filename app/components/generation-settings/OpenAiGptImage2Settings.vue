@@ -77,10 +77,3 @@ function setCompression(event: Event) {
     </div>
   </div>
 </template>
-
-<style scoped>
-.setting-input { display:block; width:100%; margin-top:.25rem; border:1px solid rgb(209 213 219); border-radius:.375rem; padding:.5rem .625rem; background:transparent; font-weight:400; }
-.setting-input:disabled { opacity:.55; cursor:not-allowed; } .setting-help { display:block; margin-top:.25rem; font-size:.75rem; line-height:1.25rem; color:rgb(107 114 128); }
-.setting-error { display:block; margin-top:.25rem; font-size:.75rem; color:rgb(220 38 38); }
-:global(.dark) .setting-input { border-color:rgb(55 65 81); } :global(.dark) .setting-help { color:rgb(156 163 175); }
-</style>

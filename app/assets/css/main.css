@@ -24,6 +24,7 @@
 
 
 html {
+    color-scheme: light;
     font-family: 'Roboto, JetBrains Mono', system-ui, sans-serif;
     /*--background-shop: #ffffff;*/
     /*--background-shop-opposite: #4f4f4f;*/
@@ -53,4 +54,71 @@ html {
 
 @media (min-width: 1536px) {
 
+}
+
+html.dark {
+    color-scheme: dark;
+}
+
+/* Shared native controls must use the same theme as Nuxt UI, including popups. */
+.setting-input {
+    display: block;
+    width: 100%;
+    margin-top: .25rem;
+    border: 1px solid var(--ui-border-accented);
+    border-radius: .375rem;
+    padding: .5rem .625rem;
+    background-color: var(--ui-bg);
+    color: var(--ui-text);
+    font-weight: 400;
+}
+
+.setting-input option,
+.setting-input optgroup {
+    background-color: var(--ui-bg);
+    color: var(--ui-text);
+}
+
+.setting-input::placeholder,
+.setting-input option:disabled {
+    color: var(--ui-text-dimmed);
+}
+
+.setting-input:focus-visible {
+    outline: 2px solid var(--ui-primary);
+    outline-offset: 2px;
+}
+
+.setting-input:disabled {
+    opacity: .55;
+    cursor: not-allowed;
+}
+
+.setting-label {
+    display: block;
+    font-size: .875rem;
+    font-weight: 500;
+    color: var(--ui-text-highlighted);
+}
+
+.setting-help {
+    display: block;
+    margin-top: .25rem;
+    font-size: .75rem;
+    line-height: 1.25rem;
+    color: var(--ui-text-muted);
+}
+
+.setting-error {
+    display: block;
+    margin-top: .25rem;
+    font-size: .75rem;
+    color: var(--ui-error);
+}
+
+.setting-card,
+.setting-section {
+    border: 1px solid var(--ui-border);
+    border-radius: .5rem;
+    padding: .75rem;
 }
