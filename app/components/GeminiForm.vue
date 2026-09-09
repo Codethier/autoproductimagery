@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import type { Component } from 'vue'
+import { watchImageModelSelection } from '../utils/watchImageModelSelection'
 import {
   IMAGE_MODEL_PROFILES,
+  generationOutputCount,
   ImageGenerationRequestSchema,
   SUPPORTED_IMAGE_MODEL_IDS,
   createDefaultSettings,
@@ -13,6 +15,9 @@ import Gemini3ProImageSettings from './generation-settings/Gemini3ProImageSettin
 import Gemini31FlashLiteImageSettings from './generation-settings/Gemini31FlashLiteImageSettings.vue'
 import Gemini25FlashImageSettings from './generation-settings/Gemini25FlashImageSettings.vue'
 import OpenAiGptImage2Settings from './generation-settings/OpenAiGptImage2Settings.vue'
+import OpenAiGptImage25Settings from './generation-settings/OpenAiGptImage25Settings.vue'
+import OpenAiGptImageLegacySettings from './generation-settings/OpenAiGptImageLegacySettings.vue'
+import CatalogImageSettings from './generation-settings/CatalogImageSettings.vue'
 
 const data = useDataStore()
 const prompt = ref('')
@@ -153,13 +158,13 @@ const settingsComponents: Record<ImageModelProfile['settingsComponent'], Compone
   Gemini31FlashLiteImageSettings,
   Gemini25FlashImageSettings,
   OpenAiGptImage2Settings,
+  OpenAiGptImage25Settings,
+  OpenAiGptImageLegacySettings,
+  CatalogImageSettings,
 }
 const selectedSettingsComponent = computed(() => settingsComponents[selectedProfile.value.settingsComponent])
 
-watch(() => data.selectedModel, (model, previousModel) => {
-  if (model !== previousModel) data.generationSettings = createDefaultSettings(model)
-  if (!selectedProfile.value.supportsMask) data.maskImage = null
-}, {flush: 'sync'})
+watchImageModelSelection(data)
 
 const selectedPricingText = computed(() => {
   const details = selectedModelInfo.value?.pricingDetails
@@ -193,9 +198,7 @@ const selectedCapabilityPills = computed(() => {
     ...caps.output.filter(v => v !== 'image').map(v => v + ' output')
   ]
 })
-const outputsPerJob = computed(() => data.generationSettings.kind === 'openai-gpt-image-2'
-    ? data.generationSettings.numberOfImages
-    : 1)
+const outputsPerJob = computed(() => generationOutputCount(data.generationSettings))
 const estimatedOutputCount = computed(() => Math.max(1, data.inputImages.length) * outputsPerJob.value)
 const selectedCostEstimate = computed(() => {
   const components = selectedPricingComponents.value
@@ -221,12 +224,14 @@ const inputCapabilityWarning = computed(() => {
 
 const referenceCount = computed(() => (data.inputImages.length > 0 ? 1 : 0) + data.models.length)
 const referenceOverflow = computed(() => Math.max(0, referenceCount.value - selectedProfile.value.maxReferenceImages))
+const missingRequiredMask = computed(() => selectedProfile.value.requiresMask && !data.maskImage)
+const luminanceMask = computed(() => selectedProfile.value.maskMode === 'luminance')
 const maskWithoutReference = computed(() => !!data.maskImage && referenceCount.value === 0)
 const maskFileNotPng = computed(() => !!data.maskImage && !/\.png(?:$|[?#])/i.test(data.maskImage))
 const maskSources = computed(() => data.inputImages.length > 0
     ? data.inputImages
     : data.models.slice(0, 1))
-const maskSourceNotPng = computed(() => !!data.maskImage
+const maskSourceNotPng = computed(() => !luminanceMask.value && !!data.maskImage
     && maskSources.value.some(source => !/\.png(?:$|[?#])/i.test(source)))
 const referenceSummary = computed(() => {
   const inputPart = data.inputImages.length > 0 ? '1 per input job' : 'no per-job input'
@@ -468,8 +473,8 @@ async function submit() {
       <div v-if="selectedProfile.supportsMask" class="rounded-lg border border-gray-200 p-3 dark:border-gray-800">
         <div class="flex flex-wrap items-center justify-between gap-2">
           <div>
-            <p class="text-sm font-medium text-gray-800 dark:text-gray-100">GPT edit mask</p>
-            <p class="text-xs text-gray-500 dark:text-gray-400">Optional PNG with an alpha channel. The first reference must also be PNG with identical dimensions. The mask guides, rather than precisely bounds, the edit.</p>
+            <p class="text-sm font-medium text-gray-800 dark:text-gray-100">{{ luminanceMask ? 'FLUX Fill mask (required)' : 'GPT edit mask' }}</p>
+            <p class="text-xs text-gray-500 dark:text-gray-400">{{ luminanceMask ? 'Required PNG mask: white areas are replaced and black areas are preserved. Use the same dimensions as the source image.' : 'Optional PNG with an alpha channel. The first reference must also be PNG with identical dimensions. Transparent areas guide the edit.' }}</p>
           </div>
           <div class="flex gap-2">
             <UModal :ui="{ content: 'max-w-7xl'}">
@@ -488,14 +493,15 @@ async function submit() {
       </div>
       <div
           class="rounded-lg border px-3 py-2 text-xs"
-          :class="referenceOverflow || maskWithoutReference || maskFileNotPng || maskSourceNotPng
+          :class="referenceOverflow || missingRequiredMask || maskWithoutReference || maskFileNotPng || maskSourceNotPng
               ? 'border-red-300 bg-red-50 text-red-700 dark:border-red-800 dark:bg-red-950/30 dark:text-red-200'
               : 'border-gray-200 bg-gray-50 text-gray-600 dark:border-gray-800 dark:bg-gray-900/60 dark:text-gray-300'"
       >
         <span class="font-medium">Reference usage:</span> {{ referenceSummary }}.
         <span v-if="referenceOverflow"> Remove {{ referenceOverflow }} shared reference image{{ referenceOverflow === 1 ? '' : 's' }} before submitting.</span>
+        <span v-if="missingRequiredMask"> Select a mask for FLUX Fill.</span>
         <span v-if="maskWithoutReference"> Select at least one input or shared reference image before using a mask.</span>
-        <span v-if="maskFileNotPng"> The mask itself must be a PNG image with an alpha channel.</span>
+        <span v-if="maskFileNotPng"> The mask itself must be a PNG image.</span>
         <span v-if="maskSourceNotPng"> Every per-job source must be PNG when a PNG mask is selected.</span>
         <span v-if="data.maskImage && !maskSourceNotPng && !maskWithoutReference"> The server verifies the mask against every source's dimensions before starting the batch.</span>
       </div>
@@ -588,7 +594,7 @@ async function submit() {
           class="self-start"
       />
       <div class="flex items-center gap-2 justify-end">
-        <UButton class="w-full" @click="submit()" :disabled="!prompt.trim() || !!referenceOverflow || maskWithoutReference || maskFileNotPng || maskSourceNotPng || !selectedModelAvailable">
+        <UButton class="w-full" @click="submit()" :disabled="!prompt.trim() || !!referenceOverflow || missingRequiredMask || maskWithoutReference || maskFileNotPng || maskSourceNotPng || !selectedModelAvailable">
           Submit
         </UButton>
       </div>

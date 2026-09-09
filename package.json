@@ -7,7 +7,7 @@
     "dev": "nuxt dev",
     "generate": "nuxt generate",
     "preview": "nuxt preview",
-    "test": "node --test tests/*.test.ts",
+    "test": "node --import ./tests/register-typescript.mjs --test tests/*.test.ts",
     "postinstall": "nuxt prepare",
     "drizzle:generate": "drizzle-kit generate",
     "drizzle:push": "drizzle-kit push",

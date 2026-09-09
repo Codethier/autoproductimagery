@@ -5,14 +5,16 @@
 - This is an image-only product imagery application. Prompts are text, and all uploaded/reference/mask/generated media must be validated image files.
 - PDF, video, audio, arbitrary files, and public media URLs are intentionally out of scope. Do not advertise or partially implement those model capabilities.
 - Each selected product image creates an independent generation job. Shared reference images may be attached to each job subject to that model's limits.
+- When the user says "add new models", check the entire current Vercel AI Gateway catalog across ALL providers and official provider documentation, then add every missing model that accepts BOTH text prompts AND uploaded images and produces images. Do not restrict discovery to OpenAI/Google or to recently released models. Image understanding with text-only output and text-to-image-only models do not qualify.
+- Complete each model addition through the exact-ID profile, strict settings schema, selector/settings UI, Gateway adapter, reference/mask validation, output accounting, stored settings/replay, and regression coverage. Verify actual image-edit/reference support in official documentation; catalog modality metadata alone can omit image inputs. Keep unavailable models clearly marked, and report eligible models that Gateway cannot yet serve. This shorthand does not authorize production deployment.
 
 ## Stack and integration boundaries
 
 - Framework: Nuxt 4 on Node 26.
 - ORM/database: Drizzle with local SQLite/libSQL.
 - All AI calls must use Vercel AI SDK through Vercel AI Gateway. Do not add direct provider SDK/API calls.
-- Curated image-model profiles and their runtime schemas live in `schemas/image-generation.ts`. Exact model IDs and discriminated settings—not names, descriptions, or regex heuristics—must choose adapters and capabilities.
-- Keep the curated provider scope to OpenAI and Google Gemini image models unless the user explicitly expands it.
+- Curated image-model profiles and their runtime schemas live in `schemas/image-generation.ts` and `schemas/catalog-image-models.ts`. Record the catalog audit and exclusions in `docs/image-model-catalog.md`. Exact model IDs and discriminated settings—not names, descriptions, or regex heuristics—must choose adapters and capabilities.
+- All Gateway providers are in scope. Keep an explicit, verified per-model whitelist and record exclusions when a catalog model cannot use uploaded pictures through Gateway or returns unsupported media such as SVG.
 
 ## Model settings and resolution
 

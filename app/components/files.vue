@@ -307,7 +307,7 @@ onBeforeUnmount(() => window.removeEventListener('paste', handlePaste))
                    @change="syncSelectToStore(file)"></UCheckbox>
         <UCheckbox v-if="props.isMaskSelect" v-model="file.selectedMask"
                    :disabled="!isPngImage(file)"
-                   :title="isPngImage(file) ? 'Use as PNG edit mask' : 'GPT Image 2 masks must be PNG files'"
+                   :title="isPngImage(file) ? 'Use as PNG edit mask' : 'GPT Image masks must be PNG files'"
                    @change="syncSelectToStore(file)"></UCheckbox>
         <UIcon name="i-heroicons-trash" class="size-6 text-red-500 cursor-pointer"
                @click="deleteFileOrFolder(file.name, file.url)"></UIcon>
