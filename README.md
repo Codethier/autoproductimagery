@@ -29,7 +29,7 @@ Upload product or reference images, choose an image-capable model from Vercel AI
 
 ## Requirements
 
-- Node.js 24.x
+- Node.js 26.x
 - A Vercel AI Gateway API key
 - A local SQLite database path
 
@@ -59,6 +59,7 @@ Install dependencies:
 
 ```bash
 npm install
+npm run drizzle:migrate
 ```
 
 Start the Nuxt development server:
@@ -123,15 +124,33 @@ docker run --rm \
 
 ## Database
 
-The app uses Drizzle with a local SQLite/libSQL database.
+The app uses Drizzle with a local SQLite/libSQL database. ORM and Kit are pinned to `1.0.0-rc.4`, a v1 release candidate. Both the app and migration commands use `DATABASE_URL`; the migration config loads `.env` for local use.
 
 Useful commands:
 
 ```bash
 npm run drizzle:generate
-npm run drizzle:push
+npm run drizzle:migrate
 npm run drizzle:studio
 ```
+
+Change `server/db/schema.ts`, generate the SQL, review it, then test it on a disposable database before applying it. Do not use `drizzle-kit push` to bypass migration history.
+
+### Upgrading an existing installation to Drizzle v1
+
+The repository already contains the converted v1 migration folders. All seven original SQL migrations and their timestamps are preserved. The missing snapshot for the historical `0003_price_source` migration was generated with Drizzle Kit, and the later snapshots were regenerated to form a complete chain before conversion.
+
+Back up the database before an approved rollout. Install the locked dependencies with `npm ci`, then run `npm run drizzle:migrate` against the intended database. With these pinned versions, the SQLite migrator automatically adds the v1 bookkeeping columns and matches previously applied migrations. It then applies any pending migrations. Existing installations do not need to rerun their old SQL or reset their database.
+
+For Coolify, use `npm run build` as the build command and this start command after the database rollout is approved:
+
+```sh
+npm run drizzle:migrate && exec node .output/server/index.mjs
+```
+
+The runtime needs Drizzle Kit, `drizzle.config.ts`, `server/db/schema.ts`, and the `drizzle/` directory. Keep the SQLite database on persistent storage and run migrations from one instance at a time.
+
+`npm run drizzle:up` converts migration files during a future format upgrade. Run it during development and commit the reviewed output; do not add it to the startup command. See the [Drizzle v1 upgrade guide](https://orm.drizzle.team/docs/upgrade-v1).
 
 Generated images are saved under `data/images/output`, and uploaded/selected images live under `data/images`.
 
