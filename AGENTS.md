@@ -14,6 +14,7 @@
 
 - Framework: Nuxt 4 on Node 26.
 - Railpack must install `libatomic1` in both the build and final runtime image through `railpack.json`. Node 26 requires `libatomic.so.1` on Linux. Deployment checks must verify the final runtime's shared libraries; a successful build alone is insufficient.
+- Coolify currently uses Railpack 0.23.0. Use explicit Apt package names in `railpack.json`; do not use the `"..."` list-extension syntax from newer Railpack documentation, because this version can pass it literally to `apt-get`. Check configuration compatibility against the deployed Railpack version.
 - ORM/database: Drizzle with local SQLite/libSQL.
 - All AI calls must use Vercel AI SDK through Vercel AI Gateway. Do not add direct provider SDK/API calls.
 - Curated image-model profiles and their runtime schemas live in `schemas/image-generation.ts` and `schemas/catalog-image-models.ts`. Record the catalog audit and exclusions in `docs/image-model-catalog.md`. Exact model IDs and discriminated settings—not names, descriptions, or regex heuristics—must choose adapters and capabilities.
