@@ -44,8 +44,3 @@ watch(() => settings.value.kind, () => { error.value = '' }, {flush: 'sync'})
     <p v-if="error" role="alert" class="text-sm text-red-600">{{ error }}</p>
   </div>
 </template>
-
-<style scoped>
-.setting-input { display:block; width:100%; margin-top:.25rem; border:1px solid rgb(209 213 219); border-radius:.375rem; padding:.5rem .625rem; background:transparent; font-weight:400; }
-:global(.dark) .setting-input { border-color:rgb(55 65 81); }
-</style>
