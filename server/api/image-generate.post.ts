@@ -27,6 +27,7 @@ import {installBoundedRawBody} from '~~/server/utils/boundedRequestBody'
 import { allocateGenerationBilling } from '~~/server/utils/generationBilling'
 import { sanitizeProviderMetadata } from '~~/server/utils/gatewayMetadata'
 import { validateGptImageMaskPair, validateBflFillMaskPair } from '~~/server/utils/gptImageMask'
+import {assertGeneratedSourcesAvailable} from '~~/server/utils/generatedImageSources'
 
 type RawBody = Record<string, unknown>
 const MAX_GENERATION_REQUEST_BYTES = 512 * 1024
@@ -178,6 +179,7 @@ export default defineEventHandler(async (event) => {
         runtimeConfig as unknown as Record<string, unknown>,
     )
     const database = await useDB()
+    await assertGeneratedSourcesAvailable(request, database.getExpiredGeneratedImagePaths)
     try {
         await database.reconcileStalePendingGenerations(generationRuntime.staleTtlMs)
     } catch (error) {

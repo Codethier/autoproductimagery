@@ -1,4 +1,5 @@
 import {pgTable, serial, integer, text, jsonb, timestamp, uuid, index} from "drizzle-orm/pg-core";
+import {sql} from "drizzle-orm";
 import type {
     OutputMetadata,
     StoredGenerationConfig,
@@ -11,6 +12,7 @@ export const systemPrompt = pgTable("systemPrompt", {
     serverImages: jsonb("serverImages").$type<string[]>(),
     modelImages: jsonb("modelImages").$type<string[]>(),
     outputImage: text("outputImage").notNull(),
+    outputImageDeletedAt: timestamp("outputImageDeletedAt", {mode: "string", withTimezone: true}),
     generationModel: text("generationModel"),
     inputTokens: integer("inputTokens"),
     outputTokens: integer("outputTokens"),
@@ -34,6 +36,8 @@ export const systemPrompt = pgTable("systemPrompt", {
     index("systemPrompt_batchId_idx").on(table.batchId),
     index("systemPrompt_parentSystemPromptId_idx").on(table.parentSystemPromptId),
     index("systemPrompt_status_updatedAt_idx").on(table.status, table.updatedAt),
+    index("systemPrompt_outputImage_idx").on(table.outputImage),
+    index("systemPrompt_image_retention_idx").on(table.createdAt, table.id).where(sql`${table.outputImageDeletedAt} IS NULL AND ${table.outputImage} <> '' AND (${table.status} = 'succeeded' OR ${table.status} IS NULL)`),
 ]);
 
 export const aiGatewayLog = pgTable("aiGatewayLog", {

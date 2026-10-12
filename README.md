@@ -82,6 +82,37 @@ The default provider timeout is 180 seconds. `NUXT_IMAGE_GENERATION_REQUEST_TIME
 
 Expired worker leases permit conservative pending-job recovery on subsequent requests. A paid call that fails or exceeds its deadline is recorded as retryable when appropriate; completed siblings remain successful. A hard process kill between an S3 write and database persistence can leave an orphan object for later operational cleanup.
 
+## Generated image retention
+
+Set `GENERATED_IMAGE_RETENTION_DAYS` on the cleanup service to choose how long generated images are retained. The default is **180 days**. Use a whole number from 1 to 36500, or `0` to disable cleanup. Invalid or blank values fail without deleting anything. Changing the number applies to existing generated outputs on the next run: lowering it can make older images immediately eligible.
+
+Cleanup selects successful generation records older than the cutoff and deletes their exact, recognized S3 output objects. It does not expire uploaded product/reference/mask images, delete folders, or erase prompts, settings, billing, or Gateway logs. Age uses the generation's original `createdAt`, so refreshing billing does not extend retention. History shows **Image expired** after deletion. You can still regenerate from available original uploads; refinement or exact replay that needs an expired generated image reports why it is unavailable.
+
+Only the application's immutable UUID output names are managed automatically. Imported legacy names that cannot be verified as managed outputs are preserved. An output shared by an unexpired generation record is also preserved. Untracked orphan objects are outside this cleanup's scope.
+
+Build and preview a cleanup using the target database's environment variables:
+
+```sh
+npm run images:cleanup
+npm run images:cleanup -- --apply
+```
+
+The default command is a dry run and needs no S3 credentials. `--apply` deletes eligible objects. Use an explicitly configured target database and bucket; the worker never runs migrations itself. Successful deletions get an `outputImageDeletedAt` marker while retaining the original URL as historical metadata. Failed deletions remain eligible for retry; deleting an already-missing object is safe to retry. PostgreSQL prevents overlapping workers, and each run has bounded SQL pages, a 10000-row limit and a five-minute work budget.
+
+On Railway, use a **separate cron service** named `image-retention` alongside the sleeping web app. Configure:
+
+| Setting | Value |
+| --- | --- |
+| Build command | `npm run build:retention` |
+| Start command | `node .output/cleanup-generated-images.mjs --apply` |
+| Cron schedule | `0 3 * * *` (daily at 03:00 UTC) |
+| Restart policy | `NEVER` |
+| Database pool | `DATABASE_POOL_MAX=1` |
+| Retention | `GENERATED_IMAGE_RETENTION_DAYS=180` |
+| Network | No public domain or TCP proxy |
+
+Reference the same PostgreSQL and private S3 variables as the app, including its storage prefix. The worker needs no Gateway key or login credentials. Apply reviewed database migrations through the app's explicit pre-deploy step before deploying the worker. It closes PostgreSQL and S3 connections when done, so it consumes no continuously running app process. Railway schedules are in UTC and may start a few minutes after the scheduled time. See [Railway cron documentation](https://docs.railway.com/cron-jobs).
+
 ## Migrations and existing local data
 
 Drizzle ORM and Kit stay pinned to `1.0.0-rc.4`. The PostgreSQL schema lives in `server/db/schema.ts`; its generated SQL and snapshots live in `drizzle/postgres/`. The earlier SQLite migration folders under `drizzle/` are retained intact as historical archives, and are not applied to PostgreSQL.

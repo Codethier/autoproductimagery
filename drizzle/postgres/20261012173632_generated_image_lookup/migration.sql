@@ -1,0 +1,1 @@
+CREATE INDEX "systemPrompt_outputImage_idx" ON "systemPrompt" ("outputImage");

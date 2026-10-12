@@ -433,6 +433,15 @@ export function createS3ImageStorage(options: {
 }
 
 let cachedStorage: ReturnType<typeof createS3ImageStorage> | undefined
+let cachedClient: S3Client | undefined
+
+// The scheduled worker has a finite lifetime; release SDK connections when it exits.
+export function closeImageStorage() {
+    cachedClient?.destroy()
+    cachedClient = undefined
+    cachedStorage = undefined
+}
+
 export async function useFS() {
     if (cachedStorage) return cachedStorage
     const { S3_ENDPOINT, S3_REGION, S3_BUCKET, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, S3_PREFIX, S3_FORCE_PATH_STYLE } = process.env
@@ -451,5 +460,6 @@ export async function useFS() {
         requestChecksumCalculation: "WHEN_REQUIRED", responseChecksumValidation: "WHEN_REQUIRED",
     })
     cachedStorage = createS3ImageStorage({ client, bucket: S3_BUCKET, prefix: S3_PREFIX })
+    cachedClient = client
     return cachedStorage
 }

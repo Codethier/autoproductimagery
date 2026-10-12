@@ -5,7 +5,7 @@ import {
     systemPrompt,
     type NewAiGatewayLog,
 } from "../db/schema"
-import { and, desc, eq, inArray, lt, sql as drizzleSql } from "drizzle-orm"
+import { and, desc, eq, inArray, isNotNull, lt, sql as drizzleSql } from "drizzle-orm"
 import type {
     OutputMetadata,
     StoredGenerationConfig,
@@ -38,11 +38,12 @@ type PendingGeneration = {
 
 type GenerationLog = Omit<NewAiGatewayLog, 'id' | 'systemPromptId' | 'createdAt'>
 
-function normalizedTimestamps<T extends {createdAt: string; updatedAt?: string}>(row: T): T {
+function normalizedTimestamps<T extends {createdAt: string; updatedAt?: string; outputImageDeletedAt?: string | null}>(row: T): T {
     return {
         ...row,
         createdAt: new Date(row.createdAt).toISOString(),
         ...(row.updatedAt ? {updatedAt: new Date(row.updatedAt).toISOString()} : {}),
+        ...(row.outputImageDeletedAt ? {outputImageDeletedAt: new Date(row.outputImageDeletedAt).toISOString()} : {}),
     }
 }
 
@@ -177,6 +178,16 @@ export async function useDB(db = getDatabase()) {
         return rowById(id)
     }
 
+    async function getExpiredGeneratedImagePaths(paths: readonly string[]) {
+        if (!paths.length) return []
+        if (paths.length > 200) throw new Error('Too many generated image paths to check')
+        const rows = await db.selectDistinct({outputImage: systemPrompt.outputImage}).from(systemPrompt).where(and(
+            inArray(systemPrompt.outputImage, [...new Set(paths)]),
+            isNotNull(systemPrompt.outputImageDeletedAt),
+        ))
+        return [...new Set(rows.map(row => row.outputImage))]
+    }
+
     async function updateSystemPromptBilling(id: number, billing: GenerationBilling) {
         const values: Record<string, unknown> = {
             ...billingValues(billing),
@@ -214,6 +225,7 @@ export async function useDB(db = getDatabase()) {
             serverImages: systemPrompt.serverImages,
             modelImages: systemPrompt.modelImages,
             outputImage: systemPrompt.outputImage,
+            outputImageDeletedAt: systemPrompt.outputImageDeletedAt,
             generationModel: systemPrompt.generationModel,
             inputTokens: systemPrompt.inputTokens,
             outputTokens: systemPrompt.outputTokens,
@@ -327,6 +339,7 @@ export async function useDB(db = getDatabase()) {
         completeGeneration,
         failGeneration,
         getSystemPrompt,
+        getExpiredGeneratedImagePaths,
         updateSystemPromptBilling,
         getSystemPrompts,
         countSystemPrompts,
