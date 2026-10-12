@@ -92,14 +92,14 @@ Expired worker leases permit conservative pending-job recovery on subsequent req
 
 ## Production deployments from master
 
-The single Railway `production` environment runs the app, PostgreSQL, private image bucket and daily retention worker. Configure both the `app` and `image-retention` services with the GitHub source `Codethier/autoproductimagery`, branch `master`, automatic push deployments and **Wait for CI** enabled. The checked-in `.github/workflows/ci.yml` runs tests against disposable PostgreSQL, typechecks, builds both entry points, checks migrations and verifies Node's runtime libraries on every push to `master` and pull request targeting it. CI receives no application or deployment credentials.
+The single Railway `production` environment runs the app, PostgreSQL, private image bucket and daily retention worker. Configure both the `app` and `image-retention` services with the GitHub source `Codethier/autoproductimagery`, branch `master`, automatic push deployments and **Wait for CI** disabled. GitHub Actions CI is not configured for this repository. Run the local verification commands above before publishing an approved change.
 
 | Service | Build | Start | Pre-deploy |
 | --- | --- | --- | --- |
 | `app` | `npm run build` | `node .output/server/index.mjs` | `npm run drizzle:migrate` |
 | `image-retention` | `npm run build:retention` | `node .output/cleanup-generated-images.mjs --apply` | None; app applies reviewed migrations |
 
-The app uses the `/api/health` readiness check and Railway serverless/sleep mode. The retention service has the daily schedule documented below and no public domain. PostgreSQL and S3 remain private; their connection variables are Railway service references. Pushes deploy the committed repository snapshot after CI succeeds, so local ignored credentials and datasets are never part of the GitHub deployment source.
+The app uses the `/api/health` readiness check and Railway serverless/sleep mode. The retention service has the daily schedule documented below and no public domain. PostgreSQL and S3 remain private; their connection variables are Railway service references. Pushes deploy the committed repository snapshot directly, so local ignored credentials and datasets are never part of the GitHub deployment source.
 
 Before switching an existing installation, review every deployment target watching `master`. Disable any obsolete target's automatic deployment before pushing this PostgreSQL/S3 version if that target still uses the previous SQLite/filesystem configuration. Preserve its existing application and stored data until a separate cutover is authorized. Production environment changes and migrations still require the explicit confirmation in `AGENTS.md`.
 
