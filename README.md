@@ -82,6 +82,19 @@ The default provider timeout is 180 seconds. `NUXT_IMAGE_GENERATION_REQUEST_TIME
 
 Expired worker leases permit conservative pending-job recovery on subsequent requests. A paid call that fails or exceeds its deadline is recorded as retryable when appropriate; completed siblings remain successful. A hard process kill between an S3 write and database persistence can leave an orphan object for later operational cleanup.
 
+## Production deployments from master
+
+The single Railway `production` environment runs the app, PostgreSQL, private image bucket and daily retention worker. Configure both the `app` and `image-retention` services with the GitHub source `Codethier/autoproductimagery`, branch `master`, automatic push deployments and **Wait for CI** enabled. The checked-in `.github/workflows/ci.yml` runs tests against disposable PostgreSQL, typechecks, builds both entry points, checks migrations and verifies Node's runtime libraries on every push to `master` and pull request targeting it. CI receives no application or deployment credentials.
+
+| Service | Build | Start | Pre-deploy |
+| --- | --- | --- | --- |
+| `app` | `npm run build` | `node .output/server/index.mjs` | `npm run drizzle:migrate` |
+| `image-retention` | `npm run build:retention` | `node .output/cleanup-generated-images.mjs --apply` | None; app applies reviewed migrations |
+
+The app uses the `/api/health` readiness check and Railway serverless/sleep mode. The retention service has the daily schedule documented below and no public domain. PostgreSQL and S3 remain private; their connection variables are Railway service references. Pushes deploy the committed repository snapshot after CI succeeds, so local ignored credentials and datasets are never part of the GitHub deployment source.
+
+Before switching an existing installation, review every deployment target watching `master`. Disable any obsolete target's automatic deployment before pushing this PostgreSQL/S3 version if that target still uses the previous SQLite/filesystem configuration. Preserve its existing application and stored data until a separate cutover is authorized. Production environment changes and migrations still require the explicit confirmation in `AGENTS.md`.
+
 ## Generated image retention
 
 Set `GENERATED_IMAGE_RETENTION_DAYS` on the cleanup service to choose how long generated images are retained. The default is **180 days**. Use a whole number from 1 to 36500, or `0` to disable cleanup. Invalid or blank values fail without deleting anything. Changing the number applies to existing generated outputs on the next run: lowering it can make older images immediately eligible.
