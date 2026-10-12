@@ -9,6 +9,8 @@ export const MAX_UPLOAD_REQUEST_BYTES = MAX_UPLOAD_AGGREGATE_BYTES + 1024 * 1024
 export const MAX_UPLOAD_PATH_BYTES = 4096
 export const MAX_CONCURRENT_UPLOADS = 2
 export const MAX_QUEUED_UPLOADS = 4
+export const MAX_UPLOAD_QUEUE_WAIT_MS = 10_000
+export const MAX_UPLOAD_STREAM_DURATION_MS = 120_000
 
 export type BufferedUploadFile = {
     name: "files"
@@ -42,7 +44,7 @@ export class BoundedUploadGate {
         this.maximumQueue = maximumQueue
     }
 
-    run<T>(work: () => Promise<T>): Promise<T> {
+    run<T>(work: () => Promise<T>, maximumWaitMs = MAX_UPLOAD_QUEUE_WAIT_MS): Promise<T> {
         if (this.active < this.concurrency) return this.start(work)
         if (this.queue.length >= this.maximumQueue) {
             return Promise.reject(createError({
@@ -50,8 +52,19 @@ export class BoundedUploadGate {
                 statusMessage: "Upload capacity is full; retry later",
             }))
         }
-        return new Promise<void>((resolve) => {
-            this.queue.push({ start: resolve })
+        return new Promise<void>((resolve, reject) => {
+            const entry: UploadQueueEntry = {
+                start: () => {
+                    clearTimeout(timeout)
+                    resolve()
+                },
+            }
+            const timeout = setTimeout(() => {
+                const index = this.queue.indexOf(entry)
+                if (index >= 0) this.queue.splice(index, 1)
+                reject(createError({ statusCode: 429, statusMessage: 'Upload capacity is full; retry later' }))
+            }, maximumWaitMs)
+            this.queue.push(entry)
         }).then(() => this.startReserved(work))
     }
 
@@ -144,10 +157,15 @@ export function parseStreamingUpload(event: H3Event): Promise<ParsedUpload> {
             return
         }
 
-        const cleanup = () => request.off("data", countRequestBytes)
+        const timeout = setTimeout(() => rejectEarly(uploadError(408, 'Upload request timed out')), MAX_UPLOAD_STREAM_DURATION_MS)
+        const cleanup = () => {
+            clearTimeout(timeout)
+            request.off("data", countRequestBytes)
+        }
         const rejectEarly = (error: ReturnType<typeof uploadError>) => {
             if (settled) return
             settled = true
+            fail(error)
             cleanup()
             request.unpipe(parser)
             request.resume()

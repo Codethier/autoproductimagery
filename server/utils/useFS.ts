@@ -1,538 +1,455 @@
-import { promises as fs, constants as fsConstants } from "node:fs"
-import type { Dirent } from "node:fs"
-import path from "node:path"
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { createError } from "h3"
-import sharp from "sharp"
+import {
+    DeleteObjectCommand, DeleteObjectsCommand, GetObjectCommand, HeadObjectCommand,
+    ListObjectsV2Command, PutObjectCommand, S3Client,
+    type GetObjectCommandOutput, type HeadObjectCommandOutput,
+    type ListObjectsV2CommandOutput, type DeleteObjectsCommandOutput,
+} from "@aws-sdk/client-s3"
 import type { SelectableFile } from "~~/schemas/main.dto"
 import type { BufferedUploadFile } from "./uploadPolicy"
+import { canonicalImageExtension, hasSupportedImageExtension, inspectDecodedImage, MAX_STORED_IMAGE_BYTES } from "./imageValidation"
+import { imagePathToUrl, normalizeImageStoragePrefix, parseImagePath, validateImagePathSegment } from "./imageStoragePaths"
 
-const BASE_DIR = path.resolve("./data/images")
-const BASE_PARENT = path.dirname(BASE_DIR)
-const INVALID_NAME_CHARS = /[\\/:*?"<>|\x00-\x1f]/
-const RESERVED_NAMES = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\..*)?$/i
-const DIAGNOSTIC_ENTRY_LIMIT = 25
-const DELETE_TREE_ENTRY_LIMIT = 10_000
-const MAX_IMAGE_PIXELS = 40_000_000
-const MAX_STORED_IMAGE_BYTES = 25 * 1024 * 1024
-const HEIC_BRANDS = new Set(["heic", "heix", "hevc", "hevx", "heim", "heis"])
+export const DELETE_TREE_ENTRY_LIMIT = 10_000
+export const S3_OPERATION_TIMEOUT_MS = 30_000
+const DEFAULT_DIRECTORY_PAGE_SIZE = 100
+const MAX_DIRECTORY_PAGE_SIZE = 500
+const MAX_FILENAME_ATTEMPTS = 32
+const MAX_DELETE_LIST_PAGES = 32
 
-const IMAGE_MIME_BY_EXTENSION: Record<string, string> = {
-    png: "image/png",
-    jpg: "image/jpeg",
-    gif: "image/gif",
-    webp: "image/webp",
-    bmp: "image/bmp",
-    tiff: "image/tiff",
-    heic: "image/heic",
+export type ImageStorageCommand = DeleteObjectCommand | DeleteObjectsCommand | GetObjectCommand
+    | HeadObjectCommand | ListObjectsV2Command | PutObjectCommand
+export type ImageStorageTransport = {
+    send(command: ImageStorageCommand, options: { abortSignal: AbortSignal }): Promise<unknown>
 }
-
-const SHARP_FORMAT_BY_EXTENSION: Record<string, string> = {
-    png: "png",
-    jpg: "jpeg",
-    gif: "gif",
-    webp: "webp",
-    bmp: "magick",
-    tiff: "tiff",
-    heic: "heif",
+export type ImageStorageEntry = { name: string }
+export type ImageDirectoryPage = {
+    files: ImageStorageEntry[]
+    dirs: ImageStorageEntry[]
+    nextCursor?: string
 }
+type DirectoryCursorEntry = { kind: "file" | "directory"; name: string }
+type DirectoryCursor = { token?: string; exhausted: boolean; pending: DirectoryCursorEntry[] }
 
-type ImageInspection = {
-    extension: string
-    mimeType: string
-    width: number
-    height: number
-    hasAlpha?: boolean
-}
-
-function sanitizeName(name: string): string {
-    const trimmed = name.trim()
-    if (!trimmed || trimmed === "." || trimmed === "..") {
-        throw createError({ statusCode: 400, statusMessage: "Invalid name" })
-    }
-    if (INVALID_NAME_CHARS.test(trimmed) || RESERVED_NAMES.test(trimmed)) {
-        throw createError({ statusCode: 400, statusMessage: "Invalid name" })
-    }
-    return trimmed
-}
-
-function normalizedForComparison(value: string) {
-    const normalized = path.resolve(value).replace(/[\\/]+$/, "")
-    return process.platform === "win32" ? normalized.toLocaleLowerCase("en-US") : normalized
-}
-
-function isWithin(base: string, target: string) {
-    const normalizedBase = normalizedForComparison(base)
-    const normalizedTarget = normalizedForComparison(target)
-    return normalizedTarget === normalizedBase || normalizedTarget.startsWith(normalizedBase + path.sep)
-}
-
-function normalizeRelativePath(relative: string): string {
-    const normalized = String(relative ?? "").replaceAll("\\", "/")
-    const segments = normalized.split("/").filter(Boolean)
-    for (const segment of segments) {
-        if (segment === "." || segment === ".." || INVALID_NAME_CHARS.test(segment)) {
-            throw createError({ statusCode: 400, statusMessage: "Invalid path" })
-        }
-    }
-    return segments.join(path.sep)
-}
-
-function resolveWithin(base: string, relative: string): string {
-    const resolved = path.resolve(base, normalizeRelativePath(relative))
-    if (!isWithin(base, resolved)) {
-        throw createError({ statusCode: 400, statusMessage: "Invalid path" })
-    }
-    return resolved
-}
-
-function decodeUrlPath(relative: string): string {
-    try {
-        return decodeURIComponent(relative)
-    } catch {
-        throw createError({ statusCode: 400, statusMessage: "Invalid path encoding" })
-    }
-}
-
-function toImageRelativePath(value: string): string {
-    const decoded = decodeUrlPath(String(value ?? ""))
-    const normalized = decoded.replaceAll("\\", "/")
-    if (normalized === "/images") return ""
-    if (!normalized.startsWith("/images/")) {
-        throw createError({ statusCode: 400, statusMessage: "Image path must be inside /images/" })
-    }
-    return normalized.slice("/images/".length)
-}
-
-function isHeicBmff(data: Buffer): boolean {
-    if (data.length < 16 || data.subarray(4, 8).toString("ascii") !== "ftyp") return false
-    const boxSize = data.readUInt32BE(0)
-    if (boxSize < 16 || boxSize > data.length) return false
-    if (HEIC_BRANDS.has(data.subarray(8, 12).toString("ascii"))) return true
-    for (let offset = 16; offset + 4 <= boxSize; offset += 4) {
-        if (HEIC_BRANDS.has(data.subarray(offset, offset + 4).toString("ascii"))) return true
-    }
-    return false
-}
-
-const IMAGE_MAGIC_SIGNATURES: Array<{ ext: string; check: (buffer: Buffer) => boolean }> = [
-    { ext: "png", check: buffer => buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) },
-    { ext: "jpg", check: buffer => buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff },
-    { ext: "gif", check: buffer => buffer.length >= 6 && /^GIF8[79]a$/.test(buffer.subarray(0, 6).toString("ascii")) },
-    { ext: "webp", check: buffer => buffer.length >= 12 && buffer.subarray(0, 4).toString("ascii") === "RIFF" && buffer.subarray(8, 12).toString("ascii") === "WEBP" },
-    { ext: "bmp", check: buffer => buffer.length >= 2 && buffer[0] === 0x42 && buffer[1] === 0x4d },
-    { ext: "tiff", check: buffer => buffer.length >= 4 && ((buffer[0] === 0x49 && buffer[1] === 0x49 && buffer[2] === 0x2a && buffer[3] === 0x00) || (buffer[0] === 0x4d && buffer[1] === 0x4d && buffer[2] === 0x00 && buffer[3] === 0x2a)) },
-    { ext: "heic", check: isHeicBmff },
-]
-
-export function detectImageType(data: Buffer): string | null {
-    for (const signature of IMAGE_MAGIC_SIGNATURES) {
-        if (signature.check(data)) return signature.ext
-    }
-    return null
-}
-
-async function inspectDecodedImage(data: Buffer, providerPayload = false): Promise<ImageInspection> {
-    const extension = detectImageType(data)
-    const badPayload = (message: string, statusCode = providerPayload ? 502 : 415): never => {
-        throw createError({ statusCode, statusMessage: message })
-    }
-    if (!extension) return badPayload(providerPayload
-        ? "Provider returned an unsupported image payload"
-        : "Unsupported file type — image required")
-
-    try {
-        const image = sharp(data, {
-            failOn: "error",
-            limitInputPixels: MAX_IMAGE_PIXELS,
-            sequentialRead: true,
-        })
-        const metadata = await image.metadata()
-        if (!metadata.width || !metadata.height || !metadata.format) {
-            return badPayload(providerPayload ? "Provider returned an invalid image" : "Invalid image")
-        }
-        if ((metadata.pages ?? 1) !== 1) {
-            return badPayload("Animated or multi-page images are not supported")
-        }
-        if (metadata.width * metadata.height > MAX_IMAGE_PIXELS) {
-            return badPayload("Image dimensions are too large", 413)
-        }
-        const expectedFormat = SHARP_FORMAT_BY_EXTENSION[extension]
-        if (expectedFormat && metadata.format !== expectedFormat) {
-            return badPayload(providerPayload ? "Provider returned an invalid image" : "Image content does not match its format")
-        }
-
-        // stats() walks every decoded pixel but returns only a tiny aggregate,
-        // unlike raw().toBuffer(), which would allocate width × height × channels.
-        const decodedStats = await image.clone().stats()
-        if (decodedStats.channels.length === 0) return badPayload(providerPayload ? "Provider returned an invalid image" : "Invalid image")
-        return {
-            extension,
-            mimeType: IMAGE_MIME_BY_EXTENSION[extension] ?? "application/octet-stream",
-            width: metadata.width,
-            height: metadata.height,
-            hasAlpha: metadata.hasAlpha,
-        }
-    } catch (error: any) {
-        if (typeof error?.statusCode === "number") throw error
-        const tooLarge = /pixel limit|too large|exceeds/i.test(String(error?.message || ""))
-        return badPayload(
-            tooLarge ? "Image dimensions are too large" : (providerPayload ? "Provider returned an invalid image" : "Invalid or corrupt image"),
-            tooLarge ? 413 : undefined,
-        )
-    }
-}
-
-async function initializeImageRoot() {
-    await fs.mkdir(BASE_PARENT, { recursive: true })
-    const parentReal = await fs.realpath(BASE_PARENT)
-    if (normalizedForComparison(parentReal) !== normalizedForComparison(BASE_PARENT)) {
-        throw createError({ statusCode: 500, statusMessage: "Image storage root is unsafe" })
-    }
-    await fs.mkdir(BASE_DIR, { recursive: false }).catch((error: NodeJS.ErrnoException) => {
-        if (error.code !== "EEXIST") throw error
+const safeStorageErrors = new WeakSet<object>()
+function storageError(statusCode: number, message: string, code: string, retryable = false) {
+    const error = createError({
+        statusCode, statusMessage: message,
+        data: { reason: message, code, retryable, diagnosticId: randomUUID() },
     })
-    const rootStat = await fs.lstat(BASE_DIR)
-    const rootReal = await fs.realpath(BASE_DIR)
-    if (!rootStat.isDirectory() || rootStat.isSymbolicLink()
-        || normalizedForComparison(rootReal) !== normalizedForComparison(BASE_DIR)) {
-        throw createError({ statusCode: 500, statusMessage: "Image storage root is unsafe" })
-    }
-    return rootReal
+    safeStorageErrors.add(error)
+    return error
 }
-
-async function assertSafeExistingPath(rootReal: string, target: string) {
-    if (!isWithin(BASE_DIR, target)) {
-        throw createError({ statusCode: 400, statusMessage: "Invalid path" })
+function normalizeStorageError(error: unknown) {
+    if (error && typeof error === "object" && safeStorageErrors.has(error)) return error
+    const failure = error && typeof error === "object" ? error as {
+        name?: unknown; $metadata?: { httpStatusCode?: unknown }
+    } : {}
+    const status = failure.$metadata?.httpStatusCode
+    if (status === 404 || failure.name === "NoSuchKey" || failure.name === "NotFound") {
+        return storageError(404, "File not found", "not_found")
     }
-    const relative = path.relative(BASE_DIR, target)
-    let current = BASE_DIR
-    for (const segment of relative.split(path.sep).filter(Boolean)) {
-        current = path.join(current, segment)
-        const stat = await fs.lstat(current)
-        if (stat.isSymbolicLink()) {
-            throw createError({ statusCode: 400, statusMessage: "Symbolic links are not allowed in image storage" })
-        }
-        const real = await fs.realpath(current)
-        if (!isWithin(rootReal, real)) {
-            throw createError({ statusCode: 400, statusMessage: "Image path escapes storage root" })
-        }
+    if (status === 412 || failure.name === "PreconditionFailed" || failure.name === "ConditionalRequestConflict") {
+        return storageError(409, "An image storage entry already exists", "already_exists", true)
     }
+    if (failure.name === "AbortError" || failure.name === "TimeoutError") {
+        return storageError(504, "Image storage request timed out", "storage_timeout", true)
+    }
+    return storageError(503, "Image storage is temporarily unavailable", "storage_unavailable", true)
 }
-
-async function ensureSafeDirectory(rootReal: string, target: string) {
-    await assertSafeExistingPath(rootReal, target)
-    const stat = await fs.lstat(target)
-    if (!stat.isDirectory() || stat.isSymbolicLink()) {
-        throw createError({ statusCode: 400, statusMessage: "Image directory is invalid" })
-    }
+function isStorageErrorCode(error: unknown, code: string): boolean {
+    return Boolean(error && typeof error === "object" && safeStorageErrors.has(error)
+        && "data" in error && (error.data as { code?: unknown })?.code === code)
 }
-
-async function ensureSafeChildDirectory(rootReal: string, target: string) {
-    const parent = path.dirname(target)
-    await ensureSafeDirectory(rootReal, parent)
+function destroyBody(body: unknown) {
+    if (body && typeof body === "object" && "destroy" in body && typeof body.destroy === "function") body.destroy()
+}
+async function readBoundedBody(body: unknown, signal: AbortSignal): Promise<Buffer> {
+    if (Buffer.isBuffer(body) || body instanceof Uint8Array) {
+        if (body.byteLength > MAX_STORED_IMAGE_BYTES) throw storageError(413, "Stored image is too large", "image_too_large")
+        return Buffer.from(body)
+    }
+    if (!body || typeof body !== "object" || !(Symbol.asyncIterator in body)) {
+        throw storageError(503, "Image storage returned an invalid response", "storage_unavailable", true)
+    }
+    const chunks: Buffer[] = []
+    let bytes = 0
+    const abort = () => destroyBody(body)
+    signal.addEventListener("abort", abort, { once: true })
     try {
-        await fs.mkdir(target)
-    } catch (error: any) {
-        if (error?.code !== "EEXIST") throw error
-    }
-    await ensureSafeDirectory(rootReal, target)
-}
-
-async function secureReadFile(rootReal: string, target: string) {
-    await assertSafeExistingPath(rootReal, target)
-    const noFollow = process.platform === "win32" ? 0 : (fsConstants.O_NOFOLLOW ?? 0)
-    const handle = await fs.open(target, fsConstants.O_RDONLY | noFollow)
-    try {
-        const stat = await handle.stat()
-        if (!stat.isFile()) throw createError({ statusCode: 404, statusMessage: "File not found" })
-        if (stat.size > MAX_STORED_IMAGE_BYTES) throw createError({ statusCode: 413, statusMessage: "Stored image is too large" })
-        const afterOpenReal = await fs.realpath(target)
-        if (!isWithin(rootReal, afterOpenReal)) {
-            throw createError({ statusCode: 400, statusMessage: "Image path escapes storage root" })
+        for await (const chunk of body as AsyncIterable<unknown>) {
+            if (signal.aborted) throw storageError(504, "Image storage request timed out", "storage_timeout", true)
+            if (!(chunk instanceof Uint8Array)) throw storageError(503, "Image storage returned an invalid response", "storage_unavailable", true)
+            bytes += chunk.byteLength
+            if (bytes > MAX_STORED_IMAGE_BYTES) throw storageError(413, "Stored image is too large", "image_too_large")
+            chunks.push(Buffer.from(chunk))
         }
-        return await handle.readFile()
+        return Buffer.concat(chunks, bytes)
     } finally {
-        await handle.close()
+        signal.removeEventListener("abort", abort)
+        destroyBody(body)
+        chunks.length = 0
     }
 }
 
-async function openExclusive(dir: string, filename: string, data: Buffer): Promise<string> {
-    const extension = path.extname(filename)
-    const stem = path.basename(filename, extension)
-    for (let counter = 0; counter <= 10_000; counter += 1) {
-        const candidate = counter === 0 ? path.join(dir, filename) : path.join(dir, `${stem} (${counter})${extension}`)
+export function createS3ImageStorage(options: {
+    client: ImageStorageTransport; bucket: string; prefix?: string; timeoutMs?: number
+}) {
+    const { client, bucket } = options
+    if (!bucket || bucket.length > 255 || /[\s/\\\x00-\x1f]/.test(bucket)) {
+        throw storageError(500, "Image storage configuration is invalid", "storage_configuration")
+    }
+    const prefix = normalizeImageStoragePrefix(options.prefix ?? "images")
+    const timeoutMs = options.timeoutMs ?? S3_OPERATION_TIMEOUT_MS
+    if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 120_000) {
+        throw storageError(500, "Image storage configuration is invalid", "storage_configuration")
+    }
+
+    // Include response-body consumption in the same deadline as the S3 request.
+    async function execute<T, R = T>(command: ImageStorageCommand, consume?: (result: T, signal: AbortSignal) => Promise<R>): Promise<R> {
+        const controller = new AbortController()
+        let timer: ReturnType<typeof setTimeout> | undefined
+        const timeout = new Promise<never>((_, reject) => {
+            timer = setTimeout(() => {
+                controller.abort()
+                reject(storageError(504, "Image storage request timed out", "storage_timeout", true))
+            }, timeoutMs)
+        })
         try {
-            const handle = await fs.open(candidate, "wx")
-            try {
-                await handle.writeFile(data)
-                await handle.sync()
-            } finally {
-                await handle.close()
-            }
-            return candidate
-        } catch (error: any) {
-            if (error?.code !== "EEXIST") throw error
-        }
-    }
-    throw createError({ statusCode: 500, statusMessage: "Could not allocate unique filename" })
-}
-
-async function assertTreeHasNoLinks(target: string) {
-    const pending = [target]
-    let visited = 0
-    while (pending.length > 0) {
-        const current = pending.pop()!
-        const stat = await fs.lstat(current)
-        if (stat.isSymbolicLink()) {
-            throw createError({ statusCode: 400, statusMessage: "Symbolic links are not allowed in image storage" })
-        }
-        visited += 1
-        if (visited > DELETE_TREE_ENTRY_LIMIT) {
-            throw createError({ statusCode: 413, statusMessage: "Folder is too large to delete safely" })
-        }
-        if (!stat.isDirectory()) continue
-        for (const entry of await fs.readdir(current)) pending.push(path.join(current, entry))
-    }
-}
-
-function errorInfo(error: any) {
-    if (!error) return undefined
-    return {
-        code: typeof error?.code === "string" ? error.code : undefined,
-        message: String(error?.statusMessage || error?.message || error),
-        statusCode: typeof error?.statusCode === "number" ? error.statusCode : undefined,
-    }
-}
-
-export async function useFS() {
-    const rootReal = await initializeImageRoot()
-
-    function resolvePath(relative: string) {
-        return resolveWithin(BASE_DIR, relative ?? "/")
+            const request = client.send(command, { abortSignal: controller.signal }).then(async response => {
+                if (controller.signal.aborted) {
+                    if (response && typeof response === "object" && "Body" in response) destroyBody(response.Body)
+                    throw storageError(504, "Image storage request timed out", "storage_timeout", true)
+                }
+                return consume ? consume(response as T, controller.signal) : response as R
+            })
+            return await Promise.race([request, timeout])
+        } catch (error) { throw normalizeStorageError(error) }
+        finally { clearTimeout(timer) }
     }
 
-    async function listDirs(relative: string): Promise<Dirent[]> {
-        const target = resolvePath(relative)
-        await ensureSafeDirectory(rootReal, target)
-        return (await fs.readdir(target, { withFileTypes: true })).filter(entry => entry.isDirectory() && !entry.isSymbolicLink())
+    function boundedKey(key: string) {
+        if (Buffer.byteLength(key, "utf8") > 1024) throw createError({ statusCode: 400, statusMessage: "Image path is too long" })
+        return key
     }
-
-    async function listFiles(relative: string): Promise<Dirent[]> {
-        const target = resolvePath(relative)
-        await ensureSafeDirectory(rootReal, target)
-        return (await fs.readdir(target, { withFileTypes: true })).filter(entry => entry.isFile() && !entry.isSymbolicLink())
-    }
-
-    async function readDir(relative: string) {
-        const target = resolvePath(relative)
-        await ensureSafeDirectory(rootReal, target)
-        const entries = await fs.readdir(target, { withFileTypes: true })
-        const files = entries.filter(entry => entry.isFile() && !entry.isSymbolicLink())
-        const dirs = entries.filter(entry => entry.isDirectory() && !entry.isSymbolicLink())
-        files.sort((left, right) => left.name.localeCompare(right.name))
-        dirs.sort((left, right) => left.name.localeCompare(right.name))
-        return { files, dirs }
-    }
-
-    function relativePathToUrl(relative: string, name: string) {
-        const joined = normalizeRelativePath(path.join(relative || "", name))
-        const encoded = joined.split(path.sep).filter(Boolean).map(encodeURIComponent).join("/")
-        return `/images/${encoded}`
-    }
-
-    function parseFileDirEntToSelectableFile(dirents: Dirent[], relative: string): SelectableFile[] {
-        return dirents.map(entry => ({
-            name: entry.name,
-            selectedModel: false,
-            selectedImage: false,
-            selectedMask: false,
-            url: relativePathToUrl(relative, entry.name),
-        }))
-    }
-
-    async function createFolder(relative: string, folderName: string) {
-        const safeName = sanitizeName(folderName)
-        const parent = resolvePath(relative)
-        await ensureSafeDirectory(rootReal, parent)
-        const target = resolveWithin(BASE_DIR, path.join(normalizeRelativePath(relative), safeName))
-        try {
-            await fs.mkdir(target)
-        } catch (error: any) {
-            if (error?.code === "EEXIST") throw createError({ statusCode: 409, statusMessage: "Folder already exists" })
+    function objectKey(parts: readonly string[]) { return boundedKey(prefix + parts.map(validateImagePathSegment).join("/")) }
+    function folderKey(parts: readonly string[]) { return boundedKey(parts.length ? objectKey(parts) + "/" : prefix) }
+    async function head(key: string): Promise<HeadObjectCommandOutput | undefined> {
+        try { return await execute<HeadObjectCommandOutput>(new HeadObjectCommand({ Bucket: bucket, Key: key })) }
+        catch (error) {
+            if (isStorageErrorCode(error, "not_found")) return undefined
             throw error
         }
-        await ensureSafeDirectory(rootReal, target)
     }
-
+    async function directoryExists(parts: readonly string[]): Promise<boolean> {
+        if (!parts.length) return true
+        if (await head(folderKey(parts))) return true
+        // Imported objects can have parents without explicit markers.
+        const result = await execute<ListObjectsV2CommandOutput>(new ListObjectsV2Command({
+            Bucket: bucket, Prefix: folderKey(parts), MaxKeys: 1,
+        }))
+        return Boolean(result.Contents?.length)
+    }
+    async function assertDirectory(parts: readonly string[]) {
+        if (!await directoryExists(parts)) throw storageError(404, "Image folder not found", "not_found")
+    }
+    function cursorScope(parts: readonly string[]) {
+        return createHash("sha256").update(bucket + "/" + folderKey(parts)).digest("base64url")
+    }
+    function decodeCursor(cursor: string | undefined, parts: readonly string[]): DirectoryCursor {
+        if (!cursor) return { exhausted: false, pending: [] }
+        try {
+            if (cursor.length > 8192 || !/^[a-zA-Z\d_-]+$/.test(cursor)) throw new Error("invalid")
+            const value: unknown = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"))
+            if (!value || typeof value !== "object" || Object.keys(value).some(key => !["scope", "token", "exhausted", "pending"].includes(key))) throw new Error("invalid")
+            const record = value as { scope?: unknown; token?: unknown; exhausted?: unknown; pending?: unknown }
+            if (record.scope !== cursorScope(parts) || typeof record.exhausted !== "boolean" || !Array.isArray(record.pending)
+                || record.pending.length > 1) throw new Error("invalid")
+            if (record.exhausted ? record.token !== undefined
+                : typeof record.token !== "string" || !record.token || Buffer.byteLength(record.token) > 4096) throw new Error("invalid")
+            const pending = record.pending.map((entry: unknown): DirectoryCursorEntry => {
+                if (!entry || typeof entry !== "object" || Object.keys(entry).some(key => !["kind", "name"].includes(key))) throw new Error("invalid")
+                const item = entry as { kind?: unknown; name?: unknown }
+                if ((item.kind !== "file" && item.kind !== "directory") || typeof item.name !== "string") throw new Error("invalid")
+                validateImagePathSegment(item.name)
+                if (item.kind === "file" && !hasSupportedImageExtension(item.name)) throw new Error("invalid")
+                if (item.kind === "file") objectKey([...parts, item.name])
+                else folderKey([...parts, item.name])
+                return { kind: item.kind, name: item.name }
+            })
+            return { token: record.token as string | undefined, exhausted: record.exhausted, pending }
+        } catch { throw createError({ statusCode: 400, statusMessage: "Invalid image directory cursor" }) }
+    }
+    function encodeCursor(state: DirectoryCursor, parts: readonly string[]) {
+        const cursor = Buffer.from(JSON.stringify({ scope: cursorScope(parts), ...state })).toString("base64url")
+        if (cursor.length > 8192) throw storageError(503, "Image storage returned an invalid response", "storage_unavailable", true)
+        return cursor
+    }
+    function safeListedName(key: string, directoryPrefix: string, folder = false): string | undefined {
+        if (!key.startsWith(directoryPrefix)) return undefined
+        const raw = key.slice(directoryPrefix.length)
+        const name = folder && raw.endsWith("/") ? raw.slice(0, -1) : raw
+        try { return validateImagePathSegment(name) }
+        catch { return undefined }
+    }
+    async function readDir(relative: string, pagination: { cursor?: string; limit?: number } = {}): Promise<ImageDirectoryPage> {
+        const parts = parseImagePath(relative, true)
+        const limit = pagination.limit ?? DEFAULT_DIRECTORY_PAGE_SIZE
+        if (!Number.isInteger(limit) || limit < 1 || limit > MAX_DIRECTORY_PAGE_SIZE) {
+            throw createError({ statusCode: 400, statusMessage: "Invalid image directory page size" })
+        }
+        const state = decodeCursor(pagination.cursor, parts)
+        await assertDirectory(parts)
+        const directoryPrefix = folderKey(parts)
+        const returned = state.pending.splice(0, limit)
+        const remaining = limit - returned.length
+        if (remaining > 0 && !state.exhausted) {
+            // Some compatible backends terminate marker-only MaxKeys=1 pages
+            // incorrectly and do not support StartAfter. Fetch at least two
+            // entries and carry the single possible overflow in our cursor.
+            const requestedKeys = Math.max(2, remaining)
+            const result = await execute<ListObjectsV2CommandOutput>(new ListObjectsV2Command({
+                Bucket: bucket, Prefix: directoryPrefix, Delimiter: "/", MaxKeys: requestedKeys,
+                ContinuationToken: state.token,
+            }))
+            if ((result.Contents?.length ?? 0) + (result.CommonPrefixes?.length ?? 0) > requestedKeys) {
+                throw storageError(503, "Image storage returned an invalid response", "storage_unavailable", true)
+            }
+            for (const entry of result.Contents ?? []) {
+                if (!entry.Key) continue
+                const name = safeListedName(entry.Key, directoryPrefix)
+                if (name && hasSupportedImageExtension(name)) state.pending.push({ kind: "file", name })
+            }
+            for (const entry of result.CommonPrefixes ?? []) {
+                if (!entry.Prefix) continue
+                const name = safeListedName(entry.Prefix, directoryPrefix, true)
+                if (name) state.pending.push({ kind: "directory", name })
+            }
+            const nextToken = result.IsTruncated ? result.NextContinuationToken : undefined
+            if (result.IsTruncated && (!nextToken || nextToken === state.token || Buffer.byteLength(nextToken) > 4096)) {
+                throw storageError(503, "Image storage returned an invalid response", "storage_unavailable", true)
+            }
+            state.token = nextToken
+            state.exhausted = !result.IsTruncated
+            returned.push(...state.pending.splice(0, remaining))
+        }
+        const files = returned.filter(entry => entry.kind === "file").map(({ name }) => ({ name }))
+        const dirs = returned.filter(entry => entry.kind === "directory").map(({ name }) => ({ name }))
+        files.sort((left, right) => left.name.localeCompare(right.name))
+        dirs.sort((left, right) => left.name.localeCompare(right.name))
+        return {
+            files, dirs,
+            nextCursor: state.pending.length || !state.exhausted ? encodeCursor(state, parts) : undefined,
+        }
+    }
+    function parseFileDirEntToSelectableFile(entries: ImageStorageEntry[], relative: string): SelectableFile[] {
+        const parts = parseImagePath(relative, true)
+        return entries.map(entry => ({
+            name: validateImagePathSegment(entry.name),
+            selectedModel: false, selectedImage: false, selectedMask: false,
+            url: imagePathToUrl([...parts, entry.name]),
+        }))
+    }
+    async function createFolder(relative: string, folderName: string) {
+        const parts = parseImagePath(relative, true)
+        const name = validateImagePathSegment(folderName)
+        await assertDirectory(parts)
+        const child = [...parts, name]
+        if (await head(objectKey(child)) || await directoryExists(child)) {
+            throw storageError(409, "Folder already exists", "already_exists")
+        }
+        await execute(new PutObjectCommand({
+            Bucket: bucket, Key: folderKey(child), Body: Buffer.alloc(0), ContentLength: 0,
+            ContentType: "application/x-directory", IfNoneMatch: "*",
+        }))
+    }
     async function saveFile(relative: string, file: BufferedUploadFile) {
+        const parts = parseImagePath(relative, true)
         if (!file.filename) throw createError({ statusCode: 400, statusMessage: "Missing filename" })
-        if (file.data.byteLength > MAX_STORED_IMAGE_BYTES) throw createError({ statusCode: 413, statusMessage: "Image is too large" })
+        const originalName = validateImagePathSegment(file.filename)
         if (file.type && !file.type.toLowerCase().startsWith("image/")) {
             throw createError({ statusCode: 415, statusMessage: "Declared content-type is not an image" })
         }
         const inspection = await inspectDecodedImage(file.data)
-        const originalName = sanitizeName(path.basename(file.filename))
-        const stem = path.basename(originalName, path.extname(originalName))
-        const safeName = `${stem}.${inspection.extension}`
-        const directory = resolvePath(relative)
-        await ensureSafeDirectory(rootReal, directory)
-        return path.basename(await openExclusive(directory, safeName, file.data))
+        const extensionIndex = originalName.lastIndexOf(".")
+        const stem = extensionIndex > 0 ? originalName.slice(0, extensionIndex) : originalName
+        await assertDirectory(parts)
+        for (let counter = 0; counter < MAX_FILENAME_ATTEMPTS; counter += 1) {
+            const name = `${stem}${counter ? ` (${counter})` : ""}.${inspection.extension}`
+            validateImagePathSegment(name)
+            if (await directoryExists([...parts, name])) continue
+            try {
+                await execute(new PutObjectCommand({
+                    Bucket: bucket, Key: objectKey([...parts, name]), Body: file.data,
+                    ContentLength: file.data.byteLength, ContentType: inspection.mimeType, IfNoneMatch: "*",
+                }))
+                return name
+            } catch (error) {
+                if (!isStorageErrorCode(error, "already_exists")) throw error
+            }
+        }
+        throw storageError(409, "Could not allocate a unique image filename", "already_exists", true)
     }
-
-    async function deleteFileOrFolder(relative: string) {
-        const target = resolvePath(relative)
-        if (target === BASE_DIR) throw createError({ statusCode: 400, statusMessage: "Cannot delete root" })
-        try {
-            await assertSafeExistingPath(rootReal, target)
-            await assertTreeHasNoLinks(target)
-            await fs.rm(target, { recursive: true, force: false })
-        } catch (error: any) {
-            if (error?.code === "ENOENT") throw createError({ statusCode: 404, statusMessage: "Not found" })
-            throw error
-        }
-    }
-
-    async function getFileDiagnostics(relative: string, error?: any) {
-        let decodedPath: string | undefined
-        let decodeError: string | undefined
-        let resolvedPath: string | undefined
-        let parentPath: string | undefined
-        let parentEntriesSample: string[] = []
-        let statError: ReturnType<typeof errorInfo> | undefined
-        try {
-            decodedPath = decodeURIComponent(String(relative ?? ""))
-        } catch (decodeFailure: any) {
-            decodeError = String(decodeFailure?.message || decodeFailure)
-        }
-        try {
-            resolvedPath = resolveWithin(BASE_DIR, toImageRelativePath(decodedPath ?? String(relative ?? "")))
-            parentPath = path.dirname(resolvedPath)
-            await fs.lstat(resolvedPath).catch((failure: any) => { statError = errorInfo(failure) })
-            await ensureSafeDirectory(rootReal, parentPath)
-            parentEntriesSample = (await fs.readdir(parentPath)).slice(0, DIAGNOSTIC_ENTRY_LIMIT)
-        } catch (failure: any) {
-            statError = errorInfo(failure)
-        }
-        return {
-            originalPath: String(relative ?? ""),
-            decodedPath,
-            decodeError,
-            cwd: path.resolve("."),
-            baseDir: BASE_DIR,
-            rootReal,
-            resolvedPath,
-            parentPath,
-            parentEntriesSample,
-            statError,
-            thrownError: errorInfo(error),
-        }
-    }
-
     async function getFile(relative: string): Promise<Buffer> {
-        let target: string
-        try {
-            target = resolveWithin(BASE_DIR, toImageRelativePath(relative))
-            return await secureReadFile(rootReal, target)
-        } catch (error: any) {
-            const diagnosticId = randomUUID()
-            console.warn("[image-file-load] Could not read image file", {
-                diagnosticId,
-                ...await getFileDiagnostics(relative, error),
-            })
-            const statusCode = error?.code === "ENOENT" ? 404
-                : (Number(error?.statusCode) >= 400 && Number(error?.statusCode) < 500 ? Number(error.statusCode) : 500)
-            const statusMessage = statusCode === 404 ? "File not found"
-                : (statusCode < 500 ? String(error?.statusMessage || "Invalid image path") : "Could not read image file")
-            throw createError({
-                statusCode,
-                statusMessage,
-                data: { reason: statusMessage, diagnosticId },
-            })
-        }
+        const parts = parseImagePath(relative)
+        if (!parts.length) throw createError({ statusCode: 400, statusMessage: "An image filename is required" })
+        return execute<GetObjectCommandOutput, Buffer>(new GetObjectCommand({
+            Bucket: bucket, Key: objectKey(parts),
+        }), async (result, signal) => {
+            if (typeof result.ContentLength === "number" && result.ContentLength > MAX_STORED_IMAGE_BYTES) {
+                destroyBody(result.Body)
+                throw storageError(413, "Stored image is too large", "image_too_large")
+            }
+            return readBoundedBody(result.Body, signal)
+        })
     }
-
-    async function fileExists(relative: string) {
-        const target = resolveWithin(BASE_DIR, toImageRelativePath(relative))
-        try {
-            await assertSafeExistingPath(rootReal, target)
-            const stat = await fs.lstat(target)
-            return stat.isFile() && !stat.isSymbolicLink()
-        } catch (error: any) {
-            if (error?.code === "ENOENT") return false
-            throw error
-        }
-    }
-
     async function getImageFile(relative: string) {
         const buffer = await getFile(relative)
         return { buffer, ...await inspectDecodedImage(buffer) }
     }
-
-    async function saveGeneratedImage(data: Buffer, _declaredMimeType?: string) {
-        if (data.byteLength > MAX_STORED_IMAGE_BYTES) {
-            throw createError({ statusCode: 502, statusMessage: "Provider returned an image that is too large" })
+    async function fileExists(relative: string) {
+        const parts = parseImagePath(relative)
+        return parts.length > 0 && Boolean(await head(objectKey(parts)))
+    }
+    // Maintenance import preserves historical URLs. Unlike uploads it must never
+    // rename a collision; an existing object must contain exactly the same bytes.
+    async function importImage(relative: string, data: Buffer): Promise<"imported" | "already_present"> {
+        const parts = parseImagePath(relative)
+        const filename = parts.at(-1)
+        if (!filename) throw createError({ statusCode: 400, statusMessage: "An image filename is required" })
+        const inspection = await inspectDecodedImage(data)
+        const extension = canonicalImageExtension(filename)
+        if (extension !== inspection.extension) {
+            throw createError({ statusCode: 415, statusMessage: "Imported image extension must match decoded content" })
         }
-        const inspection = await inspectDecodedImage(data, true)
-        const outputDirectory = resolveWithin(BASE_DIR, "output")
-        await ensureSafeChildDirectory(rootReal, outputDirectory)
-        const id = randomUUID()
-        const filename = `img-${Date.now()}-${id}.${inspection.extension}`
-        const destination = resolveWithin(outputDirectory, filename)
-        const temporary = resolveWithin(outputDirectory, `.tmp-${id}.${inspection.extension}`)
+        await assertDirectory(parts.slice(0, -1))
         try {
-            const handle = await fs.open(temporary, "wx")
-            try {
-                await handle.writeFile(data)
-                await handle.sync()
-            } finally {
-                await handle.close()
-            }
-            await fs.rename(temporary, destination)
-            await assertSafeExistingPath(rootReal, destination)
+            await execute(new PutObjectCommand({
+                Bucket: bucket, Key: objectKey(parts), Body: data,
+                ContentLength: data.byteLength, ContentType: inspection.mimeType, IfNoneMatch: "*",
+            }))
+            return "imported"
         } catch (error) {
-            await fs.rm(temporary, { force: true }).catch(() => undefined)
-            throw error
-        }
-        return {
-            url: `/images/output/${filename}`,
-            mimeType: inspection.mimeType,
-            bytes: data.length,
-            width: inspection.width,
-            height: inspection.height,
+            if (!isStorageErrorCode(error, "already_exists")) throw error
+            if ((await getFile(relative)).equals(data)) return "already_present"
+            throw storageError(409, "Imported image conflicts with existing content", "import_conflict")
         }
     }
-
+    let outputFolderReady: Promise<void> | undefined
+    async function ensureOutputFolder() {
+        outputFolderReady ??= execute(new PutObjectCommand({
+            Bucket: bucket, Key: folderKey(["output"]), Body: Buffer.alloc(0), ContentLength: 0,
+            ContentType: "application/x-directory", IfNoneMatch: "*",
+        })).then(() => undefined).catch(error => {
+            if (isStorageErrorCode(error, "already_exists")) return
+            outputFolderReady = undefined
+            throw error
+        })
+        await outputFolderReady
+    }
+    async function saveGeneratedImage(data: Buffer, _declaredMimeType?: string) {
+        const inspection = await inspectDecodedImage(data, true)
+        await ensureOutputFolder()
+        const filename = `img-${Date.now()}-${randomUUID()}.${inspection.extension}`
+        await execute(new PutObjectCommand({
+            Bucket: bucket, Key: objectKey(["output", filename]), Body: data,
+            ContentLength: data.byteLength, ContentType: inspection.mimeType, IfNoneMatch: "*",
+        }))
+        return {
+            url: imagePathToUrl(["output", filename]), mimeType: inspection.mimeType,
+            bytes: data.byteLength, width: inspection.width, height: inspection.height,
+        }
+    }
     async function removeGeneratedImage(url: string) {
-        const target = resolveWithin(BASE_DIR, toImageRelativePath(url))
-        const outputDirectory = resolveWithin(BASE_DIR, "output")
-        if (target === outputDirectory || !isWithin(outputDirectory, target)) {
+        const parts = parseImagePath(url)
+        if (parts.length !== 2 || parts[0] !== "output" || !/^img-\d+-[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}\.(png|jpg|gif|webp|bmp|tiff|heic)$/.test(parts[1]!)) {
             throw createError({ statusCode: 400, statusMessage: "Only generated output files can be removed here" })
         }
-        try {
-            await assertSafeExistingPath(rootReal, target)
-            const stat = await fs.lstat(target)
-            if (!stat.isFile() || stat.isSymbolicLink()) {
-                throw createError({ statusCode: 400, statusMessage: "Generated output path is invalid" })
-            }
-            await fs.rm(target, { force: true })
-        } catch (error: any) {
-            if (error?.code !== "ENOENT") throw error
+        await execute(new DeleteObjectCommand({ Bucket: bucket, Key: objectKey(parts) }))
+    }
+    async function deleteFileOrFolder(relative: string, entryType?: "file" | "directory") {
+        const parts = parseImagePath(relative, true)
+        if (!parts.length) throw createError({ statusCode: 400, statusMessage: "Cannot delete root" })
+        if (entryType !== undefined && entryType !== "file" && entryType !== "directory") {
+            throw createError({ statusCode: 400, statusMessage: "Invalid image entry type" })
         }
+        const fileKey = objectKey(parts)
+        const file = entryType === "directory" ? undefined : await head(fileKey)
+        if (entryType === "file" && !file) throw storageError(404, "File not found", "not_found")
+        if (file) {
+            if (entryType === undefined && await directoryExists(parts)) {
+                throw storageError(409, "Choose whether to delete the image or folder", "ambiguous_entry")
+            }
+            await execute(new DeleteObjectCommand({ Bucket: bucket, Key: fileKey }))
+            return
+        }
+        const directoryPrefix = folderKey(parts)
+        const keys: string[] = []
+        let token: string | undefined
+        let pages = 0
+        do {
+            pages += 1
+            const result = await execute<ListObjectsV2CommandOutput>(new ListObjectsV2Command({
+                Bucket: bucket, Prefix: directoryPrefix, MaxKeys: 1000, ContinuationToken: token,
+            }))
+            for (const entry of result.Contents ?? []) {
+                if (!entry.Key || !entry.Key.startsWith(directoryPrefix)) {
+                    throw storageError(503, "Image storage returned an invalid response", "storage_unavailable", true)
+                }
+                keys.push(entry.Key)
+                if (keys.length > DELETE_TREE_ENTRY_LIMIT) {
+                    throw createError({ statusCode: 413, statusMessage: "Folder is too large to delete safely" })
+                }
+            }
+            const previousToken = token
+            token = result.IsTruncated ? result.NextContinuationToken : undefined
+            if (result.IsTruncated && (!token || token === previousToken || pages >= MAX_DELETE_LIST_PAGES)) {
+                throw storageError(503, "Image storage returned an invalid response", "storage_unavailable", true)
+            }
+        } while (token)
+        if (!keys.length) throw storageError(404, "Image folder not found", "not_found")
+        // Bound the complete deletion set before the first destructive call.
+        // Keep the folder marker until all children have been deleted.
+        const children = keys.filter(key => key !== directoryPrefix)
+        for (let offset = 0; offset < children.length; offset += 1000) {
+            const result = await execute<DeleteObjectsCommandOutput>(new DeleteObjectsCommand({
+                Bucket: bucket, Delete: { Objects: children.slice(offset, offset + 1000).map(Key => ({ Key })), Quiet: true },
+            }))
+            if (result.Errors?.length) {
+                throw storageError(503, "Some images could not be deleted; retry the folder deletion", "partial_delete", true)
+            }
+        }
+        if (keys.includes(directoryPrefix)) await execute(new DeleteObjectCommand({ Bucket: bucket, Key: directoryPrefix }))
+        if (parts.length === 1 && parts[0] === "output") outputFolderReady = undefined
     }
-
     return {
-        listDirs,
-        listFiles,
         readDir,
-        parseFileDirEntToSelectableFile,
-        createFolder,
-        saveFile,
-        deleteFileOrFolder,
-        getFile,
-        getImageFile,
-        saveGeneratedImage,
-        removeGeneratedImage,
-        fileExists,
+        listDirs: async (relative: string) => (await readDir(relative)).dirs,
+        listFiles: async (relative: string) => (await readDir(relative)).files,
+        parseFileDirEntToSelectableFile, createFolder, saveFile, deleteFileOrFolder,
+        getFile, getImageFile, saveGeneratedImage, removeGeneratedImage, fileExists, importImage,
     }
+}
+
+let cachedStorage: ReturnType<typeof createS3ImageStorage> | undefined
+export async function useFS() {
+    if (cachedStorage) return cachedStorage
+    const { S3_ENDPOINT, S3_REGION, S3_BUCKET, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, S3_PREFIX, S3_FORCE_PATH_STYLE } = process.env
+    if (!S3_ENDPOINT || !S3_REGION || !S3_BUCKET || !S3_ACCESS_KEY_ID || !S3_SECRET_ACCESS_KEY) {
+        throw storageError(500, "Image storage is not configured", "storage_configuration")
+    }
+    try {
+        const endpoint = new URL(S3_ENDPOINT)
+        if (endpoint.protocol !== "https:" || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) throw new Error("invalid")
+        if (S3_FORCE_PATH_STYLE && S3_FORCE_PATH_STYLE !== "true" && S3_FORCE_PATH_STYLE !== "false") throw new Error("invalid")
+    } catch { throw storageError(500, "Image storage configuration is invalid", "storage_configuration") }
+    const client = new S3Client({
+        endpoint: S3_ENDPOINT, region: S3_REGION,
+        credentials: { accessKeyId: S3_ACCESS_KEY_ID, secretAccessKey: S3_SECRET_ACCESS_KEY },
+        forcePathStyle: S3_FORCE_PATH_STYLE !== "false", maxAttempts: 2,
+        requestChecksumCalculation: "WHEN_REQUIRED", responseChecksumValidation: "WHEN_REQUIRED",
+    })
+    cachedStorage = createS3ImageStorage({ client, bucket: S3_BUCKET, prefix: S3_PREFIX })
+    return cachedStorage
 }

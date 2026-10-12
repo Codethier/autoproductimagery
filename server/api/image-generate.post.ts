@@ -18,8 +18,9 @@ import { useDB, type GenerationBilling } from '~~/server/utils/useDB'
 import { useGateway } from '~~/server/utils/useGateway'
 import {
     GenerationQueueFullError,
-    getGenerationLimiter,
+    getGenerationRequestTimeoutMs,
     getGenerationRuntimeSettings,
+    reserveGenerationBatch,
     unresolvedGenerationIndexes,
 } from '~~/server/utils/generationLimiter'
 import {installBoundedRawBody} from '~~/server/utils/boundedRequestBody'
@@ -176,10 +177,6 @@ export default defineEventHandler(async (event) => {
     const generationRuntime = getGenerationRuntimeSettings(
         runtimeConfig as unknown as Record<string, unknown>,
     )
-    const limiter = getGenerationLimiter(
-        generationRuntime.concurrency,
-        generationRuntime.maxQueue,
-    )
     const database = await useDB()
     try {
         await database.reconcileStalePendingGenerations(generationRuntime.staleTtlMs)
@@ -220,8 +217,9 @@ export default defineEventHandler(async (event) => {
         return database.createPendingGeneration(pendingRowData(inputImage))
     }
 
-    async function preflightMaskSources() {
+    async function preflightMaskSources(abortSignal: AbortSignal) {
         if (!request.maskImage) return
+        abortSignal.throwIfAborted()
         const mask = await imageFs.getImageFile(request.maskImage)
         const maskDescriptor = {
             mimeType: mask.mimeType,
@@ -231,8 +229,10 @@ export default defineEventHandler(async (event) => {
             hasAlpha: mask.hasAlpha,
         }
         for (const inputImage of sourceImages) {
+            abortSignal.throwIfAborted()
             const firstSource = inputImage ?? request.modelImages[0]
             const source = firstSource ? await imageFs.getImageFile(firstSource) : undefined
+            abortSignal.throwIfAborted()
             const validateMask = getImageModelProfile(request.model)?.maskMode === 'luminance'
                 ? validateBflFillMaskPair : validateGptImageMaskPair
             const validationError = validateMask(maskDescriptor, source ? {
@@ -248,316 +248,321 @@ export default defineEventHandler(async (event) => {
         }
     }
 
-    // Validate the mask against every per-job source before creating any
-    // pending rows. One bad later source rejects the request atomically.
-    await preflightMaskSources()
-    const gateway = await useGateway()
-
-    const jobs: Array<{
-        inputImage: string | null
-        rows: Array<NonNullable<Awaited<ReturnType<typeof database.createPendingGeneration>>>>
-    }> = []
-    let initialRows: Awaited<ReturnType<typeof database.createPendingGenerations>>
+    let reservation: Awaited<ReturnType<typeof reserveGenerationBatch>>
     try {
-        initialRows = await database.createPendingGenerations(sourceImages.flatMap(inputImage =>
-            Array.from({length: expectedOutputs}, () => pendingRowData(inputImage)),
-        ))
+        reservation = await reserveGenerationBatch(
+            batchId,
+            sourceImages.length,
+            generationRuntime,
+            getGenerationRequestTimeoutMs(runtimeConfig as unknown as Record<string, unknown>),
+        )
     } catch (error) {
-        throw persistenceDiagnostic(error, `Could not create pending rows for batch ${batchId}`)
-    }
-    let initialRowIndex = 0
-    for (const inputImage of sourceImages) {
-        const rows = initialRows.slice(initialRowIndex, initialRowIndex + expectedOutputs)
-        initialRowIndex += expectedOutputs
-        jobs.push({inputImage, rows})
+        if (error instanceof GenerationQueueFullError) {
+            throw createError({
+                statusCode: 429,
+                statusMessage: error.statusMessage,
+                data: {code: error.code, retryable: true},
+            })
+        }
+        throw persistenceDiagnostic(error, 'Could not reserve generation capacity')
     }
 
-    function baseLog(job: typeof jobs[number], startedAt: number) {
-        return {
-            batchId,
-            attemptNumber: 1,
-            model: request.model,
-            prompt: request.prompt,
-            inputImages: job.inputImage ? [job.inputImage] : [],
-            modelImages: request.modelImages,
-            requestJson: {
+    try {
+        // The shared process memory gate covers preflight as well as running
+        // jobs, so queued batches cannot decode sources concurrently without a
+        // slot. Validate every mask pair before pending rows or paid work.
+        await reservation.withMemorySlot(abortSignal => preflightMaskSources(abortSignal))
+        reservation.signal.throwIfAborted()
+        const gateway = await useGateway()
+        const jobs: Array<{
+            inputImage: string | null
+            rows: Array<NonNullable<Awaited<ReturnType<typeof database.createPendingGeneration>>>>
+        }> = []
+        let initialRows: Awaited<ReturnType<typeof database.createPendingGenerations>>
+        try {
+            initialRows = await database.createPendingGenerations(sourceImages.flatMap(inputImage =>
+                Array.from({length: expectedOutputs}, () => pendingRowData(inputImage)),
+            ))
+        } catch (error) {
+            throw persistenceDiagnostic(error, `Could not create pending rows for batch ${batchId}`)
+        }
+        let initialRowIndex = 0
+        for (const inputImage of sourceImages) {
+            const rows = initialRows.slice(initialRowIndex, initialRowIndex + expectedOutputs)
+            initialRowIndex += expectedOutputs
+            jobs.push({inputImage, rows})
+        }
+
+        function baseLog(job: typeof jobs[number], startedAt: number) {
+            return {
                 batchId,
+                attemptNumber: 1,
                 model: request.model,
                 prompt: request.prompt,
                 inputImages: job.inputImage ? [job.inputImage] : [],
                 modelImages: request.modelImages,
-                maskImage: request.maskImage,
-                settings: request.settings,
-            },
-            resolvedConfigJson: generationConfig,
-            durationMs: Date.now() - startedAt,
-        }
-    }
-
-    async function persistFailure(
-        job: typeof jobs[number],
-        rowIndex: number,
-        error: unknown,
-        startedAt: number,
-        billing: GenerationBilling = {model: request.model},
-    ) {
-        const normalized = normalizeError(error)
-        const row = job.rows[rowIndex]
-        if (!row) throw new Error(`Missing pending row at output index ${rowIndex}`)
-        return database.failGeneration(row.id, {
-            error: normalized,
-            billing,
-            log: {
-                ...baseLog(job, startedAt),
-                status: 'error',
-                outputImage: null,
-                outputMimeType: null,
-                inputTokens: billing.inputTokens ?? null,
-                outputTokens: billing.outputTokens ?? null,
-                totalTokens: billing.totalTokens ?? null,
-                priceUsd: billing.priceUsd ?? null,
-                priceSource: billing.priceSource ?? null,
-                gatewayGenerationId: billing.gatewayGenerationId ?? null,
-                providerRequestId: normalized.requestId ?? null,
-                responseJson: {reason: normalized.message},
-                error: normalized.message,
-                errorJson: normalized,
-            },
-        })
-    }
-
-    async function runJob(job: typeof jobs[number]) {
-        const startedAt = Date.now()
-        const terminalIndexes = new Set<number>()
-        const savedOutputUrls = new Map<number, string>()
-        const rows: Array<NonNullable<Awaited<ReturnType<typeof database.getSystemPrompt>>>> = []
-        let generated: Array<Awaited<ReturnType<typeof gateway.generateAnyImage>>[number] | undefined> = []
-
-        function rememberRow(index: number, row: NonNullable<Awaited<ReturnType<typeof database.getSystemPrompt>>>) {
-            terminalIndexes.add(index)
-            const existing = rows.findIndex(item => item.id === row.id)
-            if (existing >= 0) rows[existing] = row
-            else rows.push(row)
+                requestJson: {
+                    batchId,
+                    model: request.model,
+                    prompt: request.prompt,
+                    inputImages: job.inputImage ? [job.inputImage] : [],
+                    modelImages: request.modelImages,
+                    maskImage: request.maskImage,
+                    settings: request.settings,
+                },
+                resolvedConfigJson: generationConfig,
+                durationMs: Date.now() - startedAt,
+            }
         }
 
-        try {
-            generated = await gateway.generateAnyImage({
-                ...request,
-                inputImages: job.inputImage ? [job.inputImage] : [],
+        async function persistFailure(
+            job: typeof jobs[number],
+            rowIndex: number,
+            error: unknown,
+            startedAt: number,
+            billing: GenerationBilling = {model: request.model},
+        ) {
+            const normalized = normalizeError(error)
+            const row = job.rows[rowIndex]
+            if (!row) throw new Error(`Missing pending row at output index ${rowIndex}`)
+            return database.failGeneration(row.id, {
+                error: normalized,
+                billing,
+                log: {
+                    ...baseLog(job, startedAt),
+                    status: 'error',
+                    outputImage: null,
+                    outputMimeType: null,
+                    inputTokens: billing.inputTokens ?? null,
+                    outputTokens: billing.outputTokens ?? null,
+                    totalTokens: billing.totalTokens ?? null,
+                    priceUsd: billing.priceUsd ?? null,
+                    priceSource: billing.priceSource ?? null,
+                    gatewayGenerationId: billing.gatewayGenerationId ?? null,
+                    providerRequestId: normalized.requestId ?? null,
+                    responseJson: {reason: normalized.message},
+                    error: normalized.message,
+                    errorJson: normalized,
+                },
             })
-            const generatedCount = generated.length
-            // Gemini may return more than one image even though its API has no
-            // deterministic `n` option. Persist every charged output.
-            while (job.rows.length < generatedCount) {
-                job.rows.push(await createPendingRow(job.inputImage))
-            }
-            for (let outputIndex = 0; outputIndex < job.rows.length; outputIndex += 1) {
-                const image = generated[outputIndex]
-                if (!image) {
-                    const failure = await persistFailure(
-                        job,
-                        outputIndex,
-                        createError({
-                            statusCode: 502,
-                            statusMessage: `Provider returned ${generatedCount} of ${job.rows.length} requested images.`,
-                        }),
-                        startedAt,
-                    )
-                    rememberRow(outputIndex, failure.row)
-                    continue
-                }
-
-                try {
-                    const billing = allocateGenerationBilling(image.billing ?? {model: request.model}, outputIndex, generatedCount)
-                    const pendingRow = job.rows[outputIndex]
-                    if (!pendingRow) throw new Error(`Missing pending row at output index ${outputIndex}`)
-                    let saved: Awaited<ReturnType<typeof imageFs.saveGeneratedImage>> | undefined
-                    try {
-                        saved = await imageFs.saveGeneratedImage(image.buffer, image.mimeType)
-                        savedOutputUrls.set(outputIndex, saved.url)
-                        const outputMetadata: OutputMetadata = {
-                            mimeType: saved.mimeType,
-                            bytes: saved.bytes,
-                            width: saved.width,
-                            height: saved.height,
-                            responseText: image.responseText || undefined,
-                            reasoningText: image.reasoningText || undefined,
-                            warnings: Array.isArray(image.warnings) ? image.warnings : [],
-                            grounding: image.grounding,
-                        }
-                        const completion = await database.completeGeneration(pendingRow.id, {
-                            outputImage: saved.url,
-                            outputMetadata,
-                            billing,
-                            log: {
-                                ...baseLog(job, startedAt),
-                                status: 'success',
-                                outputImage: saved.url,
-                                outputMimeType: saved.mimeType,
-                                inputTokens: billing.inputTokens ?? null,
-                                outputTokens: billing.outputTokens ?? null,
-                                totalTokens: billing.totalTokens ?? null,
-                                priceUsd: billing.priceUsd ?? null,
-                                priceSource: billing.priceSource ?? null,
-                                gatewayGenerationId: billing.gatewayGenerationId ?? null,
-                                responseJson: {outputMetadata, billing},
-                                error: null,
-                                errorJson: null,
-                            },
-                        })
-                        // A stale-job reconciler may have won the conditional
-                        // transition. In that case this newly written file was
-                        // never linked and must be removed.
-                        if (!completion.transitioned) {
-                            await imageFs.removeGeneratedImage(saved.url).catch(() => undefined)
-                            savedOutputUrls.delete(outputIndex)
-                        }
-                        rememberRow(outputIndex, completion.row)
-                    } catch (persistenceError) {
-                        const publicError = persistenceDiagnostic(
-                            persistenceError,
-                            `Could not durably persist output ${outputIndex} for row ${pendingRow.id}`,
-                            'Generated image persistence failed.',
-                        )
-                        // A failed transaction response can be an ambiguous commit.
-                        // Never unlink the output unless a subsequent DB read proves
-                        // that the row is not succeeded.
-                        let current: Awaited<ReturnType<typeof database.getSystemPrompt>>
-                        let stateKnown = true
-                        try {
-                            current = await database.getSystemPrompt(pendingRow.id)
-                        } catch (stateError) {
-                            stateKnown = false
-                            console.error('[image-generation] Could not resolve ambiguous persistence state', {
-                                diagnosticId: publicError.data?.diagnosticId,
-                                rowId: pendingRow.id,
-                                error: stateError,
-                            })
-                        }
-                        if (current?.status === 'succeeded') {
-                            rememberRow(outputIndex, current)
-                            continue
-                        }
-                        if (!stateKnown) throw publicError
-                        if (saved?.url) {
-                            await imageFs.removeGeneratedImage(saved.url).catch(() => undefined)
-                            savedOutputUrls.delete(outputIndex)
-                        }
-                        const failure = await persistFailure(job, outputIndex, publicError, startedAt, billing)
-                        rememberRow(outputIndex, failure.row)
-                    }
-                } finally {
-                    // Drop both references immediately. The image bytes are no
-                    // longer needed once persistence/repair has taken over.
-                    image.buffer = EMPTY_GENERATED_IMAGE_BUFFER
-                    generated[outputIndex] = undefined
-                }
-            }
-            return rows
-        } catch (generationError) {
-            const repairErrors: unknown[] = []
-            for (const outputIndex of unresolvedGenerationIndexes(job.rows.length, terminalIndexes)) {
-                try {
-                    const failure = await persistFailure(job, outputIndex, generationError, startedAt)
-                    const savedUrl = savedOutputUrls.get(outputIndex)
-                    if (failure.row.status !== 'succeeded' && savedUrl) {
-                        await imageFs.removeGeneratedImage(savedUrl).catch(() => undefined)
-                        savedOutputUrls.delete(outputIndex)
-                    }
-                    rememberRow(outputIndex, failure.row)
-                } catch (repairError) {
-                    const pendingRow = job.rows[outputIndex]
-                    const current = pendingRow
-                        ? await database.getSystemPrompt(pendingRow.id).catch(() => undefined)
-                        : undefined
-                    if (current && current.status !== 'pending') {
-                        rememberRow(outputIndex, current)
-                    } else {
-                        repairErrors.push(repairError)
-                    }
-                }
-            }
-            if (repairErrors.length) {
-                throw new AggregateError(repairErrors, 'Failed to repair one or more pending generation rows')
-            }
-            return rows
-        } finally {
-            // If processing aborted mid-array, release every unvisited provider
-            // output as well instead of retaining the full multi-image response.
-            for (let index = 0; index < generated.length; index += 1) {
-                const remaining = generated[index]
-                if (!remaining) continue
-                remaining.buffer = EMPTY_GENERATED_IMAGE_BUFFER
-                generated[index] = undefined
-            }
         }
-    }
 
-    // Pending rows act as leases. Heartbeats keep queued and running work from
-    // being reclaimed by another worker; a dead process stops heartbeating and
-    // its rows become eligible after the configured stale TTL.
-    const heartbeat = setInterval(() => {
-        const ids = jobs.flatMap(job => job.rows.map(row => row.id))
-        void database.touchPendingGenerations(ids).catch(error => {
-            console.error('[image-generation] Failed to refresh pending generation leases', error)
-        })
-    }, generationRuntime.heartbeatMs)
-    heartbeat.unref?.()
+        async function runJob(job: typeof jobs[number], abortSignal: AbortSignal) {
+            const startedAt = Date.now()
+            const terminalIndexes = new Set<number>()
+            const savedOutputUrls = new Map<number, string>()
+            const rows: Array<NonNullable<Awaited<ReturnType<typeof database.getSystemPrompt>>>> = []
+            let generated: Array<Awaited<ReturnType<typeof gateway.generateAnyImage>>[number] | undefined> = []
 
-    let settled: PromiseSettledResult<Awaited<ReturnType<typeof runJob>>>[]
-    try {
-        settled = await Promise.allSettled(jobs.map(job => limiter.run(() => runJob(job))))
-    } finally {
-        clearInterval(heartbeat)
-    }
+            function rememberRow(index: number, row: NonNullable<Awaited<ReturnType<typeof database.getSystemPrompt>>>) {
+                terminalIndexes.add(index)
+                const existing = rows.findIndex(item => item.id === row.id)
+                if (existing >= 0) rows[existing] = row
+                else rows.push(row)
+            }
 
-    const objects = settled.flatMap(result => result.status === 'fulfilled' ? result.value : [])
-    const infrastructureFailures: Array<{
-        result: PromiseRejectedResult
-        job: typeof jobs[number]
-    }> = []
-    settled.forEach((result, index) => {
-        const job = jobs[index]
-        if (result.status === 'rejected' && job) infrastructureFailures.push({result, job})
-    })
-
-    for (const {result, job} of infrastructureFailures) {
-        console.error('[image-generation] Generation job rejected; attempting terminal repair', result.reason)
-        for (let outputIndex = 0; outputIndex < job.rows.length; outputIndex += 1) {
             try {
-                const repaired = await persistFailure(job, outputIndex, result.reason, Date.now())
-                if (!objects.some(row => row.id === repaired.row.id)) objects.push(repaired.row)
-            } catch (repairError) {
-                console.error('[image-generation] Failed to repair a pending generation row', repairError)
-                const row = job.rows[outputIndex]
-                    ? await database.getSystemPrompt(job.rows[outputIndex]!.id).catch(() => undefined)
-                    : undefined
-                if (row && !objects.some(item => item.id === row.id)) objects.push(row)
+                generated = await gateway.generateAnyImage({
+                    ...request,
+                    inputImages: job.inputImage ? [job.inputImage] : [],
+                }, abortSignal)
+                const generatedCount = generated.length
+                // Gemini may return more than one image even though its API has no
+                // deterministic `n` option. Persist every charged output.
+                while (job.rows.length < generatedCount) {
+                    job.rows.push(await createPendingRow(job.inputImage))
+                }
+                for (let outputIndex = 0; outputIndex < job.rows.length; outputIndex += 1) {
+                    const image = generated[outputIndex]
+                    if (!image) {
+                        const failure = await persistFailure(
+                            job,
+                            outputIndex,
+                            createError({
+                                statusCode: 502,
+                                statusMessage: `Provider returned ${generatedCount} of ${job.rows.length} requested images.`,
+                            }),
+                            startedAt,
+                        )
+                        rememberRow(outputIndex, failure.row)
+                        continue
+                    }
+
+                    try {
+                        const billing = allocateGenerationBilling(image.billing ?? {model: request.model}, outputIndex, generatedCount)
+                        const pendingRow = job.rows[outputIndex]
+                        if (!pendingRow) throw new Error(`Missing pending row at output index ${outputIndex}`)
+                        let saved: Awaited<ReturnType<typeof imageFs.saveGeneratedImage>> | undefined
+                        try {
+                            saved = await imageFs.saveGeneratedImage(image.buffer, image.mimeType)
+                            savedOutputUrls.set(outputIndex, saved.url)
+                            const outputMetadata: OutputMetadata = {
+                                mimeType: saved.mimeType,
+                                bytes: saved.bytes,
+                                width: saved.width,
+                                height: saved.height,
+                                responseText: image.responseText || undefined,
+                                reasoningText: image.reasoningText || undefined,
+                                warnings: Array.isArray(image.warnings) ? image.warnings : [],
+                                grounding: image.grounding,
+                            }
+                            const completion = await database.completeGeneration(pendingRow.id, {
+                                outputImage: saved.url,
+                                outputMetadata,
+                                billing,
+                                log: {
+                                    ...baseLog(job, startedAt),
+                                    status: 'success',
+                                    outputImage: saved.url,
+                                    outputMimeType: saved.mimeType,
+                                    inputTokens: billing.inputTokens ?? null,
+                                    outputTokens: billing.outputTokens ?? null,
+                                    totalTokens: billing.totalTokens ?? null,
+                                    priceUsd: billing.priceUsd ?? null,
+                                    priceSource: billing.priceSource ?? null,
+                                    gatewayGenerationId: billing.gatewayGenerationId ?? null,
+                                    responseJson: {outputMetadata, billing},
+                                    error: null,
+                                    errorJson: null,
+                                },
+                            })
+                            // A stale-job reconciler may have won the conditional
+                            // transition. In that case this newly written file was
+                            // never linked and must be removed.
+                            if (!completion.transitioned) {
+                                await imageFs.removeGeneratedImage(saved.url).catch(() => undefined)
+                                savedOutputUrls.delete(outputIndex)
+                            }
+                            rememberRow(outputIndex, completion.row)
+                        } catch (persistenceError) {
+                            const publicError = persistenceDiagnostic(
+                                persistenceError,
+                                `Could not durably persist output ${outputIndex} for row ${pendingRow.id}`,
+                                'Generated image persistence failed.',
+                            )
+                            // A failed transaction response can be an ambiguous commit.
+                            // Never unlink the output unless a subsequent DB read proves
+                            // that the row is not succeeded.
+                            let current: Awaited<ReturnType<typeof database.getSystemPrompt>>
+                            let stateKnown = true
+                            try {
+                                current = await database.getSystemPrompt(pendingRow.id)
+                            } catch (stateError) {
+                                stateKnown = false
+                                console.error('[image-generation] Could not resolve ambiguous persistence state', {
+                                    diagnosticId: publicError.data?.diagnosticId,
+                                    rowId: pendingRow.id,
+                                    error: stateError,
+                                })
+                            }
+                            if (current?.status === 'succeeded') {
+                                rememberRow(outputIndex, current)
+                                continue
+                            }
+                            if (!stateKnown) throw publicError
+                            if (saved?.url) {
+                                await imageFs.removeGeneratedImage(saved.url).catch(() => undefined)
+                                savedOutputUrls.delete(outputIndex)
+                            }
+                            const failure = await persistFailure(job, outputIndex, publicError, startedAt, billing)
+                            rememberRow(outputIndex, failure.row)
+                        }
+                    } finally {
+                        // Drop both references immediately. The image bytes are no
+                        // longer needed once persistence/repair has taken over.
+                        image.buffer = EMPTY_GENERATED_IMAGE_BUFFER
+                        generated[outputIndex] = undefined
+                    }
+                }
+                return rows
+            } catch (generationError) {
+                const repairErrors: unknown[] = []
+                for (const outputIndex of unresolvedGenerationIndexes(job.rows.length, terminalIndexes)) {
+                    try {
+                        const failure = await persistFailure(job, outputIndex, generationError, startedAt)
+                        const savedUrl = savedOutputUrls.get(outputIndex)
+                        if (failure.row.status !== 'succeeded' && savedUrl) {
+                            await imageFs.removeGeneratedImage(savedUrl).catch(() => undefined)
+                            savedOutputUrls.delete(outputIndex)
+                        }
+                        rememberRow(outputIndex, failure.row)
+                    } catch (repairError) {
+                        const pendingRow = job.rows[outputIndex]
+                        const current = pendingRow
+                            ? await database.getSystemPrompt(pendingRow.id).catch(() => undefined)
+                            : undefined
+                        if (current && current.status !== 'pending') {
+                            rememberRow(outputIndex, current)
+                        } else {
+                            repairErrors.push(repairError)
+                        }
+                    }
+                }
+                if (repairErrors.length) {
+                    throw new AggregateError(repairErrors, 'Failed to repair one or more pending generation rows')
+                }
+                return rows
+            } finally {
+                // If processing aborted mid-array, release every unvisited provider
+                // output as well instead of retaining the full multi-image response.
+                for (let index = 0; index < generated.length; index += 1) {
+                    const remaining = generated[index]
+                    if (!remaining) continue
+                    remaining.buffer = EMPTY_GENERATED_IMAGE_BUFFER
+                    generated[index] = undefined
+                }
             }
         }
-    }
 
-    const allRejectedForOverload = infrastructureFailures.length === jobs.length
-        && infrastructureFailures.every(({result}) => result.reason instanceof GenerationQueueFullError)
-    if (allRejectedForOverload) {
-        throw createError({
-            statusCode: 429,
-            statusMessage: 'Image generation queue is full. Please try again later.',
-            data: {batchId},
+        const settled = await Promise.allSettled(jobs.map((job, index) =>
+            reservation.run(index, abortSignal => runJob(job, abortSignal)),
+        ))
+
+        const objects = settled.flatMap(result => result.status === 'fulfilled' ? result.value : [])
+        const infrastructureFailures: Array<{
+            result: PromiseRejectedResult
+            job: typeof jobs[number]
+        }> = []
+        settled.forEach((result, index) => {
+            const job = jobs[index]
+            if (result.status === 'rejected' && job) infrastructureFailures.push({result, job})
         })
-    }
-    const succeeded = objects.filter(row => row?.status === 'succeeded').length
-    const failed = objects.filter(row => row?.status === 'failed').length
-    const pending = objects.filter(row => row?.status === 'pending').length
-    return {
-        ok: failed === 0 && pending === 0,
-        obj: objects,
-        batchId,
-        summary: {
-            requested: sourceImages.length * expectedOutputs,
-            total: objects.length,
-            succeeded,
-            failed: failed + pending,
-        },
+
+        for (const {result, job} of infrastructureFailures) {
+            console.error('[image-generation] Generation job rejected; attempting terminal repair', result.reason)
+            for (let outputIndex = 0; outputIndex < job.rows.length; outputIndex += 1) {
+                try {
+                    const repaired = await persistFailure(job, outputIndex, result.reason, Date.now())
+                    if (!objects.some(row => row.id === repaired.row.id)) objects.push(repaired.row)
+                } catch (repairError) {
+                    console.error('[image-generation] Failed to repair a pending generation row', repairError)
+                    const row = job.rows[outputIndex]
+                        ? await database.getSystemPrompt(job.rows[outputIndex]!.id).catch(() => undefined)
+                        : undefined
+                    if (row && !objects.some(item => item.id === row.id)) objects.push(row)
+                }
+            }
+        }
+
+        const succeeded = objects.filter(row => row?.status === 'succeeded').length
+        const failed = objects.filter(row => row?.status === 'failed').length
+        const pending = objects.filter(row => row?.status === 'pending').length
+        return {
+            ok: failed === 0 && pending === 0,
+            obj: objects,
+            batchId,
+            summary: {
+                requested: sourceImages.length * expectedOutputs,
+                total: objects.length,
+                succeeded,
+                failed: failed + pending,
+            },
+        }
+    } finally {
+        await reservation.close().catch(error => {
+            // Expiring durable leases remain conservative if PostgreSQL is
+            // unavailable during cleanup; successful outputs stay committed.
+            persistenceDiagnostic(error, 'Could not release generation capacity')
+        })
     }
 })

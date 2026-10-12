@@ -1,15 +1,16 @@
-import { db } from "~~/server/utils/lib/db"
+import { getDatabase } from "./lib/db"
 import {
     aiGatewayLog,
+    runtimeLease,
     systemPrompt,
     type NewAiGatewayLog,
-} from "~~/server/db/schema"
+} from "../db/schema"
 import { and, desc, eq, inArray, lt, sql as drizzleSql } from "drizzle-orm"
 import type {
     OutputMetadata,
     StoredGenerationConfig,
     StoredGenerationError,
-} from "~~/schemas/image-generation"
+} from "../../schemas/image-generation"
 
 export type GenerationBilling = {
     model?: string
@@ -37,9 +38,12 @@ type PendingGeneration = {
 
 type GenerationLog = Omit<NewAiGatewayLog, 'id' | 'systemPromptId' | 'createdAt'>
 
-function affectedRows(result: unknown) {
-    const value = result as {rowsAffected?: number; changes?: number} | undefined
-    return Number(value?.rowsAffected ?? value?.changes ?? 0)
+function normalizedTimestamps<T extends {createdAt: string; updatedAt?: string}>(row: T): T {
+    return {
+        ...row,
+        createdAt: new Date(row.createdAt).toISOString(),
+        ...(row.updatedAt ? {updatedAt: new Date(row.updatedAt).toISOString()} : {}),
+    }
 }
 
 function billingValues(billing: GenerationBilling) {
@@ -57,10 +61,10 @@ function billingValues(billing: GenerationBilling) {
     }
 }
 
-export async function useDB() {
+export async function useDB(db = getDatabase()) {
     async function rowById(id: number) {
         const [row] = await db.select().from(systemPrompt).where(eq(systemPrompt.id, id)).limit(1)
-        return row
+        return row ? normalizedTimestamps(row) : undefined
     }
 
     async function requiredRowById(id: number) {
@@ -87,16 +91,11 @@ export async function useDB() {
 
     async function createPendingGenerations(items: PendingGeneration[]) {
         if (items.length === 0) return []
-        const ids: number[] = []
-        await db.transaction(async (tx) => {
-            for (const item of items) {
-                const result = await tx.insert(systemPrompt).values(pendingValues(item)).run()
-                const id = Number((result as any)?.lastInsertRowid ?? 0)
-                if (!id) throw new Error('Database did not return an id for a pending generation')
-                ids.push(id)
-            }
-        })
-        return Promise.all(ids.map(requiredRowById))
+        // A single INSERT commits all pending output rows atomically and returns
+        // PostgreSQL generated IDs without connection-local SQLite state.
+        const rows = await db.insert(systemPrompt).values(items.map(pendingValues)).returning()
+        if (rows.length !== items.length) throw new Error('Database did not return all pending generations')
+        return rows.map(normalizedTimestamps)
     }
 
     async function createPendingGeneration(data: PendingGeneration) {
@@ -133,8 +132,8 @@ export async function useDB() {
             await tx.insert(aiGatewayLog).values({
                 ...data.log,
                 systemPromptId: id,
-            }).run()
-            return row
+            })
+            return normalizedTimestamps(row)
         })
         if (transitionedRow) return {row: transitionedRow, transitioned: true}
         return {row: await requiredRowById(id), transitioned: false}
@@ -167,8 +166,8 @@ export async function useDB() {
             await tx.insert(aiGatewayLog).values({
                 ...data.log,
                 systemPromptId: id,
-            }).run()
-            return row
+            })
+            return normalizedTimestamps(row)
         })
         if (transitionedRow) return {row: transitionedRow, transitioned: true}
         return {row: await requiredRowById(id), transitioned: false}
@@ -189,19 +188,18 @@ export async function useDB() {
         await db.update(systemPrompt)
             .set(values)
             .where(eq(systemPrompt.id, id))
-            .run()
         return rowById(id)
     }
 
     async function touchPendingGenerations(ids: number[]) {
         if (!ids.length) return 0
-        const result = await db.update(systemPrompt).set({
+        const rows = await db.update(systemPrompt).set({
             updatedAt: drizzleSql`CURRENT_TIMESTAMP`,
         }).where(and(
             inArray(systemPrompt.id, ids),
             eq(systemPrompt.status, 'pending'),
-        )).run()
-        return affectedRows(result)
+        )).returning({id: systemPrompt.id})
+        return rows.length
     }
 
     async function getSystemPrompts(take = 50, skip = 0) {
@@ -210,7 +208,7 @@ export async function useDB() {
         // History is a compact replay/card projection. Large raw usage,
         // provider detail, output metadata, and structured errors are fetched
         // only through the single-record endpoint.
-        return db.select({
+        const rows = await db.select({
             id: systemPrompt.id,
             TextPrompt: systemPrompt.TextPrompt,
             serverImages: systemPrompt.serverImages,
@@ -236,6 +234,7 @@ export async function useDB() {
             .orderBy(desc(systemPrompt.createdAt), desc(systemPrompt.id))
             .limit(limit)
             .offset(offset)
+        return rows.map(normalizedTimestamps)
     }
 
     async function countSystemPrompts() {
@@ -244,7 +243,12 @@ export async function useDB() {
     }
 
     async function reconcileStalePendingGenerations(staleTtlMs: number, nowMs = Date.now()) {
-        const cutoff = new Date(nowMs - staleTtlMs).toISOString().replace('T', ' ').slice(0, 19)
+        const cutoff = new Date(nowMs - staleTtlMs).toISOString()
+        const noLiveLease = drizzleSql`NOT EXISTS (
+            SELECT 1 FROM ${runtimeLease}
+            WHERE ${runtimeLease.owner}::text = ${systemPrompt.batchId}
+            AND ${runtimeLease.expiresAt} > CURRENT_TIMESTAMP
+        )`
         const interrupted = await db.select({
             id: systemPrompt.id,
             batchId: systemPrompt.batchId,
@@ -256,6 +260,7 @@ export async function useDB() {
         }).from(systemPrompt).where(and(
             eq(systemPrompt.status, 'pending'),
             lt(systemPrompt.updatedAt, cutoff),
+            noLiveLease,
         )).orderBy(systemPrompt.updatedAt, systemPrompt.id).limit(100)
         if (!interrupted.length) return 0
 
@@ -268,7 +273,7 @@ export async function useDB() {
         let reconciled = 0
         await db.transaction(async (tx) => {
             for (const row of interrupted) {
-                const result = await tx.update(systemPrompt).set({
+                const rows = await tx.update(systemPrompt).set({
                     outputImage: '',
                     status: 'failed',
                     errors: error.message,
@@ -278,8 +283,9 @@ export async function useDB() {
                     eq(systemPrompt.id, row.id),
                     eq(systemPrompt.status, 'pending'),
                     lt(systemPrompt.updatedAt, cutoff),
-                )).run()
-                if (affectedRows(result) === 0) continue
+                    noLiveLease,
+                )).returning({id: systemPrompt.id})
+                if (rows.length === 0) continue
                 reconciled += 1
                 await tx.insert(aiGatewayLog).values({
                     systemPromptId: row.id,
@@ -296,24 +302,23 @@ export async function useDB() {
                     responseJson: {reason: error.message},
                     error: error.message,
                     errorJson: error,
-                }).run()
+                })
             }
         })
         return reconciled
     }
 
     async function createAiGatewayLog(data: NewAiGatewayLog) {
-        const result = await db.insert(aiGatewayLog).values(data).run()
-        const id = Number((result as any)?.lastInsertRowid ?? 0)
-        if (!id) throw new Error('Database did not return an id for the Gateway log')
-        const [row] = await db.select().from(aiGatewayLog).where(eq(aiGatewayLog.id, id))
-        return row
+        const [row] = await db.insert(aiGatewayLog).values(data).returning()
+        if (!row) throw new Error('Database did not return the Gateway log')
+        return normalizedTimestamps(row)
     }
 
     async function getAiGatewayLogs(limit = 50) {
-        return db.select().from(aiGatewayLog)
+        const rows = await db.select().from(aiGatewayLog)
             .orderBy(desc(aiGatewayLog.createdAt), desc(aiGatewayLog.id))
             .limit(Math.max(1, Math.min(200, limit)))
+        return rows.map(normalizedTimestamps)
     }
 
     return {

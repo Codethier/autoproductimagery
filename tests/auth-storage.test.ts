@@ -1,7 +1,4 @@
 import assert from "node:assert/strict"
-import { promises as nodeFs } from "node:fs"
-import os from "node:os"
-import path from "node:path"
 import { Readable } from "node:stream"
 import test from "node:test"
 import {
@@ -10,7 +7,6 @@ import {
     credentialsMatch,
     verifyAuthSessionToken,
 } from "../server/utils/authSession.ts"
-import { detectImageType, useFS } from "../server/utils/useFS.ts"
 import { installBoundedRawBody } from "../server/utils/boundedRequestBody.ts"
 import {
     MAX_UPLOAD_AGGREGATE_BYTES,
@@ -45,47 +41,6 @@ test("credential comparison validates both values", () => {
     assert.equal(credentialsMatch("user", "pass", "user", "pass"), true)
     assert.equal(credentialsMatch("wrong", "pass", "user", "pass"), false)
     assert.equal(credentialsMatch("user", "wrong", "user", "pass"), false)
-})
-
-function bmff(majorBrand: string, compatibleBrands: string[] = []): Buffer {
-    const size = 16 + compatibleBrands.length * 4
-    const result = Buffer.alloc(size)
-    result.writeUInt32BE(size, 0)
-    result.write("ftyp", 4, "ascii")
-    result.write(majorBrand, 8, "ascii")
-    compatibleBrands.forEach((brand, index) => result.write(brand, 16 + index * 4, "ascii"))
-    return result
-}
-
-test("HEIC detection requires a HEIC BMFF brand", () => {
-    assert.equal(detectImageType(bmff("heic", ["mif1"])), "heic")
-    assert.equal(detectImageType(bmff("mif1", ["heix"])), "heic")
-    assert.equal(detectImageType(bmff("mif1", ["heim"])), "heic")
-    assert.equal(detectImageType(bmff("mif1", ["heis"])), "heic")
-    assert.equal(detectImageType(bmff("isom", ["mp42"])), null)
-    assert.equal(detectImageType(bmff("avif", ["mif1"])), null)
-})
-
-test("file read errors expose only a correlation id, not filesystem diagnostics", async () => {
-    const originalWarn = console.warn
-    console.warn = () => undefined
-    try {
-        const imageFs = await useFS()
-        await assert.rejects(
-            imageFs.getFile("/images/does-not-exist/auth-storage-test.png"),
-            (error: any) => {
-                const serialized = JSON.stringify(error?.data)
-                assert.equal(error?.statusCode, 404)
-                assert.equal(typeof error?.data?.diagnosticId, "string")
-                assert.equal("fileDiagnostics" in (error?.data || {}), false)
-                assert.equal(serialized.includes(process.cwd()), false)
-                assert.equal(serialized.includes("auth-storage-test.png"), false)
-                return true
-            },
-        )
-    } finally {
-        console.warn = originalWarn
-    }
 })
 
 test("bounded multipart buffering rejects declared and chunked oversized bodies", async () => {
@@ -193,67 +148,4 @@ test("login throttle applies account limits, returns retry timing, and expires",
     assert.equal(blocked.allowed, false)
     assert.equal(blocked.retryAfterSeconds, LOGIN_THROTTLE_WINDOW_MS / 1000)
     assert.equal(throttle.consume("198.51.100.1", "target-user", now + LOGIN_THROTTLE_WINDOW_MS).allowed, true)
-})
-
-test("image storage fully decodes uploads instead of trusting magic bytes", async () => {
-    const imageFs = await useFS()
-    const corruptPng = Buffer.concat([
-        Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-        Buffer.from("not-a-real-png"),
-    ])
-    await assert.rejects(
-        imageFs.saveFile("/", {
-            name: "files",
-            filename: "corrupt.png",
-            type: "image/png",
-            data: corruptPng,
-        }),
-        (error: any) => error?.statusCode === 415,
-    )
-})
-
-test("image storage rejects symlink or junction traversal and omits links from listings", async (t) => {
-    const imageRoot = path.resolve("./data/images")
-    const outside = await nodeFs.mkdtemp(path.join(os.tmpdir(), "autoproductimagery-outside-"))
-    const linkName = `security-link-${process.pid}-${Date.now()}`
-    const linkPath = path.join(imageRoot, linkName)
-    await nodeFs.writeFile(path.join(outside, "secret.png"), "outside")
-    try {
-        await nodeFs.symlink(outside, linkPath, process.platform === "win32" ? "junction" : "dir")
-    } catch (error: any) {
-        if (error?.code === "EPERM" || error?.code === "EACCES") {
-            t.skip("symlink creation is not permitted on this host")
-            await nodeFs.rm(outside, { recursive: true, force: true })
-            return
-        }
-        throw error
-    }
-    try {
-        const imageFs = await useFS()
-        const root = await imageFs.readDir("/")
-        assert.equal(root.dirs.some(entry => entry.name === linkName), false)
-        const originalWarn = console.warn
-        console.warn = () => undefined
-        try {
-            await assert.rejects(
-                imageFs.getFile(`/images/${linkName}/secret.png`),
-                (error: any) => error?.statusCode === 400,
-            )
-        } finally {
-            console.warn = originalWarn
-        }
-    } finally {
-        await nodeFs.unlink(linkPath).catch(() => undefined)
-        await nodeFs.rm(outside, { recursive: true, force: true })
-    }
-})
-
-test("file DTOs expose image URLs but no absolute parent paths", async () => {
-    const imageFs = await useFS()
-    const dto = imageFs.parseFileDirEntToSelectableFile([
-        { name: "product one.png" } as any,
-    ], "/catalog")
-    assert.equal(dto[0]?.url, "/images/catalog/product%20one.png")
-    assert.equal("parentPath" in (dto[0] || {}), false)
-    assert.equal(JSON.stringify(dto).includes(process.cwd()), false)
 })

@@ -80,6 +80,44 @@ let items = await useFetch('/api/files', {
   }
 })
 
+const additionalFiles = ref<SelectableFile[]>([])
+const additionalDirs = ref<Array<{name: string}>>([])
+const nextCursor = ref<string | undefined>()
+const loadingMore = ref(false)
+const displayedFiles = computed(() => [...(items.data.value?.files ?? []), ...additionalFiles.value])
+const displayedDirs = computed(() => [...(items.data.value?.dirs ?? []), ...additionalDirs.value])
+watch(() => items.data.value, (page) => {
+  additionalFiles.value = []
+  additionalDirs.value = []
+  nextCursor.value = page?.nextCursor
+}, {immediate: true})
+
+async function loadMoreFiles() {
+  if (!nextCursor.value || loadingMore.value) return
+  loadingMore.value = true
+  const listingPath = path.value
+  const cursor = nextCursor.value
+  try {
+    const page = await $fetch('/api/files', {query: {path: listingPath, cursor, limit: 100}})
+    if (path.value !== listingPath || nextCursor.value !== cursor) return
+    const knownFiles = new Set(displayedFiles.value.map(file => file.url))
+    const knownDirs = new Set(displayedDirs.value.map(dir => dir.name))
+    for (const file of page.files) {
+      if (knownFiles.has(file.url)) continue
+      file.selectedImage = dataStore.inputImages.includes(file.url)
+      file.selectedModel = dataStore.models.includes(file.url)
+      file.selectedMask = dataStore.maskImage === file.url
+      additionalFiles.value.push(file)
+    }
+    additionalDirs.value.push(...page.dirs.filter(dir => !knownDirs.has(dir.name)))
+    nextCursor.value = page.nextCursor
+  } catch (error: any) {
+    toast.add({title: 'Could not load more files', description: error?.statusMessage ?? 'Please try again.', color: 'error'})
+  } finally {
+    loadingMore.value = false
+  }
+}
+
 function syncSelectToStore(file: SelectableFile) {
   // Sync selected images
   const imgIdx = dataStore.inputImages.indexOf(file.url)
@@ -100,7 +138,7 @@ function syncSelectToStore(file: SelectableFile) {
   // A mask is a single image, so selecting one clears the previous selection.
   if (file.selectedMask) {
     dataStore.maskImage = file.url
-    for (const item of items.data.value?.files || []) {
+    for (const item of displayedFiles.value) {
       if (item.url !== file.url) item.selectedMask = false
     }
   } else if (dataStore.maskImage === file.url) {
@@ -188,7 +226,10 @@ async function deleteFileOrFolder(filename: string, selectedUrl?: string) {
   const base = path.value.endsWith('/') ? path.value.slice(0, -1) : path.value
   const pathToSubmit = `${base}/${filename}`
   try {
-    await $fetch('/api/deleteFileOrFolder', { method: 'DELETE', body: { path: pathToSubmit } })
+    await $fetch('/api/deleteFileOrFolder', {
+      method: 'DELETE',
+      body: {path: pathToSubmit, entryType: selectedUrl ? 'file' : 'directory'}
+    })
     if (selectedUrl) {
       removeDeletedSelections(selectedUrl, false)
     } else {
@@ -205,7 +246,7 @@ function clearModelSelection() {
   try {
     ;(dataStore.models as any).splice(0)
   } catch { /* no-op */ }
-  const files = items.data.value?.files
+  const files = displayedFiles.value
   if (files) {
     for (const f of files) f.selectedModel = false
   }
@@ -215,7 +256,7 @@ function clearImageSelection() {
   try {
     ;(dataStore.inputImages as any).splice(0)
   } catch { /* no-op */ }
-  const files = items.data.value?.files
+  const files = displayedFiles.value
   if (files) {
     for (const f of files) f.selectedImage = false
   }
@@ -223,7 +264,7 @@ function clearImageSelection() {
 
 function clearMaskSelection() {
   dataStore.maskImage = null
-  const files = items.data.value?.files
+  const files = displayedFiles.value
   if (files) {
     for (const f of files) f.selectedMask = false
   }
@@ -290,16 +331,16 @@ onBeforeUnmount(() => window.removeEventListener('paste', handlePaste))
         </div>
 
       </div>
-      <div v-for="dir of items.data.value?.dirs"
+      <div v-for="dir of displayedDirs" :key="dir.name"
            class="flex justify-center items-center gap-2 flex-col  cursor-pointer hover:text-primary-500 w-full h-full">
         <UIcon @click="enterFolder(dir.name)" name="material-symbols-create-new-folder" class="size-16"></UIcon>
         <p class="w-full truncate text-center">{{ dir.name }}</p>
         <UIcon name="i-heroicons-trash" class="size-6 text-red-500 cursor-pointer"
                @click="deleteFileOrFolder(dir.name)"></UIcon>
       </div>
-      <div v-for="file of items.data.value?.files"
+      <div v-for="file of displayedFiles" :key="file.url"
            class="text-center text-balance flex flex-col gap-2 justify-center items-center w-full h-full">
-        <img :src="`api/data${file.url}`" class="w-full object-contain" loading="lazy">
+        <img :src="`/api/data${file.url}`" :alt="file.name" class="w-full object-contain" loading="lazy">
         <p class="w-full truncate text-center">{{ file.name }}</p>
         <UCheckbox v-if="props.isModelSelect" v-model="file.selectedModel"
                    @change="syncSelectToStore(file)"></UCheckbox>
@@ -311,6 +352,10 @@ onBeforeUnmount(() => window.removeEventListener('paste', handlePaste))
                    @change="syncSelectToStore(file)"></UCheckbox>
         <UIcon name="i-heroicons-trash" class="size-6 text-red-500 cursor-pointer"
                @click="deleteFileOrFolder(file.name, file.url)"></UIcon>
+      </div>
+
+      <div v-if="nextCursor" class="col-span-4">
+        <UButton label="Load more files" :loading="loadingMore" :disabled="loadingMore" @click="loadMoreFiles"/>
       </div>
 
     </div>
