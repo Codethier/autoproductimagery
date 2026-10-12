@@ -4,6 +4,14 @@ Generate product imagery through Vercel AI Gateway, using independent jobs for e
 
 ![Example generated image](public/examples/image2.png)
 
+## Image workspace
+
+The app opens at **Edit** (`/edit`), with an image-only upload area and an Assets picker. Choose one product image to open the canvas, write a prompt, and attach optional shared reference images or a model-specific mask. The canvas supports zoom, download, replacement, and using a generated result as the next input. Model settings remain specific to each current model; favourites, New tags, warnings, reference limits and exact replay are preserved.
+
+**Same-origin batch** (`/same-origin-batch`) applies one prompt and the same shared references to each selected input image. Each input creates an independent generation job; selecting several references does not multiply the jobs. Edit and batch keep separate input selections while sharing the prompt and model settings. Active requests stay visible across workspace navigation, and generation history remains available in both views.
+
+**Assets** (`/assets`) provides the private image library, folder browsing, uploads, keyword search, previews, downloads, favourites and multi-selection. The reusable picker supplies Edit inputs, batch inputs, shared references and PNG masks. Favourites are a browser-local preference; image bytes and file management remain authenticated server operations. Listing and search use bounded S3 pagination, so large libraries can continue loading without reading every image into memory. The Generated images view shows the output folder; retention eligibility comes from generation records rather than this view.
+
 ## Storage and runtime
 
 - Uploaded and generated images are validated raster images in a **private S3-compatible bucket**. Railway Storage Buckets are supported.
@@ -81,6 +89,19 @@ Keep `railpack.json`: Node 26 requires `libatomic1` in both the build and final 
 The default provider timeout is 180 seconds. `NUXT_IMAGE_GENERATION_REQUEST_TIMEOUT_MS` defaults to 270 seconds and limits queue waits and provider work. Already-returned provider outputs are still persisted through bounded S3/database operations before the handler returns. Set the host's maximum request duration above the provider-work budget **plus the output-persistence margin**, or lower the configured budget and batch size. This requires a Node serverless runtime with enough execution time for image generation; edge-only runtimes and short-duration functions are unsupported.
 
 Expired worker leases permit conservative pending-job recovery on subsequent requests. A paid call that fails or exceeds its deadline is recorded as retryable when appropriate; completed siblings remain successful. A hard process kill between an S3 write and database persistence can leave an orphan object for later operational cleanup.
+
+## Production deployments from master
+
+The single Railway `production` environment runs the app, PostgreSQL, private image bucket and daily retention worker. Configure both the `app` and `image-retention` services with the GitHub source `Codethier/autoproductimagery`, branch `master`, automatic push deployments and **Wait for CI** enabled. The checked-in `.github/workflows/ci.yml` runs tests against disposable PostgreSQL, typechecks, builds both entry points, checks migrations and verifies Node's runtime libraries on every push to `master` and pull request targeting it. CI receives no application or deployment credentials.
+
+| Service | Build | Start | Pre-deploy |
+| --- | --- | --- | --- |
+| `app` | `npm run build` | `node .output/server/index.mjs` | `npm run drizzle:migrate` |
+| `image-retention` | `npm run build:retention` | `node .output/cleanup-generated-images.mjs --apply` | None; app applies reviewed migrations |
+
+The app uses the `/api/health` readiness check and Railway serverless/sleep mode. The retention service has the daily schedule documented below and no public domain. PostgreSQL and S3 remain private; their connection variables are Railway service references. Pushes deploy the committed repository snapshot after CI succeeds, so local ignored credentials and datasets are never part of the GitHub deployment source.
+
+Before switching an existing installation, review every deployment target watching `master`. Disable any obsolete target's automatic deployment before pushing this PostgreSQL/S3 version if that target still uses the previous SQLite/filesystem configuration. Preserve its existing application and stored data until a separate cutover is authorized. Production environment changes and migrations still require the explicit confirmation in `AGENTS.md`.
 
 ## Generated image retention
 

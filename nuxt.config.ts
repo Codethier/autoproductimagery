@@ -55,9 +55,10 @@ export default defineNuxtConfig({
         // 'vue-json-pretty/lib/styles.css'
     ],
     icon: {
-        // npm package with all icons: "@iconify/json": "^2.2.232",
-        //     removed it because the build needed too much ram and didn't build...
-        serverBundle: 'remote',
+        // Bundle only the two collections used by this app, so workspace
+        // controls render on cold starts without a remote icon CDN request.
+        serverBundle: {collections: ['lucide', 'heroicons']},
+        fallbackToApi: false,
     },
     ui: {
         // icons:['heroicons','openmoji','line-md','wpf']
