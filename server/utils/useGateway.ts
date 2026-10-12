@@ -434,9 +434,11 @@ export function enrichImageModelInfo(model: GatewayModelInfo): GatewayModelInfo 
     }
 }
 
-export async function useGateway() {
+export async function useGateway(imageStorage?: Pick<Awaited<ReturnType<typeof useFS>>, 'getImageFile'>) {
     const gateway = getGateway()
-    const fs = await useFS()
+    // Generation APIs inject the account-authorized storage facade. Catalog
+    // and billing lookups do not read image sources.
+    const fs = imageStorage ?? await useFS()
 
     async function listModels(opts: ListModelsOpts = {}): Promise<GatewayModelInfo[]> {
         let models: GatewayModelInfo[]

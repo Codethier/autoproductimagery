@@ -19,6 +19,17 @@ export const useDataStore = defineStore('data', () => {
     let generationSettings = ref<ImageGenerationSettings>(createDefaultSettings(DEFAULT_IMAGE_MODEL_ID))
     let maskImage = ref<string | null>(null)
 
+    function resetWorkspace() {
+        models.value = []
+        inputImages.value = []
+        editSource.value = null
+        composerPrompt.value = ''
+        pendingGenerations.value = []
+        selectedModel.value = DEFAULT_IMAGE_MODEL_ID
+        generationSettings.value = createDefaultSettings(DEFAULT_IMAGE_MODEL_ID)
+        maskImage.value = null
+    }
+
     return {
         models,
         inputImages,
@@ -28,6 +39,7 @@ export const useDataStore = defineStore('data', () => {
         selectedModel,
         generationSettings,
         maskImage,
+        resetWorkspace,
     }
 
 })

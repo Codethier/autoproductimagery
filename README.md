@@ -6,19 +6,32 @@ Generate product imagery through Vercel AI Gateway, using independent jobs for e
 
 ## Image workspace
 
-The app opens at **Edit** (`/edit`), with an image-only upload area and an Assets picker. Choose one product image to open the canvas, write a prompt, and attach optional shared reference images or a model-specific mask. The canvas supports zoom, download, replacement, and using a generated result as the next input. Model settings remain specific to each current model; favourites, New tags, warnings, reference limits and exact replay are preserved.
+The app opens at **Edit** (`/edit`), in a warm studio layout with top navigation and an image-only upload area. Choose one product image from your library or Shared with me to open the canvas, write a prompt, and attach optional shared reference images or a model-specific mask. The canvas supports zoom, download, replacement, and using a generated result as the next input. Model settings remain specific to each current model; favourites, New tags, warnings, reference limits and exact replay are preserved.
 
 **Same-origin batch** (`/same-origin-batch`) applies one prompt and the same shared references to each selected input image. Each input creates an independent generation job; selecting several references does not multiply the jobs. Edit and batch keep separate input selections while sharing the prompt and model settings. Active requests stay visible across workspace navigation, and generation history remains available in both views.
 
-**Assets** (`/assets`) provides the private image library, folder browsing, uploads, keyword search, previews, downloads, favourites and multi-selection. The reusable picker supplies Edit inputs, batch inputs, shared references and PNG masks. Favourites are a browser-local preference; image bytes and file management remain authenticated server operations. Listing and search use bounded S3 pagination, so large libraries can continue loading without reading every image into memory. The Generated images view shows the output folder; retention eligibility comes from generation records rather than this view.
+**Library** (`/assets`) provides each user's private images, folders, uploads, keyword search, previews, downloads, favourites and multi-selection. The reusable picker supplies Edit inputs, batch inputs, references and PNG masks. Favourites are browser-local preferences scoped to the organization and user. Listing and search paginate the authorized PostgreSQL asset registry; the browser never scans the bucket or discovers another user's private objects. Generated images are identified by stored metadata; retention eligibility comes from generation records.
+
+**Shared with me** (`/shared`) groups shared files and folders by the person who shared them. A source is a member of the same organization. View access permits previews, downloads and using an image in a new generation; the resulting output belongs to the generating user. Optional edit access also permits uploading into a shared folder and deleting its contents. Only the original owner can grant or revoke access. Folder grants apply to their logical descendants, including later uploads; revocation applies on the next server operation. Sharing is confined to the same organization. Shared generated images still expire under the retention policy.
+
+## Organizations and accounts
+
+There are two roles: **organization owner** and **user**. Owners manage accounts in **Team** (`/team`): create usernames and initial passwords, choose roles, update display names, reset passwords, and disable or re-enable accounts. Users manage their own images and sharing, and can change their password in **Account** (`/account`). There is no public signup or email invitation service. The last enabled owner cannot be demoted or disabled.
+
+An owner manages membership but has no automatic access to another user's private images, prompts, billing or Gateway diagnostics. All image reads, upload destinations, sharing, generation inputs, masks, history, details and billing refreshes enforce the authenticated organization and user. Each generation stores trusted ownership; client-supplied IDs cannot select another user's account or history.
+
+After applying the account migration, existing global sessions are invalid and users sign in again. On an empty account database, the first successful sign-in with the configured `NUXT_AUTH_USER` and `NUXT_AUTH_PASSWORD` creates the original organization owner. Existing unclaimed generation history and Gateway logs are assigned to that owner. Once any account exists, environment credentials cannot bypass a changed account password or create another bootstrap owner. Imported image objects require the explicit adoption step below before appearing in a library.
+
+Passwords are individually salted and hashed with bounded asynchronous scrypt. Session cookies contain random opaque tokens; PostgreSQL stores only their hashes, expiry and account version. Sessions expire after 12 hours. Logout revokes the current session; password, role and enabled-state changes revoke the affected user's sessions. Cookies are `HttpOnly`, `SameSite=Lax`, and secure under HTTPS/production. Mutating browser requests require the same origin. Account switches clear in-memory inputs, pending work and private caches; tabs notify each other with an opaque change event so an old tab clears its previous account without revoking a new login.
 
 ## Storage and runtime
 
 - Uploaded and generated images are validated raster images in a **private S3-compatible bucket**. Railway Storage Buckets are supported.
-- PostgreSQL stores generation history, exact replay settings, output dimensions/MIME/bytes, billing, attempt diagnostics, and coordination leases.
+- PostgreSQL stores organizations, accounts, hashed sessions, logical assets and sharing grants, generation history, exact replay settings, output dimensions/MIME/bytes, billing, attempt diagnostics, and coordination leases.
 - The Nuxt app needs no persistent disk or app volume. Warm instances share PostgreSQL and S3; a fresh instance can serve images and replay stored generations.
-- Authenticated image routes proxy private objects through `/api/data/images/...`. Bucket credentials and object URLs are never sent to the browser.
-- Folder markers preserve empty folders. File listings use bounded cursor pagination; the file browser loads more pages on demand. Concurrent uploads use conditional object creation rather than overwriting a same-name image.
+- Authenticated image routes proxy private objects through `/api/data/images/...`. Bucket credentials and public/presigned object URLs are never sent to the browser.
+- New uploads have immutable UUID object paths under their organization and owner. Logical folders are separate registry metadata: deleting and re-uploading a filename cannot replace an old generation source or revive a revoked file grant. Folder deletion sends a bounded list of exact registered keys, never a recursive physical-prefix delete.
+- File listings use bounded cursor pagination bound to the account and filters; the file browser loads more pages on demand. Concurrent uploads use conditional creation and never overwrite existing image bytes.
 - Generation admission, running limits, job ownership, and login throttling are coordinated across instances. Provider work is awaited within the request, with abortable timeouts and durable recovery of abandoned pending rows.
 
 This is an image-only application. PDF, video, audio, arbitrary file uploads, and external media URLs are unsupported. All AI requests use the Vercel AI SDK through Vercel AI Gateway.
@@ -31,7 +44,6 @@ Use Node.js 26.x, PostgreSQL, a private S3-compatible bucket, and a Vercel AI Ga
 NUXT_AI_GATEWAY_API_KEY=
 NUXT_AUTH_USER=
 NUXT_AUTH_PASSWORD=
-NUXT_AUTH_SESSION_SECRET=
 DATABASE_URL=postgresql://localhost:5432/autoproductimagery
 DATABASE_POOL_MAX=3
 S3_ENDPOINT=https://t3.storageapi.dev
@@ -43,7 +55,7 @@ S3_PREFIX=images
 S3_FORCE_PATH_STYLE=false
 ```
 
-Set a strong login password and a separate random session secret of at least 32 characters. Every app instance must use the same credentials and signing secret. Changing either invalidates existing sessions. Cookies are expiring, signed, `HttpOnly`, `SameSite`, and secure under HTTPS/production.
+Set strong initial owner credentials and keep them consistent across instances until the original owner has signed in. Subsequent authentication uses account password hashes and revocable sessions in PostgreSQL. The legacy `NUXT_AUTH_SESSION_SECRET` setting is no longer used by the account-session implementation and does not need to be rotated or changed for this upgrade.
 
 Railway buckets use virtual-host addressing, so `S3_FORCE_PATH_STYLE=false` is appropriate for Railway. Use the bucket's **base endpoint** and its S3 bucket name from the Credentials tab. The bucket's display name and S3 bucket name can differ. Other S3 services may require path addressing. Objects remain under `S3_PREFIX`; do not point unrelated applications at the same prefix.
 
@@ -157,6 +169,14 @@ node --import ./tests/register-typescript.mjs scripts/import-local-images.ts --s
 node --import ./tests/register-typescript.mjs scripts/import-sqlite-to-postgres.ts --sqlite=./sqlite/drizzle.db --dry-run
 ```
 
-To apply to an empty development target, first configure the development bucket credentials, set `APP_ENV=development`, and run the image importer with `--confirm-development` instead of `--dry-run`. Then set `IMPORT_DATABASE_URL` explicitly and run the database importer with `--apply --environment=development`. The image importer preserves paths, validates content, resumes identical existing objects, and refuses conflicting overwrites. The database importer preserves IDs, JSON, timestamps, billing, and log relationships transactionally, and refuses a populated generation/history target.
+To apply to an empty development target, first configure the development bucket credentials, set `APP_ENV=development`, and run the image importer with `--confirm-development` instead of `--dry-run`. Then set `IMPORT_DATABASE_URL` explicitly and run the database importer with `--apply --environment=development`. The image importer preserves paths, validates content, resumes identical existing objects, and refuses conflicting overwrites. The database importer preserves IDs, JSON, timestamps, billing, and log relationships transactionally, and refuses a populated generation/history target. Complete imports before the first owner sign-in so bootstrap can assign the unclaimed history.
+
+After the original owner is initialized, review a bounded plan for registering imported legacy image objects in that owner's library:
+
+```sh
+node --import ./tests/register-typescript.mjs scripts/adopt-legacy-assets.ts --organization-id <uuid> --owner-id <uuid> --max-entries 1000
+```
+
+To apply the reviewed plan, add `--apply --confirm-owner-id <same-owner-uuid>`. The command is restricted to the original bootstrap owner, validates every newly registered image, preserves existing URLs and ownership, and writes metadata only. It never modifies S3 bytes. Objects in the new organizations namespace and deleted registry entries cannot be adopted as legacy files. The default limit is 1000 entries, with an upper bound of 10000; folders are bounded to 32 levels. Legacy objects remain inaccessible through application routes until explicitly registered. Adoption against production requires separate exact confirmation.
 
 The local `private-agents.md` stores the selected Railway project/development IDs and is ignored. Real `.env` files, databases, and `.codex/artifacts/` reports are also ignored; `.env.example` contains no credentials.

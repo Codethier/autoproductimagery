@@ -25,6 +25,8 @@ export type GenerationBilling = {
     usageJson?: Record<string, unknown>
 }
 
+export type GenerationOwner = { organizationId: string; userId: string }
+
 type PendingGeneration = {
     prompt: string
     inputImages: string[]
@@ -62,9 +64,22 @@ function billingValues(billing: GenerationBilling) {
     }
 }
 
-export async function useDB(db = getDatabase()) {
+// API callers must provide an authenticated owner. The unscoped form is for
+// explicit maintenance/import tools and disposable database tests only.
+export async function useDB(db = getDatabase(), owner?: GenerationOwner) {
+    const generationScope = () => owner ? and(
+        eq(systemPrompt.organizationId, owner.organizationId),
+        eq(systemPrompt.userId, owner.userId),
+    ) : undefined
+    const logScope = () => owner ? and(
+        eq(aiGatewayLog.organizationId, owner.organizationId),
+        eq(aiGatewayLog.userId, owner.userId),
+    ) : undefined
+    const ownershipValues = () => owner ? {
+        organizationId: owner.organizationId, userId: owner.userId,
+    } : {}
     async function rowById(id: number) {
-        const [row] = await db.select().from(systemPrompt).where(eq(systemPrompt.id, id)).limit(1)
+        const [row] = await db.select().from(systemPrompt).where(and(eq(systemPrompt.id, id), generationScope())).limit(1)
         return row ? normalizedTimestamps(row) : undefined
     }
 
@@ -76,6 +91,7 @@ export async function useDB(db = getDatabase()) {
 
     function pendingValues(data: PendingGeneration) {
         return {
+            ...ownershipValues(),
             TextPrompt: data.prompt,
             serverImages: data.inputImages,
             modelImages: data.modelImages,
@@ -92,6 +108,11 @@ export async function useDB(db = getDatabase()) {
 
     async function createPendingGenerations(items: PendingGeneration[]) {
         if (items.length === 0) return []
+        if (owner) {
+            for (const id of new Set(items.map(item => item.parentSystemPromptId).filter((id): id is number => id !== undefined))) {
+                if (!await rowById(id)) throw new Error('Generation parent is unavailable to this account')
+            }
+        }
         // A single INSERT commits all pending output rows atomically and returns
         // PostgreSQL generated IDs without connection-local SQLite state.
         const rows = await db.insert(systemPrompt).values(items.map(pendingValues)).returning()
@@ -126,12 +147,15 @@ export async function useDB(db = getDatabase()) {
             }).where(and(
                 eq(systemPrompt.id, id),
                 eq(systemPrompt.status, 'pending'),
+                generationScope(),
             )).returning()
 
             if (!row) return undefined
 
             await tx.insert(aiGatewayLog).values({
                 ...data.log,
+                organizationId: row.organizationId,
+                userId: row.userId,
                 systemPromptId: id,
             })
             return normalizedTimestamps(row)
@@ -160,12 +184,15 @@ export async function useDB(db = getDatabase()) {
             }).where(and(
                 eq(systemPrompt.id, id),
                 eq(systemPrompt.status, 'pending'),
+                generationScope(),
             )).returning()
 
             if (!row) return undefined
 
             await tx.insert(aiGatewayLog).values({
                 ...data.log,
+                organizationId: row.organizationId,
+                userId: row.userId,
                 systemPromptId: id,
             })
             return normalizedTimestamps(row)
@@ -184,6 +211,7 @@ export async function useDB(db = getDatabase()) {
         const rows = await db.selectDistinct({outputImage: systemPrompt.outputImage}).from(systemPrompt).where(and(
             inArray(systemPrompt.outputImage, [...new Set(paths)]),
             isNotNull(systemPrompt.outputImageDeletedAt),
+            generationScope(),
         ))
         return [...new Set(rows.map(row => row.outputImage))]
     }
@@ -198,7 +226,7 @@ export async function useDB(db = getDatabase()) {
 
         await db.update(systemPrompt)
             .set(values)
-            .where(eq(systemPrompt.id, id))
+            .where(and(eq(systemPrompt.id, id), generationScope()))
         return rowById(id)
     }
 
@@ -209,6 +237,7 @@ export async function useDB(db = getDatabase()) {
         }).where(and(
             inArray(systemPrompt.id, ids),
             eq(systemPrompt.status, 'pending'),
+            generationScope(),
         )).returning({id: systemPrompt.id})
         return rows.length
     }
@@ -243,6 +272,7 @@ export async function useDB(db = getDatabase()) {
             parentSystemPromptId: systemPrompt.parentSystemPromptId,
             generationConfig: systemPrompt.generationConfig,
         }).from(systemPrompt)
+            .where(generationScope())
             .orderBy(desc(systemPrompt.createdAt), desc(systemPrompt.id))
             .limit(limit)
             .offset(offset)
@@ -250,7 +280,7 @@ export async function useDB(db = getDatabase()) {
     }
 
     async function countSystemPrompts() {
-        const [result] = await db.select({value: drizzleSql<number>`count(*)`}).from(systemPrompt)
+        const [result] = await db.select({value: drizzleSql<number>`count(*)`}).from(systemPrompt).where(generationScope())
         return Number(result?.value ?? 0)
     }
 
@@ -269,10 +299,13 @@ export async function useDB(db = getDatabase()) {
             TextPrompt: systemPrompt.TextPrompt,
             serverImages: systemPrompt.serverImages,
             modelImages: systemPrompt.modelImages,
+            organizationId: systemPrompt.organizationId,
+            userId: systemPrompt.userId,
         }).from(systemPrompt).where(and(
             eq(systemPrompt.status, 'pending'),
             lt(systemPrompt.updatedAt, cutoff),
             noLiveLease,
+            generationScope(),
         )).orderBy(systemPrompt.updatedAt, systemPrompt.id).limit(100)
         if (!interrupted.length) return 0
 
@@ -296,11 +329,14 @@ export async function useDB(db = getDatabase()) {
                     eq(systemPrompt.status, 'pending'),
                     lt(systemPrompt.updatedAt, cutoff),
                     noLiveLease,
+                    generationScope(),
                 )).returning({id: systemPrompt.id})
                 if (rows.length === 0) continue
                 reconciled += 1
                 await tx.insert(aiGatewayLog).values({
                     systemPromptId: row.id,
+                    organizationId: row.organizationId,
+                    userId: row.userId,
                     batchId: row.batchId,
                     attemptNumber: 1,
                     status: 'error',
@@ -321,13 +357,14 @@ export async function useDB(db = getDatabase()) {
     }
 
     async function createAiGatewayLog(data: NewAiGatewayLog) {
-        const [row] = await db.insert(aiGatewayLog).values(data).returning()
+        const [row] = await db.insert(aiGatewayLog).values({...data, ...ownershipValues()}).returning()
         if (!row) throw new Error('Database did not return the Gateway log')
         return normalizedTimestamps(row)
     }
 
     async function getAiGatewayLogs(limit = 50) {
         const rows = await db.select().from(aiGatewayLog)
+            .where(logScope())
             .orderBy(desc(aiGatewayLog.createdAt), desc(aiGatewayLog.id))
             .limit(Math.max(1, Math.min(200, limit)))
         return rows.map(normalizedTimestamps)

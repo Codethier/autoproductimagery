@@ -6,14 +6,14 @@ const QuerySchema = z.object({
 })
 
 export default defineEventHandler(async (event) => {
-    useAuth(event)
+    const account = await useAuth(event)
 
     const parsed = QuerySchema.safeParse(getQuery(event))
     if (!parsed.success) {
         throw createError({statusCode: 400, statusMessage: `Invalid query: ${parsed.error.message}`})
     }
 
-    const db = await useDB()
+    const db = await useDB(undefined, account)
     const items = await db.getAiGatewayLogs(parsed.data.limit ?? 50)
     return {ok: true, items}
 })

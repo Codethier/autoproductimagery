@@ -19,6 +19,8 @@
 - Coolify currently uses Railpack 0.23.0. Use explicit Apt package names in `railpack.json`; do not use the `"..."` list-extension syntax from newer Railpack documentation, because this version can pass it literally to `apt-get`. Check configuration compatibility against the deployed Railpack version.
 - ORM/database: Drizzle with PostgreSQL. Runtime code must not fall back to a local SQLite file.
 - Uploaded and generated images live in a private S3-compatible Railway bucket. Runtime file operations must use the storage backend; do not require a local disk or persistent app volume. Keep object keys within the configured prefix and serve images through authenticated endpoints.
+- HTTP image operations must use `useUserFS` with the authenticated account and PostgreSQL asset registry. Raw `useFS` is reserved for authorized internal maintenance/imports. Organization owners administer membership, not other users' private assets or generation history. Sharing is limited to users in the same organization and inherited through logical folder ancestry.
+- Uploaded object URLs are immutable and separate from logical folder names. Delete only exact authorized registered keys; never recursively delete a physical user prefix or infer access from a path prefix. Legacy objects require explicit bootstrap-owner adoption before HTTP access.
 - All AI calls must use Vercel AI SDK through Vercel AI Gateway. Do not add direct provider SDK/API calls.
 - Curated image-model profiles and their runtime schemas live in `schemas/image-generation.ts` and `schemas/catalog-image-models.ts`. Record the catalog audit and exclusions in `docs/image-model-catalog.md`. Exact model IDs and discriminated settings—not names, descriptions, or regex heuristics—must choose adapters and capabilities.
 - All Gateway providers are in scope. Keep an explicit, verified per-model whitelist and record exclusions when a catalog model cannot use uploaded pictures through Gateway or returns unsupported media such as SVG.
@@ -44,7 +46,9 @@
 ## Authentication and request safety
 
 - Never store configured usernames/passwords or other server credentials in client-readable cookies or browser storage.
-- Authenticate through a server endpoint and issue an opaque/signed, expiring `HttpOnly`, `SameSite` session cookie; use `Secure` in production/HTTPS and timing-safe comparisons for secrets/signatures.
+- Authenticate through a server endpoint and issue a random opaque, expiring `HttpOnly`, `SameSite` session cookie backed by a hashed PostgreSQL session row. Use `Secure` in production/HTTPS, salted bounded scrypt password verification, and account-version revocation for password/role/enabled-state changes. The original configured login bootstraps the first organization owner once; it must never bypass an established account password.
+- Scope every generation/history/log/detail/billing read and mutation to authenticated organization and user. Recheck image and mask access before paid work. Keep owner administration scoped to their organization and protect the last enabled owner. Browser mutations require exact same-origin validation.
+- Bind private client cache keys and browser preferences to account identity. Discard asynchronous responses after an account epoch changes and clear other tabs through credential-free notifications without logging out their new session.
 - Parse multipart uploads as bounded streams; enforce request, file-count, per-file, aggregate-byte, and concurrent-upload limits during consumption. Do not reintroduce whole-body multipart parsers for large image uploads.
 - Keep all image reads, writes, listings, and serving confined to the configured S3 prefix. Validate canonical object-key segments, reject traversal/URLs/ambiguous encoding, paginate listings, and bound recursive deletions. Local import tools must resolve real paths and reject symlinks/junctions/reparse points.
 - Determine trusted image MIME/extension from successfully decoded content, not caller filenames or magic prefixes alone. Reject corrupt, truncated, arbitrary ISO-BMFF/video, and unsupported image payloads before storage.
@@ -61,7 +65,7 @@
 
 ## Verification
 
-- Add regression coverage for every model profile and settings discriminator, model switching, mask/source validation, timeouts, limiter overload/recovery, multi-output partial failures, pending-job recovery, auth sessions, upload limits, root confinement, and redacted errors.
+- Add regression coverage for every model profile and settings discriminator, model switching, mask/source validation, timeouts, limiter overload/recovery, multi-output partial failures, pending-job recovery, auth sessions, upload limits, root confinement, and redacted errors. Account and sharing changes require cross-user/cross-organization privacy, revocation, role administration, private history, account switching, immutable replay sources, and bounded exact-key deletion coverage.
 - Before handing off changes, run `npm test`, `npx nuxi typecheck`, `npm run build`, `npx drizzle-kit check`, and `git diff --check` when applicable.
 - Do not make paid generation calls during routine tests.
 

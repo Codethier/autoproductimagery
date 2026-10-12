@@ -17,11 +17,11 @@ export function parseFavouriteModels(raw: string | null): ImageModelId[] {
   }
 }
 
-export function createImageModelFavourites(getStorage: () => FavouriteStorage) {
+export function createImageModelFavourites(getStorage: () => FavouriteStorage, getKey: () => string = () => IMAGE_MODEL_FAVOURITES_KEY) {
   return {
     load(): {ids: ImageModelId[]; persistent: boolean} {
       try {
-        return {ids: parseFavouriteModels(getStorage().getItem(IMAGE_MODEL_FAVOURITES_KEY)), persistent: true}
+        return {ids: parseFavouriteModels(getStorage().getItem(getKey())), persistent: true}
       } catch {
         return {ids: [], persistent: false}
       }
@@ -29,7 +29,7 @@ export function createImageModelFavourites(getStorage: () => FavouriteStorage) {
     toggle(ids: readonly ImageModelId[], id: ImageModelId): {ids: ImageModelId[]; persistent: boolean} {
       const next = ids.includes(id) ? ids.filter(value => value !== id) : [...ids, id]
       try {
-        getStorage().setItem(IMAGE_MODEL_FAVOURITES_KEY, JSON.stringify(next))
+        getStorage().setItem(getKey(), JSON.stringify(next))
         return {ids: next, persistent: true}
       } catch {
         return {ids: next, persistent: false}

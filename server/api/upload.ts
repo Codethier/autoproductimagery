@@ -8,20 +8,22 @@ function clientFilename(value: string | undefined) {
 }
 
 export default defineEventHandler(async (event) => {
-    useAuth(event)
+    const actor = await useAuth(event)
     assertMethod(event, "POST")
 
     return withUploadSlot(async () => {
         const { path: targetPath, files } = await parseStreamingUpload(event)
-        const fs = await useFS()
+        const fs = await useUserFS(actor)
         const saved: string[] = []
+        const savedFiles: import('~~/schemas/image-storage').AssetFile[] = []
         const failed: Array<{ filename: string; reason: string }> = []
 
         for (const file of files) {
             const filename = clientFilename(file.filename)
             try {
-                const name = await fs.saveFile(targetPath, file)
-                saved.push(name)
+                const image = await fs.saveUpload(targetPath, file)
+                saved.push(image.name)
+                savedFiles.push(image)
             } catch (err: any) {
                 const statusCode = Number(err?.statusCode)
                 if (statusCode >= 400 && statusCode < 500) {
@@ -36,6 +38,6 @@ export default defineEventHandler(async (event) => {
             }
         }
 
-        return { saved, failed }
+        return { saved, savedFiles, failed }
     })
 })

@@ -25,6 +25,11 @@ import CatalogImageSettings from './generation-settings/CatalogImageSettings.vue
 
 const props = withDefaults(defineProps<{ mode?: GenerationComposerMode }>(), { mode: 'batch' })
 const data = useDataStore()
+const account = useAccount()
+function accountSnapshot() { return {epoch: account.epoch.value, identity: account.identity.value} }
+function isCurrentAccount(snapshot: ReturnType<typeof accountSnapshot>) {
+  return snapshot.epoch === account.epoch.value && snapshot.identity === account.identity.value
+}
 const sourceImages = computed(() => composerSources(props.mode, data.editSource, data.inputImages))
 const isEdit = computed(() => props.mode === 'edit')
 const hasSources = computed(() => sourceImages.value.length > 0)
@@ -252,9 +257,11 @@ const referenceSummary = computed(() => {
   return `${referenceCount.value}/${selectedProfile.value.maxReferenceImages} references per generation (${inputPart} + ${data.models.length} shared)`
 })
 
-const pastPrompts = useFetch('/api/systemprompts', { deep: true, query: { take: 20 }, key: 'systemPrompts' })
+const pastPrompts = useFetch('/api/systemprompts', {
+  deep: true, query: { take: 20 }, key: computed(() => `systemPrompts:${account.identity.value}:${account.epoch.value}`),
+})
 const gatewayLogs = useFetch<{ ok: boolean; items: AiGatewayLog[] }>('/api/ai-gateway-logs?limit=25', {
-  key: 'aiGatewayLogs',
+  key: computed(() => `aiGatewayLogs:${account.identity.value}:${account.epoch.value}`),
   immediate: false,
   default: () => ({ ok: true, items: [] })
 })
@@ -357,6 +364,20 @@ const historyOpen = ref(false)
 const loadingHistory = ref(false)
 const showMoreHistory = computed(() => displayedHistory.value.length < (pastPrompts.data.value?.count || 0))
 
+watch(account.epoch, () => {
+  errorMsg.value = null
+  additionalHistory.value = []
+  expandedLogIds.value = new Set()
+  debugLogsOpen.value = false
+  historyOpen.value = false
+  loadingHistory.value = false
+  uploading.value = false
+  dragging.value = false
+  pickerOpen.value = false
+  pickerSelection.value = []
+  previewOutput.value = null
+}, {flush: 'sync'})
+
 watch(() => data.editSource, () => {
   previewOutput.value = null
   zoom.value = 1
@@ -423,19 +444,23 @@ async function uploadFiles(files: File[]) {
   }
   uploading.value = true
   errorMsg.value = null
+  const snapshot = accountSnapshot()
   const form = new FormData()
   files.forEach(file => form.append('files', file))
   form.append('path', '/')
   try {
-    const result = await $fetch<{ saved: string[]; failed: Array<{ filename: string; reason: string }> }>('/api/upload', { method: 'POST', body: form })
-    for (const filename of result.saved) chooseSource(`/images/${encodeURIComponent(filename)}`)
+    const result = await $fetch<{ savedFiles: Array<{url: string}>; failed: Array<{ filename: string; reason: string }> }>('/api/upload', { method: 'POST', body: form })
+    if (!isCurrentAccount(snapshot)) return
+    for (const file of result.savedFiles) chooseSource(ImagePathSchema.parse(file.url))
     if (result.failed.length) errorMsg.value = result.failed.map(file => `${file.filename}: ${file.reason}`).join(' ')
     await refreshNuxtData('asset-files')
   } catch (error: any) {
-    errorMsg.value = error?.data?.statusMessage || error?.statusMessage || 'Could not upload the images. Please try again.'
+    if (isCurrentAccount(snapshot)) errorMsg.value = error?.data?.statusMessage || error?.statusMessage || 'Could not upload the images. Please try again.'
   } finally {
-    uploading.value = false
-    if (uploadInput.value) uploadInput.value.value = ''
+    if (isCurrentAccount(snapshot)) {
+      uploading.value = false
+      if (uploadInput.value) uploadInput.value.value = ''
+    }
   }
 }
 
@@ -461,14 +486,15 @@ function adjustZoom(amount: number) { zoom.value = Math.max(0.25, Math.min(2, Ma
 async function loadMoreHistory() {
   if (loadingHistory.value || !showMoreHistory.value) return
   loadingHistory.value = true
+  const snapshot = accountSnapshot()
   const skip = displayedHistory.value.length
   try {
     const page = await $fetch<NonNullable<typeof pastPrompts.data.value>>('/api/systemprompts', { query: { take: 20, skip } })
-    if (displayedHistory.value.length !== skip) return
+    if (!isCurrentAccount(snapshot) || displayedHistory.value.length !== skip) return
     const known = new Set(displayedHistory.value.map(item => item.id))
     additionalHistory.value.push(...page.items.filter(item => !known.has(item.id)))
-  } catch { errorMsg.value = 'Could not load more generation history.' }
-  finally { loadingHistory.value = false }
+  } catch { if (isCurrentAccount(snapshot)) errorMsg.value = 'Could not load more generation history.' }
+  finally { if (isCurrentAccount(snapshot)) loadingHistory.value = false }
 }
 
 const canSubmit = computed(() => hasSources.value && !!prompt.value.trim()
@@ -520,6 +546,7 @@ async function submit() {
   }
 
   errorMsg.value = null
+  const snapshot = accountSnapshot()
   const jobs = requestBody.inputImages.map((source, index): PendingGeneration => ({
     id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${index}`,
     prompt: requestBody.prompt,
@@ -541,6 +568,7 @@ async function submit() {
     const response = await $fetch<{ ok: boolean; obj?: Array<{ outputImage?: string | null; errors?: string | null }> }>('/api/image-generate', {
       method: 'POST', body: requestBody,
     })
+    if (!isCurrentAccount(snapshot)) return
     serverCreatedRows = true
     const failures = response.obj?.filter(row => !!row.errors) || []
     if (failures.length) errorMsg.value = `${failures.length} output${failures.length === 1 ? '' : 's'} failed. ${failures[0]?.errors || ''}`
@@ -552,6 +580,7 @@ async function submit() {
     }
     historyOpen.value = true
   } catch (error: any) {
+    if (!isCurrentAccount(snapshot)) return
     const message = error?.data?.statusMessage || error?.statusMessage || 'Generation failed. Please try again.'
     for (const job of jobs) {
       const retainedJob = pendingGenerations.value.find(item => item.id === job.id)
@@ -559,9 +588,11 @@ async function submit() {
     }
     errorMsg.value = message
   } finally {
-    if (serverCreatedRows) for (const job of jobs) removePendingJob(job.id)
-    await pastPrompts.refresh()
-    if (debugLogsOpen.value) await gatewayLogs.refresh()
+    if (isCurrentAccount(snapshot)) {
+      if (serverCreatedRows) for (const job of jobs) removePendingJob(job.id)
+      await pastPrompts.refresh()
+      if (isCurrentAccount(snapshot) && debugLogsOpen.value) await gatewayLogs.refresh()
+    }
   }
 }
 
@@ -586,9 +617,10 @@ async function submit() {
     <div class="studio-workspace" :class="{ 'studio-workspace--editing': hasSources }">
       <section class="studio-canvas-area" aria-label="Image canvas" @dragover.prevent="dragging = true" @dragleave.prevent="dragging = false" @drop.prevent="onDrop">
         <div v-if="!hasSources" class="studio-start">
+          <div class="studio-start-story"><span class="workspace-eyebrow">{{ isEdit ? 'The editing room' : 'A collection, one direction' }}</span><h2>{{ isEdit ? 'Make room for a new perspective.' : 'Give every image the same creative direction.' }}</h2><p>{{ isEdit ? 'Bring a product photo into the studio. Shape the scene with a prompt and reference images, then explore the result.' : 'Each selected image gets its own generation, with one shared prompt and the same references.' }}</p><span class="studio-start-line" /></div>
           <div class="studio-drop-zone" :class="{ 'studio-drop-zone--dragging': dragging }">
             <span class="studio-upload-symbol"><UIcon :name="isEdit ? 'i-lucide-layers' : 'i-lucide-images'" class="size-10" /></span>
-            <h2>{{ isEdit ? 'Drop a photo to edit' : 'One prompt. Every product image.' }}</h2>
+            <h2>{{ isEdit ? 'Start with a product photo' : 'One prompt. Every product image.' }}</h2>
             <p>{{ isEdit ? 'Upload an image or choose one from your assets to get started.' : 'Upload multiple images. Run the same prompt once for each input, with shared references.' }}</p>
             <div class="studio-upload-actions">
               <UButton icon="i-lucide-upload" :loading="uploading" :disabled="uploading" @click="uploadInput?.click()">Upload {{ isEdit ? 'image' : 'images' }}</UButton>
@@ -735,107 +767,110 @@ async function submit() {
 </template>
 
 <style scoped>
-.generation-studio { color: #ececf0; }
-.studio-route-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; height: 52px; padding: 0 24px; border-bottom: 1px solid #262629; background: #0a0a0b; }
-.studio-route-header h1 { display: flex; align-items: center; gap: 9px; font-size: 13px; font-weight: 600; }
-.studio-route-header > span { color: #73737d; font-size: 11px; }
-.studio-workspace { min-height: calc(100dvh - 108px); }
-.studio-workspace--editing { display: grid; grid-template-columns: minmax(0, 1fr) 358px; border-bottom: 1px solid #262629; }
-.studio-canvas-area { min-width: 0; display: flex; flex-direction: column; background: #111112; position: relative; }
-.generation-studio--empty .studio-canvas-area { background: #0a0a0b; min-height: calc(100dvh - 108px); }
-.studio-start { margin: auto; padding: 64px 28px; width: min(640px, 100%); }
-.studio-drop-zone { border: 1px dashed #38383b; border-radius: 18px; padding: 46px 30px 28px; background: #19191b; text-align: center; transition: border-color 150ms, background 150ms; }
-.studio-drop-zone--dragging, .studio-image-stage--dragging, .studio-batch-grid--dragging { background: #122334; border-color: #168bff; }
-.studio-upload-symbol { display: grid; place-items: center; background: #152333; color: #168bff; width: 78px; height: 78px; border-radius: 18px; margin: 0 auto 24px; }
+.generation-studio { color: var(--workspace-text); }
+.studio-route-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; min-height: 76px; padding: 18px 32px; border-bottom: 1px solid var(--workspace-border); background: var(--workspace-bg); }
+.studio-route-header h1 { display: flex; align-items: center; gap: 9px; font-size: 20px; letter-spacing: -.4px; font-weight: 550; }
+.studio-route-header > span { color: var(--workspace-muted); font-size: 11px; }
+.studio-workspace { min-height: calc(100dvh - 162px); }
+.studio-workspace--editing { display: grid; grid-template-columns: minmax(0, 1fr) 358px; border-bottom: 1px solid var(--workspace-border); }
+.studio-canvas-area { min-width: 0; display: flex; flex-direction: column; background: #211f1b; position: relative; }
+.generation-studio--empty .studio-canvas-area { background: var(--workspace-bg); min-height: calc(100dvh - 162px); }
+.studio-start { margin: auto; padding: 70px 50px; width: min(1180px, 100%); display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 76px; align-items: center; }
+.studio-start-story h2 { font-family: Georgia, serif; font-size: clamp(34px, 3.4vw, 52px); font-weight: 400; letter-spacing: -1.5px; line-height: 1.12; max-width: 470px; margin: 16px 0 22px; }
+.studio-start-story p { font-size: 13px; line-height: 1.9; color: var(--workspace-muted); max-width: 380px; }
+.studio-start-line { display: block; height: 1px; width: 70px; background: var(--workspace-accent); margin-top: 35px; }
+.studio-drop-zone { border: 1px solid #5a5043; border-radius: 24px; padding: 46px 30px 28px; background: #2c2822; text-align: center; transition: border-color 150ms, background 150ms; }
+.studio-drop-zone--dragging, .studio-image-stage--dragging, .studio-batch-grid--dragging { background: #403126; border-color: var(--workspace-accent); }
+.studio-upload-symbol { display: grid; place-items: center; background: #493628; color: var(--workspace-accent); width: 64px; height: 64px; border-radius: 50%; margin: 0 auto 24px; }
 .studio-drop-zone h2 { font-size: 20px; font-weight: 650; margin: 0 0 9px; letter-spacing: -.3px; }
-.studio-drop-zone p { font-size: 13px; color: #86868f; line-height: 1.6; max-width: 420px; margin: 0 auto; }
+.studio-drop-zone p { font-size: 13px; color: var(--workspace-muted); line-height: 1.6; max-width: 420px; margin: 0 auto; }
 .studio-upload-actions { display: flex; justify-content: center; gap: 10px; margin: 24px 0 22px; }
 .studio-file-types { display: flex; justify-content: center; gap: 7px; }
-.studio-file-types span { background: #27272a; color: #94949c; border-radius: 4px; padding: 3px 7px; font-size: 11px; }
-.studio-drop-zone .studio-upload-limits { color: #65656d; font-size: 11px; margin-top: 14px; }
-.studio-recent { padding: 17px 3px 0; }
-.studio-recent > span { display: block; font-size: 12px; color: #8c8c95; margin-bottom: 9px; }
+.studio-file-types span { background: #373127; color: #bfb4a4; border-radius: 4px; padding: 3px 7px; font-size: 11px; }
+.studio-drop-zone .studio-upload-limits { color: #9c9385; font-size: 11px; margin-top: 14px; }
+.studio-recent { padding: 17px 3px 0; grid-column: 1 / -1; max-width: 640px; }
+.studio-recent > span { display: block; font-size: 12px; color: var(--workspace-muted); margin-bottom: 9px; }
 .studio-recent-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 9px; }
-.studio-recent-grid button { border: 1px solid #303034; border-radius: 8px; overflow: hidden; aspect-ratio: 1; background: #1c1c1e; cursor: pointer; }
+.studio-recent-grid button { border: 1px solid var(--workspace-border); border-radius: 8px; overflow: hidden; aspect-ratio: 1; background: var(--workspace-surface); cursor: pointer; }
 .studio-recent-grid img { width: 100%; height: 100%; object-fit: cover; }
-.studio-recent-grid button:hover { border-color: #168bff; }
-.studio-canvas-toolbar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; padding: 15px 22px; border-bottom: 1px solid #252528; min-height: 65px; }
+.studio-recent-grid button:hover { border-color: var(--workspace-accent); }
+.studio-canvas-toolbar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; padding: 15px 22px; border-bottom: 1px solid var(--workspace-border); min-height: 65px; }
 .studio-canvas-toolbar strong { font-size: 14px; font-weight: 600; }
-.studio-source-title { display: flex; align-items: center; gap: 8px; font-size: 12px; min-width: 0; max-width: 46%; color: #b2b2ba; }
+.studio-source-title { display: flex; align-items: center; gap: 8px; font-size: 12px; min-width: 0; max-width: 46%; color: #c0b5a6; }
 .studio-source-title > span:first-of-type { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.studio-result-label { font-size: 10px; color: #74b9ff; background: #10293f; border: 1px solid #174168; border-radius: 4px; padding: 2px 5px; }
+.studio-result-label { font-size: 10px; color: #efbb95; background: #463327; border: 1px solid #77503a; border-radius: 4px; padding: 2px 5px; }
 .studio-toolbar-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .studio-toolbar-description { color: #787880; font-size: 12px; margin-top: 5px; }
-.studio-image-stage { flex: 1; min-height: 480px; max-height: calc(100dvh - 221px); padding: 44px; overflow: auto; display: flex; align-items: center; justify-content: center; position: relative; }
+.studio-image-stage { flex: 1; min-height: 480px; max-height: calc(100dvh - 279px); padding: 44px; overflow: auto; display: flex; align-items: center; justify-content: center; position: relative; }
 .studio-image-sheet { transform-origin: center; background-color: #28282b; background-image: linear-gradient(45deg, #202022 25%, transparent 25%), linear-gradient(-45deg, #202022 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #202022 75%), linear-gradient(-45deg, transparent 75%, #202022 75%); background-size: 20px 20px; background-position: 0 0, 0 10px, 10px -10px, -10px 0; box-shadow: 0 12px 36px #0004; flex-shrink: 0; max-width: 100%; }
-.studio-image-sheet img { display: block; max-width: 100%; max-height: calc(100dvh - 320px); width: auto; height: auto; object-fit: contain; }
+.studio-image-sheet img { display: block; max-width: 100%; max-height: calc(100dvh - 367px); width: auto; height: auto; object-fit: contain; }
 .studio-generating-overlay { position: absolute; bottom: 24px; left: 50%; transform: translateX(-50%); padding: 12px 20px; border: 1px solid #39393f; border-radius: 999px; background: #1c1c1ff2; display: flex; gap: 10px; align-items: center; color: #d8d8df; font-size: 13px; white-space: nowrap; }
-.studio-generating-overlay :first-child { color: #168bff; }
-.studio-canvas-footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 52px; padding: 8px 20px; color: #77777f; font-size: 11px; }
-.studio-zoom-controls { display: flex; align-items: center; background: #1f1f22; border: 1px solid #303034; border-radius: 8px; height: 34px; gap: 7px; }
-.studio-zoom-controls button { display: grid; place-items: center; min-width: 30px; height: 32px; padding: 0 8px; color: #bcbcc5; cursor: pointer; }
+.studio-generating-overlay :first-child { color: var(--workspace-accent); }
+.studio-canvas-footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 52px; padding: 8px 20px; color: var(--workspace-muted); font-size: 11px; }
+.studio-zoom-controls { display: flex; align-items: center; background: var(--workspace-surface); border: 1px solid var(--workspace-border); border-radius: 8px; height: 34px; gap: 7px; }
+.studio-zoom-controls button { display: grid; place-items: center; min-width: 30px; height: 32px; padding: 0 8px; color: #d3c8b9; cursor: pointer; }
 .studio-zoom-controls button:disabled { opacity: .3; cursor: default; }
 .studio-zoom-controls span { width: 40px; text-align: center; }
-.studio-text-button { color: #9696a0; cursor: pointer; }
+.studio-text-button { color: var(--workspace-muted); cursor: pointer; }
 .studio-text-button:hover { color: #f5f5f6; }
 .studio-batch-grid { padding: 26px; display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 18px; align-content: start; flex: 1; }
-.studio-input-card { border: 1px solid #2f2f33; border-radius: 12px; background: #1b1b1d; overflow: hidden; }
-.studio-input-preview { position: relative; aspect-ratio: 1; background: #222225; }
+.studio-input-card { border: 1px solid var(--workspace-border); border-radius: 12px; background: var(--workspace-surface); overflow: hidden; }
+.studio-input-preview { position: relative; aspect-ratio: 1; background: #302b24; }
 .studio-input-preview img { width: 100%; height: 100%; object-fit: contain; }
 .studio-input-number { position: absolute; top: 9px; left: 9px; display: grid; place-items: center; min-width: 23px; height: 23px; border-radius: 6px; color: #d9d9df; background: #111c; font-size: 11px; }
 .studio-input-preview button { position: absolute; top: 9px; right: 9px; padding: 4px; border-radius: 50%; background: #111c; display: grid; place-items: center; cursor: pointer; }
 .studio-input-caption { padding: 12px; display: flex; flex-direction: column; gap: 4px; }
 .studio-input-caption span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
 .studio-input-caption small { color: #7f7f88; font-size: 11px; }
-.studio-add-card { min-height: 215px; border: 1px dashed #37373c; border-radius: 12px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; color: #898993; font-size: 13px; cursor: pointer; }
-.studio-add-card:hover { border-color: #168bff; color: #168bff; }
-.studio-add-card small { color: #65656d; font-size: 11px; }
-.studio-composer { background: #131315; border-left: 1px solid #2a2a2e; display: flex; flex-direction: column; min-width: 0; max-height: calc(100dvh - 52px); position: sticky; top: 52px; align-self: start; height: calc(100dvh - 52px); }
+.studio-add-card { min-height: 215px; border: 1px dashed #5a5043; border-radius: 12px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; color: var(--workspace-muted); font-size: 13px; cursor: pointer; }
+.studio-add-card:hover { border-color: var(--workspace-accent); color: var(--workspace-accent); }
+.studio-add-card small { color: #9c9385; font-size: 11px; }
+.studio-composer { background: var(--workspace-surface); border-left: 1px solid var(--workspace-border); display: flex; flex-direction: column; min-width: 0; max-height: calc(100dvh - 162px); position: sticky; top: 0; align-self: start; height: calc(100dvh - 162px); }
 .studio-composer-scroll { overflow-y: auto; padding: 21px 20px 8px; min-height: 0; }
 .studio-panel-heading { margin-bottom: 22px; }
 .studio-panel-heading h2 { font-size: 15px; font-weight: 650; margin: 0 0 4px; }
-.studio-panel-heading span { font-size: 11px; color: #74747d; }
+.studio-panel-heading span { font-size: 11px; color: var(--workspace-muted); }
 .studio-control-group { margin-bottom: 20px; }
-.studio-control-group label, .studio-prompt-composer > label { display: block; font-size: 12px; font-weight: 500; margin-bottom: 9px; color: #cccdd3; }
+.studio-control-group label, .studio-prompt-composer > label { display: block; font-size: 12px; font-weight: 500; margin-bottom: 9px; color: #e2d8c9; }
 .studio-model-row { display: flex; align-items: center; gap: 3px; }
-.studio-model-meta { display: flex; gap: 8px; margin-top: 7px; color: #8a8a93; font-size: 10px; align-items: center; }
-.studio-optional { color: #65656f; margin-left: 4px; font-weight: 400; font-size: 11px; }
-.studio-settings { border-top: 1px solid #2a2a2e; border-bottom: 1px solid #2a2a2e; margin-bottom: 20px; }
-.studio-settings summary, .studio-model-details summary { display: flex; justify-content: space-between; align-items: center; padding: 14px 0; cursor: pointer; font-size: 12px; list-style: none; color: #b2b2bd; }
+.studio-model-meta { display: flex; gap: 8px; margin-top: 7px; color: var(--workspace-muted); font-size: 10px; align-items: center; }
+.studio-optional { color: #8c8273; margin-left: 4px; font-weight: 400; font-size: 11px; }
+.studio-settings { border-top: 1px solid var(--workspace-border); border-bottom: 1px solid var(--workspace-border); margin-bottom: 20px; }
+.studio-settings summary, .studio-model-details summary { display: flex; justify-content: space-between; align-items: center; padding: 14px 0; cursor: pointer; font-size: 12px; list-style: none; color: #c7bcaa; }
 .studio-settings summary::-webkit-details-marker, .studio-model-details summary::-webkit-details-marker, .studio-history summary::-webkit-details-marker { display: none; }
-.studio-settings summary :last-child { color: #686871; }
+.studio-settings summary :last-child { color: #998e7e; }
 .studio-settings-body { padding: 0 0 18px; }
-.studio-settings-reset { display: flex; justify-content: space-between; color: #777781; font-size: 10px; margin-bottom: 10px; }
-.studio-settings-reset button, .studio-group-title > button { color: #92929d; cursor: pointer; font-size: 11px; }
-.studio-settings-reset button:hover, .studio-group-title > button:hover { color: #168bff; }
+.studio-settings-reset { display: flex; justify-content: space-between; color: var(--workspace-muted); font-size: 10px; margin-bottom: 10px; }
+.studio-settings-reset button, .studio-group-title > button { color: var(--workspace-muted); cursor: pointer; font-size: 11px; }
+.studio-settings-reset button:hover, .studio-group-title > button:hover { color: var(--workspace-accent); }
 .studio-settings-body :deep(.grid) { grid-template-columns: minmax(0, 1fr); }
-.studio-settings-body :deep(label) { color: #9c9ca7; font-size: 11px; }
+.studio-settings-body :deep(label) { color: #baae9c; font-size: 11px; }
 .studio-settings-body :deep(.setting-input) { font-size: 12px; padding: 8px 10px; }
 .studio-group-title { display: flex; justify-content: space-between; align-items: start; gap: 8px; }
 .studio-reference-thumbnails { display: flex; flex-wrap: wrap; gap: 8px; }
-.studio-reference-thumb, .studio-reference-add { width: 58px; height: 64px; border-radius: 8px; border: 1px solid #313137; overflow: hidden; background: #202023; position: relative; }
+.studio-reference-thumb, .studio-reference-add { width: 58px; height: 64px; border-radius: 8px; border: 1px solid var(--workspace-border); overflow: hidden; background: var(--workspace-surface-raised); position: relative; }
 .studio-reference-thumb img { width: 100%; height: 100%; object-fit: cover; }
 .studio-reference-thumb button { position: absolute; top: 3px; right: 3px; border-radius: 50%; background: #000a; padding: 2px; display: grid; place-items: center; cursor: pointer; }
-.studio-reference-add { border-style: dashed; display: grid; place-items: center; color: #72727d; cursor: pointer; }
-.studio-reference-add:hover { border-color: #168bff; color: #168bff; }
-.studio-help, .studio-notice { font-size: 11px; line-height: 1.6; color: #777782; margin-top: 8px; }
+.studio-reference-add { border-style: dashed; display: grid; place-items: center; color: #aea18e; cursor: pointer; }
+.studio-reference-add:hover { border-color: var(--workspace-accent); color: var(--workspace-accent); }
+.studio-help, .studio-notice { font-size: 11px; line-height: 1.6; color: var(--workspace-muted); margin-top: 8px; }
 .studio-notice { color: #b6a270; }
-.studio-mask-picker { width: 100%; display: flex; align-items: center; gap: 10px; padding: 9px; border: 1px solid #303036; border-radius: 8px; color: #92929d; font-size: 11px; text-align: left; cursor: pointer; }
+.studio-mask-picker { width: 100%; display: flex; align-items: center; gap: 10px; padding: 9px; border: 1px solid var(--workspace-border); border-radius: 8px; color: var(--workspace-muted); font-size: 11px; text-align: left; cursor: pointer; }
 .studio-mask-picker > img { width: 32px; height: 32px; object-fit: contain; }
 .studio-mask-picker > span { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; }
 .studio-validation { margin: 10px 0; color: #f6a6a6; font-size: 11px; line-height: 1.6; }
-.studio-model-details { border-top: 1px solid #29292e; margin-top: 15px; }
-.studio-details-body { font-size: 11px; color: #8b8b96; line-height: 1.65; padding-bottom: 12px; }
+.studio-model-details { border-top: 1px solid var(--workspace-border); margin-top: 15px; }
+.studio-details-body { font-size: 11px; color: var(--workspace-muted); line-height: 1.65; padding-bottom: 12px; }
 .studio-details-body p { margin-top: 9px; }
-.studio-details-body code { display: block; overflow-wrap: anywhere; font-size: 10px; margin-top: 8px; color: #686873; }
-.studio-prompt-composer { margin-top: auto; padding: 18px 20px 16px; border-top: 1px solid #2a2a2f; background: #171719; }
+.studio-details-body code { display: block; overflow-wrap: anywhere; font-size: 10px; margin-top: 8px; color: #998e7e; }
+.studio-prompt-composer { margin-top: auto; padding: 18px 20px 16px; border-top: 1px solid var(--workspace-border); background: var(--workspace-surface); }
 .studio-generate-button { width: 100%; display: flex; justify-content: center; margin-top: 12px; min-height: 39px; }
 .studio-submit-preferences { margin-top: 11px; font-size: 11px; }
-.studio-submit-preferences :deep(label) { font-size: 11px; color: #7d7d88; }
+.studio-submit-preferences :deep(label) { font-size: 11px; color: var(--workspace-muted); }
 .studio-error { display: flex; align-items: start; gap: 9px; margin: 16px 24px; padding: 12px 14px; background: #2d1919; border: 1px solid #643333; border-radius: 8px; color: #f2b2b2; font-size: 12px; line-height: 1.6; }
 .studio-error > span { flex: 1; }
 .studio-error button { cursor: pointer; color: #c28080; }
-.studio-pending { padding: 22px 26px; border-top: 1px solid #28282c; }
+.studio-pending { padding: 22px 26px; border-top: 1px solid var(--workspace-border); }
 .studio-section-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
 .studio-section-heading h2 { font-size: 13px; font-weight: 550; }
 .studio-pending-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 12px; }
@@ -843,18 +878,18 @@ async function submit() {
 .studio-pending-card > img { width: 70px; height: 75px; object-fit: contain; border-radius: 5px; background: #232327; }
 .studio-pending-card > div { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; font-size: 12px; }
 .studio-pending-card strong { font-weight: 500; }
-.studio-pending-card span { color: #8b8b96; font-size: 11px; }
+.studio-pending-card span { color: var(--workspace-muted); font-size: 11px; }
 .studio-pending-card p { width: 100%; color: #e99c9c; font-size: 11px; }
-.studio-history { border-top: 1px solid #26262b; margin: 0 26px; }
-.studio-history > summary { padding: 19px 0; display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: #9595a0; list-style: none; cursor: pointer; }
-.studio-history-count { margin-left: 6px; background: #26262b; padding: 2px 6px; border-radius: 5px; font-size: 10px; }
+.studio-history { border-top: 1px solid var(--workspace-border); margin: 0 26px; }
+.studio-history > summary { padding: 19px 0; display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: var(--workspace-muted); list-style: none; cursor: pointer; }
+.studio-history-count { margin-left: 6px; background: var(--workspace-border); padding: 2px 6px; border-radius: 5px; font-size: 10px; }
 .studio-history-content { padding-bottom: 24px; }
 .studio-history-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 16px; margin-bottom: 18px; }
 .studio-debug-toggle { display: flex; justify-content: end; padding: 0 26px 15px; }
-.studio-debug-toggle button { display: flex; align-items: center; gap: 6px; font-size: 10px; color: #62626c; cursor: pointer; }
-.studio-diagnostics { margin: 10px 26px 30px; padding: 18px; background: #151517; border: 1px solid #303034; border-radius: 10px; }
+.studio-debug-toggle button { display: flex; align-items: center; gap: 6px; font-size: 10px; color: #8c8273; cursor: pointer; }
+.studio-diagnostics { margin: 10px 26px 30px; padding: 18px; background: #151517; border: 1px solid var(--workspace-border); border-radius: 10px; }
 .studio-log { border-top: 1px solid #2d2d33; }
-.studio-log-summary { width: 100%; display: flex; gap: 10px; justify-content: space-between; align-items: center; text-align: left; font-size: 11px; color: #9595a0; padding: 12px 0; cursor: pointer; }
+.studio-log-summary { width: 100%; display: flex; gap: 10px; justify-content: space-between; align-items: center; text-align: left; font-size: 11px; color: var(--workspace-muted); padding: 12px 0; cursor: pointer; }
 .studio-log-summary > span:nth-child(2) { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .studio-log-body { padding-bottom: 20px; font-size: 11px; color: #9999a6; }
 .studio-log-body p { margin-bottom: 10px; }
@@ -863,5 +898,5 @@ async function submit() {
 .studio-log-json pre { background: #09090b; border: 1px solid #27272e; border-radius: 6px; padding: 12px; max-height: 340px; overflow: auto; font-size: 10px; line-height: 1.6; }
 @media (min-width: 1500px) { .studio-workspace--editing { grid-template-columns: minmax(0, 1fr) 380px; } }
 @media (max-width: 1100px) { .studio-workspace--editing { grid-template-columns: minmax(0, 1fr) 320px; } .studio-canvas-toolbar { padding: 12px; } .studio-source-title { max-width: 100%; } .studio-image-stage { padding: 24px; } .studio-composer-scroll, .studio-prompt-composer { padding-left: 16px; padding-right: 16px; } .studio-batch-grid { padding: 18px; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 12px; } }
-@media (max-width: 760px) { .studio-workspace--editing { display: flex; flex-direction: column; } .studio-composer { position: static; height: auto; max-height: none; border-left: none; border-top: 1px solid #2a2a2f; } .studio-composer-scroll { overflow: visible; } .studio-image-stage { min-height: 320px; max-height: 520px; padding: 26px; } .studio-image-sheet img { max-height: 440px; } .studio-canvas-footer { flex-wrap: wrap; } .studio-start { padding: 36px 18px; } .studio-drop-zone { padding: 30px 18px 22px; } .studio-drop-zone h2 { font-size: 18px; } .studio-recent-grid { gap: 6px; } .studio-log-json { grid-template-columns: minmax(0, 1fr); } .studio-log-summary { flex-wrap: wrap; } .studio-history, .studio-diagnostics { margin-left: 16px; margin-right: 16px; } }
+@media (max-width: 760px) { .studio-workspace--editing { display: flex; flex-direction: column; } .studio-composer { position: static; height: auto; max-height: none; border-left: none; border-top: 1px solid var(--workspace-border); } .studio-composer-scroll { overflow: visible; } .studio-image-stage { min-height: 320px; max-height: 520px; padding: 26px; } .studio-image-sheet img { max-height: 440px; } .studio-canvas-footer { flex-wrap: wrap; } .studio-start { padding: 40px 22px; grid-template-columns: minmax(0, 1fr); gap: 28px; } .studio-start-story h2 { font-size: 36px; max-width: 430px; } .studio-start-line { display: none; } .studio-drop-zone { padding: 30px 18px 22px; } .studio-drop-zone h2 { font-size: 18px; } .studio-recent-grid { gap: 6px; } .studio-log-json { grid-template-columns: minmax(0, 1fr); } .studio-log-summary { flex-wrap: wrap; } .studio-history, .studio-diagnostics { margin-left: 16px; margin-right: 16px; } }
 </style>

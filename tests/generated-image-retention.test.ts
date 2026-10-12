@@ -6,7 +6,7 @@ import {Pool} from "pg"
 import {drizzle} from "drizzle-orm/node-postgres"
 import {migrate} from "drizzle-orm/node-postgres/migrator"
 import {eq} from "drizzle-orm"
-import {systemPrompt, type NewSystemPrompt} from "../server/db/schema.ts"
+import {systemPrompt, organizations, users, assets, assetShares, type NewSystemPrompt} from "../server/db/schema.ts"
 import {getDatabasePoolConfig} from "../server/utils/lib/db.ts"
 import {useDB} from "../server/utils/useDB.ts"
 import {
@@ -14,6 +14,7 @@ import {
     parseRetentionDays,
     runGeneratedImageRetention,
 } from "../server/utils/generatedImageRetention.ts"
+import {createAssetRepository, type AssetActor} from '../server/utils/assetAccess.ts'
 
 const NOW = new Date("2026-10-12T12:00:00.000Z")
 const DAY_MS = 86_400_000
@@ -38,6 +39,16 @@ test("retention only recognizes canonical immutable generated output URLs", () =
         valid.replace("/images/", ""), valid + "?download=1", valid + "/", valid.replace("img-", "%69mg-"),
         "/images/output/../product.png", "/images/output/product.png", "/images/output/"]) {
         assert.equal(isRetentionManagedImageUrl(path), false, path)
+    }
+})
+
+test('retention recognizes canonical organization/user output namespaces and rejects ambiguous or uploaded object paths', () => {
+    const org = randomUUID(), user = randomUUID()
+    const scoped = output().replace('/images/output/', `/images/organizations/${org}/users/${user}/output/`)
+    assert.equal(isRetentionManagedImageUrl(scoped), true)
+    for (const value of [scoped.replace('/organizations/', '/teams/'), scoped.replace(org, 'wrong-org'), scoped.replace(user, '../other'),
+        scoped.replace('/output/', '/objects/'), scoped + '?download=1', scoped.replace('organizations', '%6frganizations')]) {
+        assert.equal(isRetentionManagedImageUrl(value), false)
     }
 })
 
@@ -210,5 +221,58 @@ test("keyset pages filter unsafe and shared paths before the row budget, preserv
         assert.deepEqual(deleted, valid.map(row => row.outputImage))
         const remaining = await db.select().from(systemPrompt)
         assert.equal(remaining.filter(row => row.outputImageDeletedAt === null).length, 103)
+    })
+})
+
+test('organization retention requires matching generated registry ownership, preserves uploads and mismatches, and expires shared asset access', integration, async () => {
+    await isolatedDatabase(async (pool, db) => {
+        const org = randomUUID(), otherOrg = randomUUID(), aliceId = randomUUID(), bobId = randomUUID(), outsiderId = randomUUID()
+        await db.insert(organizations).values([{id: org, name: 'Studio'}, {id: otherOrg, name: 'Other studio'}])
+        await db.insert(users).values([
+            {id: aliceId, organizationId: org, username: 'alice', normalizedUsername: 'alice', displayName: 'Alice', role: 'owner', passwordHash: 'unused-test-hash'},
+            {id: bobId, organizationId: org, username: 'bob', normalizedUsername: 'bob', displayName: 'Bob', role: 'user', passwordHash: 'unused-test-hash'},
+            {id: outsiderId, organizationId: otherOrg, username: 'outsider', normalizedUsername: 'outsider', displayName: 'Outsider', role: 'owner', passwordHash: 'unused-test-hash'},
+        ])
+        const scoped = () => output().replace('/images/output/', `/images/organizations/${org}/users/${aliceId}/output/`)
+        const entries = [
+            {name: 'Shared generated', url: scoped(), category: 'generated' as const, owner: aliceId, organization: org, historyOwner: aliceId},
+            {name: 'Upload resembling output', url: scoped(), category: 'uploaded' as const, owner: aliceId, organization: org, historyOwner: aliceId},
+            {name: 'Registry owner mismatch', url: scoped(), category: 'generated' as const, owner: bobId, organization: org, historyOwner: aliceId},
+            {name: 'History owner mismatch', url: scoped(), category: 'generated' as const, owner: aliceId, organization: org, historyOwner: bobId},
+            {name: 'Organization mismatch', url: scoped(), category: 'generated' as const, owner: outsiderId, organization: otherOrg, historyOwner: aliceId},
+            {name: 'Scoped but unregistered', url: scoped(), category: 'generated' as const, owner: aliceId, organization: org, historyOwner: aliceId, unregistered: true},
+            {name: 'Legacy generated owner mismatch', url: output(), category: 'generated' as const, owner: bobId, organization: org, historyOwner: aliceId},
+            {name: 'Legacy registered upload', url: output(), category: 'uploaded' as const, owner: aliceId, organization: org, historyOwner: aliceId},
+            {name: 'Legacy registered generation', url: output(), category: 'generated' as const, owner: aliceId, organization: org, historyOwner: aliceId},
+            {name: 'Legacy unregistered generation', url: output(), category: 'generated' as const, owner: aliceId, organization: org, historyOwner: aliceId, unregistered: true},
+        ]
+        const registered = await db.insert(assets).values(entries.filter(entry => !entry.unregistered).map(entry => ({id: randomUUID(),
+            organizationId: entry.organization, ownerUserId: entry.owner, createdByUserId: entry.owner, name: entry.name,
+            url: entry.url, kind: 'file' as const, category: entry.category, mimeType: 'image/png', byteSize: 42, width: 4, height: 3}))).returning()
+        const sharedAsset = registered.find(row => row.url === entries[0]!.url)!
+        await db.insert(assetShares).values({id: randomUUID(), assetId: sharedAsset.id, organizationId: org, sharedByUserId: aliceId, recipientUserId: bobId, permission: 'view'})
+        const bob: AssetActor = {organizationId: org, userId: bobId, username: 'bob', displayName: 'Bob', role: 'user'}
+        const repository = createAssetRepository(bob, db)
+        assert.equal((await repository.requireAsset(sharedAsset.url)).permissions.view, true)
+        const history = await db.insert(systemPrompt).values(entries.map(entry => ({TextPrompt: entry.name, outputImage: entry.url,
+            organizationId: org, userId: entry.historyOwner, createdAt: age(200), status: 'succeeded' as const, priceUsd: '0.02'}))).returning()
+        const deleted: string[] = []
+        const result = await runGeneratedImageRetention({pool, storage: {removeGeneratedImage: async url => {deleted.push(url)}}, retentionDays: 180, now: NOW})
+        assert.equal(result.failed, 0)
+        assert.deepEqual(new Set(deleted), new Set([entries[0]!.url, entries[8]!.url, entries[9]!.url]))
+        assert.equal(result.deleted, 3)
+        const stored = await db.select().from(assets)
+        const expired = stored.find(row => row.id === sharedAsset.id)!
+        assert.equal(new Date(expired.deletedAt!).toISOString(), NOW.toISOString())
+        await assert.rejects(repository.requireAsset(sharedAsset.url), error => Boolean(error && typeof error === 'object' && 'statusCode' in error && error.statusCode === 404))
+        for (const entry of entries.slice(1, 8)) {
+            const row = stored.find(row => row.url === entry.url)
+            if (row) assert.equal(row.deletedAt, null, entry.name)
+            const generation = await db.select().from(systemPrompt).where(eq(systemPrompt.id, history.find(item => item.outputImage === entry.url)!.id))
+            assert.equal(generation[0]!.outputImageDeletedAt, null, entry.name)
+        }
+        const keptHistory = await db.select().from(systemPrompt).where(eq(systemPrompt.id, history[0]!.id))
+        assert.equal(keptHistory[0]!.priceUsd, '0.02')
+        assert.equal(keptHistory[0]!.outputImage, sharedAsset.url)
     })
 })

@@ -35,7 +35,14 @@ type SystemPrompt = {
 }
 
 const props = defineProps<{ data: SystemPrompt }>()
-const historyData = useNuxtData<{items?: SystemPrompt[]}>('systemPrompts')
+const account = useAccount()
+// A history card belongs to the account that created this component. Do not
+// rebind old replay data to a new session when the browser changes accounts.
+const cardAccount = {identity: account.identity.value, epoch: account.epoch.value}
+const cardIsCurrent = computed(() => !!cardAccount.identity
+  && cardAccount.identity === account.identity.value && cardAccount.epoch === account.epoch.value)
+const historyKey = `systemPrompts:${cardAccount.identity}:${cardAccount.epoch}`
+const historyData = useNuxtData<{items?: SystemPrompt[]}>(historyKey)
 const detailData = ref<SystemPrompt | null>(null)
 const detailLoading = ref(false)
 const detailLoaded = ref(false)
@@ -131,20 +138,22 @@ const toast = useToast()
 const billingLoading = ref(false)
 
 async function loadOutputDetails() {
-  if (detailLoading.value || detailLoaded.value) return
+  if (!cardIsCurrent.value || detailLoading.value || detailLoaded.value) return
   detailLoading.value = true
   try {
     const response = await $fetch<{ok: true; item: SystemPrompt}>(`/api/systemprompts/${props.data.id}`)
+    if (!cardIsCurrent.value) return
     detailData.value = response.item
     detailLoaded.value = true
   } catch (error: any) {
+    if (!cardIsCurrent.value) return
     toast.add({
       title: 'Could not load output details',
       description: error?.data?.statusMessage || error?.message || 'Try again later.',
       color: 'warning',
     })
   } finally {
-    detailLoading.value = false
+    if (cardIsCurrent.value) detailLoading.value = false
   }
 }
 
@@ -157,16 +166,23 @@ const outputImageDeletedAt = computed(() => props.data?.outputImageDeletedAt
   ? new Date(props.data.outputImageDeletedAt).toLocaleString()
   : '')
 
+watch(cardIsCurrent, current => {
+  if (current) return
+  currentImage.value = null
+  detailData.value = null
+  chatInput.value = ''
+}, {flush: 'sync'})
+
 watch(
   () => [props.data?.outputImage, props.data?.outputImageDeletedAt] as const,
   ([image, deletedAt]) => {
-    if (!regenLoading.value) currentImage.value = deletedAt ? null : image || null
+    if (cardIsCurrent.value && !regenLoading.value) currentImage.value = deletedAt ? null : image || null
   }
 )
 
 async function sendRefine() {
   const text = chatInput.value.trim()
-  if (!text || chatLoading.value) return
+  if (!cardIsCurrent.value || !text || chatLoading.value) return
   if (!currentImage.value) {
     toast.add({
       title: 'No image to refine',
@@ -200,35 +216,38 @@ async function sendRefine() {
         parentSystemPromptId: props.data.id,
       },
     })
+    if (!cardIsCurrent.value) return
     const row = res?.obj?.[0]
     if (row?.outputImage && !row.errors) {
       toast.add({ title: 'Refinement created' })
-      await refreshNuxtData('systemPrompts')
+      await refreshNuxtData(historyKey)
     } else {
       toast.add({ title: 'Refinement failed', description: row?.errors || 'Unknown error', color: 'warning' })
     }
   } catch (e: any) {
-    toast.add({ title: 'Refinement failed', description: e?.data?.statusMessage || e?.message || 'Request failed', color: 'warning' })
+    if (cardIsCurrent.value) toast.add({ title: 'Refinement failed', description: e?.data?.statusMessage || e?.message || 'Request failed', color: 'warning' })
   } finally {
-    chatLoading.value = false
+    if (cardIsCurrent.value) chatLoading.value = false
   }
 }
 
 async function refreshBilling() {
-  if (billingLoading.value || !props.data?.id) return
+  if (!cardIsCurrent.value || billingLoading.value || !props.data?.id) return
   billingLoading.value = true
   try {
     await $fetch(`/api/systemprompts/${props.data.id}/billing-refresh`, { method: 'POST' })
+    if (!cardIsCurrent.value) return
     toast.add({ title: 'Cost refreshed' })
-    await refreshNuxtData('systemPrompts')
+    await refreshNuxtData(historyKey)
   } catch (e: any) {
+    if (!cardIsCurrent.value) return
     toast.add({
       title: 'Cost unavailable',
       description: e?.data?.statusMessage || e?.message || 'Gateway billing is not ready yet.',
       color: 'warning'
     })
   } finally {
-    billingLoading.value = false
+    if (cardIsCurrent.value) billingLoading.value = false
   }
 }
 
@@ -240,7 +259,7 @@ function onChatKeydown(e: KeyboardEvent) {
 }
 
 async function regenerate() {
-  if (regenLoading.value) return
+  if (!cardIsCurrent.value || regenLoading.value) return
   try {
     regenLoading.value = true
     const storedInputImages = Array.isArray(props.data?.serverImages) ? props.data.serverImages : []
@@ -262,6 +281,7 @@ async function regenerate() {
       if (!parent?.outputImage) {
         const response = await $fetch<{ok: true; item: SystemPrompt}>(`/api/systemprompts/${props.data.parentSystemPromptId}`)
           .catch(() => undefined)
+        if (!cardIsCurrent.value) return
         parent = response?.item
       }
       if (!parent?.outputImage || parent.outputImageDeletedAt) {
@@ -283,7 +303,7 @@ async function regenerate() {
     // Ask the user to edit/confirm the prompt before regenerating
     const currentPrompt = props.data?.TextPrompt || ''
     const editedPrompt = typeof window !== 'undefined' ? window.prompt('Edit prompt before regenerating:', currentPrompt) : currentPrompt
-    if (editedPrompt === null) {
+    if (!cardIsCurrent.value || editedPrompt === null) {
       // User cancelled
       return
     }
@@ -292,6 +312,7 @@ async function regenerate() {
 
     // Run the job count times
     for (let i = 0; i < count; i++) {
+      if (!cardIsCurrent.value) return
       const res = await $fetch<{ ok: boolean; obj: SystemPrompt[] }>('/api/image-generate', {
         method: 'POST',
         body: {
@@ -305,6 +326,7 @@ async function regenerate() {
           parentSystemPromptId: props.data.id,
         }
       })
+      if (!cardIsCurrent.value) return
       const row = res?.obj?.[0]
       if (row?.outputImage && !row.errors) {
         currentImage.value = row.outputImage
@@ -315,21 +337,24 @@ async function regenerate() {
 
     toast.add({ title: 'Regeneration started', description: `Created ${count} job${count > 1 ? 's' : ''}.` })
   } catch (e: any) {
-    console.error(e)
+    if (!cardIsCurrent.value) return
     toast.add({
       title: 'Regeneration failed',
       description: e?.data?.statusMessage || e?.statusMessage || e?.message || 'Request failed',
       color: 'warning',
     })
   } finally {
-    await refreshNuxtData('systemPrompts')
-    regenLoading.value = false
+    if (cardIsCurrent.value) {
+      await refreshNuxtData(historyKey)
+      if (cardIsCurrent.value) regenLoading.value = false
+    }
   }
 }
 </script>
 
 <template>
   <div
+    v-if="cardIsCurrent"
     class="group relative overflow-hidden rounded-xl border border-gray-200 dark:border-gray-800 bg-white/70 dark:bg-gray-900/50 shadow-sm hover:shadow-lg transition-all duration-200"
   >
     <div v-if="currentImage" class="relative">

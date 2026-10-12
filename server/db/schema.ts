@@ -1,4 +1,4 @@
-import {pgTable, serial, integer, text, jsonb, timestamp, uuid, index} from "drizzle-orm/pg-core";
+import {pgTable, serial, integer, text, jsonb, timestamp, uuid, index, uniqueIndex, boolean, bigint, check, type AnyPgColumn} from "drizzle-orm/pg-core";
 import {sql} from "drizzle-orm";
 import type {
     OutputMetadata,
@@ -6,8 +6,89 @@ import type {
     StoredGenerationError,
 } from "~~/schemas/image-generation";
 
+export const organizations = pgTable('organization', {
+    id: uuid('id').primaryKey(),
+    name: text('name').notNull(),
+    isBootstrap: boolean('is_bootstrap').default(false).notNull(),
+    createdAt: timestamp('created_at', {mode: 'string', withTimezone: true}).defaultNow().notNull(),
+}, table => [uniqueIndex('organization_bootstrap_unique').on(table.isBootstrap).where(sql`${table.isBootstrap} = true`)]);
+
+export const users = pgTable('app_user', {
+    id: uuid('id').primaryKey(),
+    organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+    username: text('username').notNull(),
+    normalizedUsername: text('normalized_username').notNull(),
+    displayName: text('display_name').notNull(),
+    passwordHash: text('password_hash').notNull(),
+    role: text('role').$type<'owner' | 'user'>().notNull(),
+    isBootstrapOwner: boolean('is_bootstrap_owner').default(false).notNull(),
+    disabledAt: timestamp('disabled_at', {mode: 'string', withTimezone: true}),
+    authVersion: integer('auth_version').default(1).notNull(),
+    createdAt: timestamp('created_at', {mode: 'string', withTimezone: true}).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', {mode: 'string', withTimezone: true}).defaultNow().notNull(),
+}, table => [
+    uniqueIndex('app_user_username_unique').on(table.normalizedUsername),
+    uniqueIndex('app_user_bootstrap_unique').on(table.isBootstrapOwner).where(sql`${table.isBootstrapOwner} = true`),
+    index('app_user_organization_idx').on(table.organizationId, table.createdAt, table.id),
+    check('app_user_role_check', sql`${table.role} IN ('owner', 'user')`),
+]);
+
+export const accountSessions = pgTable('account_session', {
+    id: uuid('id').primaryKey(),
+    userId: uuid('user_id').notNull().references(() => users.id, {onDelete: 'cascade'}),
+    tokenHash: text('token_hash').notNull(),
+    authVersion: integer('auth_version').notNull(),
+    expiresAt: timestamp('expires_at', {mode: 'string', withTimezone: true}).notNull(),
+    createdAt: timestamp('created_at', {mode: 'string', withTimezone: true}).defaultNow().notNull(),
+}, table => [
+    uniqueIndex('account_session_token_unique').on(table.tokenHash),
+    index('account_session_user_idx').on(table.userId),
+    index('account_session_expiry_idx').on(table.expiresAt),
+]);
+
+export const assets = pgTable('asset', {
+    id: uuid('id').primaryKey(),
+    organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+    ownerUserId: uuid('owner_user_id').notNull().references(() => users.id),
+    createdByUserId: uuid('created_by_user_id').notNull().references(() => users.id),
+    parentId: uuid('parent_id').references((): AnyPgColumn => assets.id),
+    name: text('name').notNull(),
+    kind: text('kind').$type<'file' | 'folder'>().notNull(),
+    url: text('url').notNull(),
+    category: text('category').$type<'uploaded' | 'generated'>().default('uploaded').notNull(),
+    byteSize: bigint('byte_size', {mode: 'number'}),
+    mimeType: text('mime_type'),
+    width: integer('width'),
+    height: integer('height'),
+    deletedAt: timestamp('deleted_at', {mode: 'string', withTimezone: true}),
+    createdAt: timestamp('created_at', {mode: 'string', withTimezone: true}).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', {mode: 'string', withTimezone: true}).defaultNow().notNull(),
+}, table => [
+    uniqueIndex('asset_url_unique').on(table.url).where(sql`${table.deletedAt} IS NULL`),
+    index('asset_owner_parent_idx').on(table.organizationId, table.ownerUserId, table.parentId, table.name),
+    index('asset_parent_idx').on(table.parentId),
+    check('asset_kind_check', sql`${table.kind} IN ('file', 'folder')`),
+    check('asset_category_check', sql`${table.category} IN ('uploaded', 'generated')`),
+]);
+
+export const assetShares = pgTable('asset_share', {
+    id: uuid('id').primaryKey(),
+    assetId: uuid('asset_id').notNull().references(() => assets.id, {onDelete: 'cascade'}),
+    organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+    sharedByUserId: uuid('shared_by_user_id').notNull().references(() => users.id),
+    recipientUserId: uuid('recipient_user_id').notNull().references(() => users.id),
+    permission: text('permission').$type<'view' | 'edit'>().notNull(),
+    createdAt: timestamp('created_at', {mode: 'string', withTimezone: true}).defaultNow().notNull(),
+}, table => [
+    uniqueIndex('asset_share_recipient_unique').on(table.assetId, table.recipientUserId),
+    index('asset_share_org_recipient_idx').on(table.organizationId, table.recipientUserId),
+    check('asset_share_permission_check', sql`${table.permission} IN ('view', 'edit')`),
+]);
+
 export const systemPrompt = pgTable("systemPrompt", {
     id: serial("id").primaryKey(),
+    organizationId: uuid('organizationId').references(() => organizations.id),
+    userId: uuid('userId').references(() => users.id),
     TextPrompt: text("TextPrompt").notNull(),
     serverImages: jsonb("serverImages").$type<string[]>(),
     modelImages: jsonb("modelImages").$type<string[]>(),
@@ -33,6 +114,7 @@ export const systemPrompt = pgTable("systemPrompt", {
     outputMetadata: jsonb("outputMetadata").$type<OutputMetadata>(),
     errorJson: jsonb("errorJson").$type<StoredGenerationError>(),
 }, (table) => [
+    index('systemPrompt_user_history_idx').on(table.organizationId, table.userId, table.createdAt, table.id),
     index("systemPrompt_batchId_idx").on(table.batchId),
     index("systemPrompt_parentSystemPromptId_idx").on(table.parentSystemPromptId),
     index("systemPrompt_status_updatedAt_idx").on(table.status, table.updatedAt),
@@ -42,6 +124,8 @@ export const systemPrompt = pgTable("systemPrompt", {
 
 export const aiGatewayLog = pgTable("aiGatewayLog", {
     id: serial("id").primaryKey(),
+    organizationId: uuid('organizationId').references(() => organizations.id),
+    userId: uuid('userId').references(() => users.id),
     systemPromptId: integer("systemPromptId"),
     status: text("status").notNull(),
     model: text("model").notNull(),
@@ -67,6 +151,7 @@ export const aiGatewayLog = pgTable("aiGatewayLog", {
     errorJson: jsonb("errorJson").$type<StoredGenerationError>(),
     createdAt: timestamp("createdAt", {mode: "string", withTimezone: true}).defaultNow().notNull(),
 }, (table) => [
+    index('aiGatewayLog_user_history_idx').on(table.organizationId, table.userId, table.createdAt, table.id),
     index("aiGatewayLog_systemPromptId_idx").on(table.systemPromptId),
     index("aiGatewayLog_batchId_idx").on(table.batchId),
     index("aiGatewayLog_gatewayGenerationId_idx").on(table.gatewayGenerationId),

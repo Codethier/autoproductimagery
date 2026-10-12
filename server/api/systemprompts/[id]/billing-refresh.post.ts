@@ -11,14 +11,14 @@ const ParamsSchema = z.object({
 })
 
 export default defineEventHandler(async (event) => {
-    useAuth(event)
+    const account = await useAuth(event)
 
     const parsed = ParamsSchema.safeParse(event.context.params)
     if (!parsed.success) {
         throw createError({statusCode: 400, statusMessage: `Invalid id: ${parsed.error.message}`})
     }
 
-    const db = await useDB()
+    const db = await useDB(undefined, account)
     const row = await db.getSystemPrompt(parsed.data.id)
     if (!row) {
         throw createError({statusCode: 404, statusMessage: 'Generated image record not found'})

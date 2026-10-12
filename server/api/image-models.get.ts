@@ -27,7 +27,7 @@ function capabilitiesFor(profile: ImageModelProfile) {
 }
 
 export default defineEventHandler(async (event) => {
-    useAuth(event)
+    await useAuth(event)
     const parsed = QuerySchema.safeParse(getQuery(event))
     if (!parsed.success) {
         throw createError({statusCode: 400, statusMessage: `Invalid query: ${parsed.error.message}`})

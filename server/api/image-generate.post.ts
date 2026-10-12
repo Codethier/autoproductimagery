@@ -28,6 +28,7 @@ import { allocateGenerationBilling } from '~~/server/utils/generationBilling'
 import { sanitizeProviderMetadata } from '~~/server/utils/gatewayMetadata'
 import { validateGptImageMaskPair, validateBflFillMaskPair } from '~~/server/utils/gptImageMask'
 import {assertGeneratedSourcesAvailable} from '~~/server/utils/generatedImageSources'
+import {useUserFS} from '~~/server/utils/useUserFS'
 
 type RawBody = Record<string, unknown>
 const MAX_GENERATION_REQUEST_BYTES = 512 * 1024
@@ -165,7 +166,7 @@ function normalizeError(error: unknown): StoredGenerationError {
 }
 
 export default defineEventHandler(async (event) => {
-    useAuth(event)
+    const account = await useAuth(event)
     await installBoundedRawBody(event, MAX_GENERATION_REQUEST_BYTES)
     const raw = await readBody<RawBody>(event)
     const {request, requestedModel} = parseRequest(raw ?? {})
@@ -178,14 +179,23 @@ export default defineEventHandler(async (event) => {
     const generationRuntime = getGenerationRuntimeSettings(
         runtimeConfig as unknown as Record<string, unknown>,
     )
-    const database = await useDB()
+    const database = await useDB(undefined, account)
+    const imageFs = await useUserFS(account)
+    // Check every source before reserving capacity, creating pending records,
+    // or starting paid provider work. The Gateway also checks each actual read.
+    await imageFs.assertReadableImages([
+        ...request.inputImages, ...request.modelImages,
+        ...(request.maskImage ? [request.maskImage] : []),
+    ])
+    if (request.parentSystemPromptId && !await database.getSystemPrompt(request.parentSystemPromptId)) {
+        throw createError({statusCode: 404, statusMessage: 'Generated image record not found'})
+    }
     await assertGeneratedSourcesAvailable(request, database.getExpiredGeneratedImagePaths)
     try {
         await database.reconcileStalePendingGenerations(generationRuntime.staleTtlMs)
     } catch (error) {
         throw persistenceDiagnostic(error, 'Could not reconcile stale generation rows')
     }
-    const imageFs = await useFS()
     const batchId = randomUUID()
     const expectedOutputs = generationOutputCount(request.settings)
     const sourceImages: Array<string | null> = request.inputImages.length
@@ -275,7 +285,7 @@ export default defineEventHandler(async (event) => {
         // slot. Validate every mask pair before pending rows or paid work.
         await reservation.withMemorySlot(abortSignal => preflightMaskSources(abortSignal))
         reservation.signal.throwIfAborted()
-        const gateway = await useGateway()
+        const gateway = await useGateway(imageFs)
         const jobs: Array<{
             inputImage: string | null
             rows: Array<NonNullable<Awaited<ReturnType<typeof database.createPendingGeneration>>>>

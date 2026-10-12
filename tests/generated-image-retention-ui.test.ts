@@ -24,7 +24,7 @@ const combined = `${script.content.replace('export default', 'const component ='
 ${template.code.replace('export function render', 'function render')}
 component.render = render;
 export default component;`
-  .replace(/import\s*\{\s*refreshNuxtData\s*\}\s*from\s*['"]#app['"]/g, 'const refreshNuxtData = async () => {}')
+  .replace(/import\s*\{\s*refreshNuxtData\s*\}\s*from\s*['"]#app['"]/g, 'const refreshNuxtData = (...args) => globalThis.refreshNuxtData(...args)')
   .replace(/(['"])~~\/schemas\/image-generation\1/g, JSON.stringify(schemaUrl))
   .replace(/(['"])vue\1/g, JSON.stringify(vueUrl))
 const javascript = transpileModule(combined, {
@@ -47,10 +47,15 @@ const original = {
 
 async function renderCard(data: Record<string, unknown>, history: Record<string, unknown>[] = [], fetcher?: (url: string, options?: unknown) => Promise<unknown>) {
   const notifications: Record<string, unknown>[] = []
+  const account = {identity: ref('studio.alice'), epoch: ref(1)}
+  const historyKeys: string[] = []
+  const refreshedKeys: string[] = []
   let bindings: any
   const injected: Record<string, unknown> = {
     computed, ref, watch,
-    useNuxtData: () => ({data: ref({items: history})}),
+    useAccount: () => account,
+    useNuxtData: (key: string) => { historyKeys.push(key); return {data: ref({items: history})} },
+    refreshNuxtData: async (key: string) => { refreshedKeys.push(key) },
     useToast: () => ({add: (notification: Record<string, unknown>) => notifications.push(notification)}),
     $fetch: fetcher ?? (async () => {throw new Error('Unexpected API request')}),
   }
@@ -66,7 +71,7 @@ async function renderCard(data: Record<string, unknown>, history: Record<string,
   for (const name of ['UInput', 'UTextarea', 'UIcon']) app.component(name, {setup: () => () => h('span')})
   try {
     const html = await renderToString(app)
-    return {html, bindings, notifications, restore: () => {
+    return {html, bindings, notifications, account, historyKeys, refreshedKeys, restore: () => {
       for (const [key, descriptor] of previous) {
         if (descriptor) Object.defineProperty(globalThis, key, descriptor)
         else Reflect.deleteProperty(globalThis, key)
@@ -157,4 +162,89 @@ test('retention errors from generation sources are visible when an exact replay 
     assert.equal(card.notifications[0]?.title, 'Regeneration failed')
     assert.equal(card.notifications[0]?.description, reason)
   } finally {console.error = previousConsoleError; card.restore()}
+})
+
+test('history card caches and billing refreshes use the original account and session namespace', async () => {
+  const card = await renderCard(original, [], async () => ({ok: true}))
+  try {
+    assert.deepEqual(card.historyKeys, ['systemPrompts:studio.alice:1'])
+    await card.bindings.refreshBilling()
+    assert.deepEqual(card.refreshedKeys, ['systemPrompts:studio.alice:1'])
+  } finally {card.restore()}
+})
+
+test('an old history card refuses details, billing, refinement and regeneration after an account change', async () => {
+  const calls: string[] = []
+  const card = await renderCard(original, [], async url => { calls.push(url); return {ok: true} })
+  try {
+    card.account.identity.value = 'studio.bea'
+    card.account.epoch.value += 1
+    card.bindings.chatInput.value = 'Use a warmer light'
+    await card.bindings.loadOutputDetails()
+    await card.bindings.refreshBilling()
+    await card.bindings.sendRefine()
+    await card.bindings.regenerate()
+    assert.equal(card.bindings.cardIsCurrent.value, false)
+    assert.deepEqual(calls, [])
+    assert.deepEqual(card.notifications, [])
+    assert.deepEqual(card.refreshedKeys, [])
+  } finally {card.restore()}
+})
+
+test('late output details and billing responses never populate a new account or refresh its cache', async () => {
+  for (const action of ['loadOutputDetails', 'refreshBilling'] as const) {
+    let finish!: (value: unknown) => void
+    const card = await renderCard(original, [], () => new Promise(resolve => {finish = resolve}))
+    try {
+      const pending = card.bindings[action]()
+      card.account.identity.value = 'studio.bea'
+      card.account.epoch.value += 1
+      finish({ok: true, item: {...original, outputMetadata: {responseText: 'Private provider details'}}})
+      await pending
+      assert.equal(card.bindings.detailData.value, null)
+      assert.deepEqual(card.notifications, [])
+      assert.deepEqual(card.refreshedKeys, [])
+    } finally {card.restore()}
+  }
+})
+
+test('late refinement results are ignored and repeated regeneration stops before another paid request on account change', async () => {
+  for (const action of ['sendRefine', 'regenerate'] as const) {
+    let finish!: (value: unknown) => void
+    const calls: string[] = []
+    const card = await renderCard(original, [], url => {calls.push(url); return new Promise(resolve => {finish = resolve})})
+    try {
+      card.bindings.chatInput.value = 'Use a warmer light'
+      card.bindings.regenCount.value = 3
+      const pending = card.bindings[action]()
+      assert.deepEqual(calls, ['/api/image-generate'])
+      card.account.identity.value = 'studio.bea'
+      card.account.epoch.value += 1
+      const replacement = '/images/output/previous-user-result.png'
+      finish({ok: true, obj: [{...original, outputImage: replacement}]})
+      await pending
+      assert.equal(calls.length, 1)
+      assert.notEqual(card.bindings.currentImage.value, replacement)
+      assert.deepEqual(card.notifications, [])
+      assert.deepEqual(card.refreshedKeys, [])
+    } finally {card.restore()}
+  }
+})
+
+test('legacy parent replay cannot continue into generation after the account changes during its detail lookup', async () => {
+  let finish!: (value: unknown) => void
+  const calls: string[] = []
+  const card = await renderCard({...original, id: 2, serverImages: [], parentSystemPromptId: 1}, [], url => {
+    calls.push(url); return new Promise(resolve => {finish = resolve})
+  })
+  try {
+    const pending = card.bindings.regenerate()
+    assert.deepEqual(calls, ['/api/systemprompts/1'])
+    card.account.epoch.value += 1
+    finish({ok: true, item: original})
+    await pending
+    assert.deepEqual(calls, ['/api/systemprompts/1'])
+    assert.deepEqual(card.notifications, [])
+    assert.deepEqual(card.refreshedKeys, [])
+  } finally {card.restore()}
 })

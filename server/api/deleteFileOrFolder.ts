@@ -3,7 +3,7 @@ import { installBoundedRawBody } from "../utils/boundedRequestBody"
 import {DeleteImageEntrySchema} from '~~/schemas/image-storage'
 
 export default defineEventHandler(async (event) => {
-    useAuth(event)
+    const actor = await useAuth(event)
     assertMethod(event, "DELETE")
 
     await installBoundedRawBody(event, 16 * 1024)
@@ -13,7 +13,7 @@ export default defineEventHandler(async (event) => {
     }
     const body = parsed.data
 
-    const fs = await useFS()
+    const fs = await useUserFS(actor)
     await fs.deleteFileOrFolder(body.path, body.entryType)
     return { ok: true }
 })

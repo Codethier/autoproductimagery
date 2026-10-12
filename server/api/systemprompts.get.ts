@@ -4,9 +4,9 @@ import { randomUUID } from "node:crypto";
 
 export default defineEventHandler(async (event) => {
   // Require auth (same as other endpoints)
-  useAuth(event)
+  const account = await useAuth(event)
 
-  const db = await useDB()
+  const db = await useDB(undefined, account)
   const runtime = getGenerationRuntimeSettings(
     useRuntimeConfig() as unknown as Record<string, unknown>,
   )

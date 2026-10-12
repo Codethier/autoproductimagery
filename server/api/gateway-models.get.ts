@@ -13,7 +13,7 @@ const CACHE_TTL_MS = 10 * 60 * 1000
 const CURATED_IMAGE_MODELS = new Set<string>(SUPPORTED_IMAGE_MODEL_IDS)
 
 export default defineEventHandler(async (event) => {
-    useAuth(event)
+    await useAuth(event)
 
     const parsed = QuerySchema.safeParse(getQuery(event))
     if (!parsed.success) {

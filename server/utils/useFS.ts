@@ -440,22 +440,36 @@ export function createS3ImageStorage(options: {
         })
         await outputFolderReady
     }
-    async function saveGeneratedImage(data: Buffer, _declaredMimeType?: string) {
+    async function saveGeneratedImage(data: Buffer, _declaredMimeType?: string, namespace?: {organizationId: string; userId: string}) {
         const inspection = await inspectDecodedImage(data, true)
-        await ensureOutputFolder()
+        const outputParts = namespace
+            ? ['organizations', namespace.organizationId, 'users', namespace.userId, 'output'] : ['output']
+        if (namespace && (![namespace.organizationId, namespace.userId].every(value => /^[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}$/i.test(value)))) {
+            throw createError({statusCode: 400, statusMessage: 'Invalid image namespace'})
+        }
+        if (namespace) {
+            try {
+                await execute(new PutObjectCommand({Bucket: bucket, Key: folderKey(outputParts), Body: Buffer.alloc(0),
+                    ContentLength: 0, ContentType: 'application/x-directory', IfNoneMatch: '*'}))
+            } catch (error) { if (!isStorageErrorCode(error, 'already_exists')) throw error }
+        } else await ensureOutputFolder()
         const filename = `img-${Date.now()}-${randomUUID()}.${inspection.extension}`
         await execute(new PutObjectCommand({
-            Bucket: bucket, Key: objectKey(["output", filename]), Body: data,
+            Bucket: bucket, Key: objectKey([...outputParts, filename]), Body: data,
             ContentLength: data.byteLength, ContentType: inspection.mimeType, IfNoneMatch: "*",
         }))
         return {
-            url: imagePathToUrl(["output", filename]), mimeType: inspection.mimeType,
+            url: imagePathToUrl([...outputParts, filename]), mimeType: inspection.mimeType,
             bytes: data.byteLength, width: inspection.width, height: inspection.height,
         }
     }
     async function removeGeneratedImage(url: string) {
         const parts = parseImagePath(url)
-        if (parts.length !== 2 || parts[0] !== "output" || !/^img-\d+-[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}\.(png|jpg|gif|webp|bmp|tiff|heic)$/.test(parts[1]!)) {
+        const uuid = /^[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}$/i
+        const legacy = parts.length === 2 && parts[0] === 'output'
+        const scoped = parts.length === 6 && parts[0] === 'organizations' && uuid.test(parts[1]!)
+            && parts[2] === 'users' && uuid.test(parts[3]!) && parts[4] === 'output'
+        if ((!legacy && !scoped) || !/^img-\d+-[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}\.(png|jpg|gif|webp|bmp|tiff|heic)$/.test(parts.at(-1)!)) {
             throw createError({ statusCode: 400, statusMessage: "Only generated output files can be removed here" })
         }
         await execute(new DeleteObjectCommand({ Bucket: bucket, Key: objectKey(parts) }))
@@ -515,11 +529,35 @@ export function createS3ImageStorage(options: {
         if (keys.includes(directoryPrefix)) await execute(new DeleteObjectCommand({ Bucket: bucket, Key: directoryPrefix }))
         if (parts.length === 1 && parts[0] === "output") outputFolderReady = undefined
     }
+    async function deleteFolderMarker(relative: string) {
+        const parts = parseImagePath(relative, true)
+        if (!parts.length) throw createError({statusCode: 400, statusMessage: 'Cannot delete root'})
+        // Actor-bound callers already determine their registry deletion set.
+        // Removing a marker must never sweep unrelated physical descendants.
+        await execute(new DeleteObjectCommand({Bucket: bucket, Key: folderKey(parts)}))
+    }
+    async function deleteRegisteredEntries(entries: Array<{url: string; kind: 'file' | 'folder'}>) {
+        if (entries.length > DELETE_TREE_ENTRY_LIMIT * 2) throw createError({statusCode: 413, statusMessage: 'Folder is too large to delete safely'})
+        const keys = [...new Set(entries.map(entry => {
+            const parts = parseImagePath(entry.url)
+            if (!parts.length || imagePathToUrl(parts) !== entry.url || (entry.kind !== 'file' && entry.kind !== 'folder')) {
+                throw createError({statusCode: 400, statusMessage: 'Invalid registered image path'})
+            }
+            return entry.kind === 'folder' ? folderKey(parts) : objectKey(parts)
+        }))]
+        // No bucket listing and no recursive prefix deletion: the caller authorizes every exact key.
+        for (let offset = 0; offset < keys.length; offset += 1000) {
+            const result = await execute<DeleteObjectsCommandOutput>(new DeleteObjectsCommand({Bucket: bucket,
+                Delete: {Objects: keys.slice(offset, offset + 1000).map(Key => ({Key})), Quiet: true}}))
+            if (result.Errors?.length) throw storageError(503, 'Some images could not be deleted; retry the folder deletion', 'partial_delete', true)
+        }
+        if (entries.some(entry => entry.kind === 'folder' && entry.url === '/images/output')) outputFolderReady = undefined
+    }
     return {
         readDir, listAssets,
         listDirs: async (relative: string) => (await readDir(relative)).dirs,
         listFiles: async (relative: string) => (await readDir(relative)).files,
-        parseFileDirEntToSelectableFile, createFolder, saveFile, deleteFileOrFolder,
+        parseFileDirEntToSelectableFile, createFolder, saveFile, deleteFileOrFolder, deleteFolderMarker, deleteRegisteredEntries,
         getFile, getImageFile, saveGeneratedImage, removeGeneratedImage, fileExists, importImage,
     }
 }

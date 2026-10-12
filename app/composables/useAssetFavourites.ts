@@ -1,15 +1,18 @@
 import {ASSET_FAVOURITES_KEY, createAssetFavourites} from '../utils/assetPreferences'
 
 export function useAssetFavourites() {
-    const urls = useState<string[]>('asset-favourite-urls', () => [])
+    const account = useAccount()
+    const urls = ref<string[]>([])
     const persistent = useState('asset-favourite-persistent', () => true)
-    const preferences = createAssetFavourites(() => window.localStorage)
+    const storageKey = computed(() => `${ASSET_FAVOURITES_KEY}.${account.identity.value || 'signed-out'}`)
+    const preferences = createAssetFavourites(() => window.localStorage, () => storageKey.value)
     function load() {
         const result = preferences.load()
         urls.value = result.urls
         persistent.value = result.persistent
     }
-    function onStorage(event: StorageEvent) { if (event.key === ASSET_FAVOURITES_KEY || event.key === null) load() }
+    function onStorage(event: StorageEvent) { if (event.key === storageKey.value || event.key === null) load() }
+    watch(account.identity, () => { urls.value = []; if (import.meta.client && account.identity.value) load() })
     onMounted(() => { load(); window.addEventListener('storage', onStorage) })
     onBeforeUnmount(() => window.removeEventListener('storage', onStorage))
     function toggle(url: string) {

@@ -5,18 +5,13 @@ export default defineNuxtRouteMiddleware(async (to) => {
   // The session cookie is HttpOnly, so the browser must never inspect it.
   // SSR's request fetch forwards the incoming cookie; browser fetches include
   // same-origin cookies automatically.
-  const authenticated = useState<boolean | undefined>('auth-session', () => undefined)
-  if (authenticated.value === true) return
+  const session = useAccount()
+  if (session.account.value) return
 
   try {
-    const requestFetch = useRequestFetch()
-    const ok = await requestFetch<boolean>('/api/testCredentials')
-    if (ok === true) {
-      authenticated.value = true
-      return
-    }
+    if (await session.load()) return
   } catch {
-    authenticated.value = false
+    session.clear()
   }
 
   // Any authenticated path returned above.

@@ -40,14 +40,14 @@ export function parseAssetFavourites(raw: string | null): string[] {
 }
 
 type PreferenceStorage = Pick<Storage, 'getItem' | 'setItem'>
-export function createAssetFavourites(getStorage: () => PreferenceStorage) {
+export function createAssetFavourites(getStorage: () => PreferenceStorage, getKey: () => string = () => ASSET_FAVOURITES_KEY) {
     function save(urls: string[]) {
-        try { getStorage().setItem(ASSET_FAVOURITES_KEY, JSON.stringify(urls)); return {urls, persistent: true} }
+        try { getStorage().setItem(getKey(), JSON.stringify(urls)); return {urls, persistent: true} }
         catch { return {urls, persistent: false} }
     }
     return {
         load() {
-            try { return {urls: parseAssetFavourites(getStorage().getItem(ASSET_FAVOURITES_KEY)), persistent: true} }
+            try { return {urls: parseAssetFavourites(getStorage().getItem(getKey())), persistent: true} }
             catch { return {urls: [] as string[], persistent: false} }
         },
         toggle(current: readonly string[], url: string) {

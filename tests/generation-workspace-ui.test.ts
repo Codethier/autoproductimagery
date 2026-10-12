@@ -25,12 +25,13 @@ registerHooks({
     if (url === formUrl || (url.startsWith(settingsDirectory) && url.endsWith('.vue'))) {
       const filename = fileURLToPath(url)
       let source = readFileSync(filename, 'utf8')
-      if (url === formUrl) source = source.replace('</script>', 'defineExpose({ submit, sourceImages, data, pickerKind, confirmPicker, previewOutput, canSubmit, prompt, pendingGenerations, activeGenerationCount })\n</script>')
+      if (url === formUrl) source = source.replace('</script>', 'defineExpose({ submit, uploadFiles, loadMoreHistory, sourceImages, data, pickerKind, confirmPicker, previewOutput, canSubmit, prompt, pendingGenerations, activeGenerationCount, errorMsg, uploading, displayedHistory })\n</script>')
       const { descriptor } = parse(source, { filename })
       const compiled = compileScript(descriptor, { id: filename, inlineTemplate: true })
       const nuxtServices = url === formUrl ? `
         const useDataStore = () => globalThis.${environmentKey}.store;
-        const useFetch = (url) => globalThis.${environmentKey}.useFetch(url);
+        const useAccount = () => globalThis.${environmentKey}.account;
+        const useFetch = (...args) => globalThis.${environmentKey}.useFetch(...args);
         const useRoute = () => globalThis.${environmentKey}.route;
         const $fetch = (...args) => globalThis.${environmentKey}.fetch(...args);
         const refreshNuxtData = async () => {};
@@ -62,11 +63,13 @@ async function renderWorkspace(mode: 'edit' | 'batch', overrides: Partial<Store>
   })
   const environment: any = {
     store, route: reactive({ query: {} }), exposed: null,
-    useFetch(url: string) {
+    account: {epoch: ref(1), identity: ref('org.alice')}, refreshes: [], fetchKeys: [],
+    useFetch(url: string, options: {key?: unknown}) {
+      this.fetchKeys.push({url, key: options.key})
       const data = url === '/api/image-models'
         ? { ok: true, items: Object.values(IMAGE_MODEL_PROFILES).map(profile => ({ id: profile.id, profile, available: true, catalogStatus: 'available' })) }
         : { ok: true, count: 0, items: [] }
-      return { data: ref(data), status: ref('success'), error: ref(null), refresh: async () => undefined }
+      return { data: ref(data), status: ref('success'), error: ref(null), refresh: async () => { this.refreshes.push(url) } }
     },
     async fetch(url: string, options: { body?: unknown }) {
       requests.push({ url, options })
@@ -144,7 +147,7 @@ async function mountWorkspace(mode: 'edit' | 'batch', environment: any) {
 
 test('Edit renders a photo-only upload landing while existing batch sources stay selected', async () => {
   const workspace = await renderWorkspace('edit', { inputImages: ['/images/batch-a.png', '/images/batch-b.png'] })
-  assert.match(workspace.html, /Drop a photo to edit/)
+  assert.match(workspace.html, /Start with a product photo/)
   assert.match(workspace.html, /Upload image/)
   assert.doesNotMatch(workspace.html, /studio-composer"/)
   assert.deepEqual(workspace.store.inputImages, ['/images/batch-a.png', '/images/batch-b.png'])
@@ -238,6 +241,88 @@ test('navigation unmounts and remounts the editor without losing an in-flight re
     await request
     first?.app.unmount()
     remounted?.app.unmount()
+    ;(globalThis as any).window = previousWindow
+  }
+})
+
+test('uploads select the server-assigned immutable image URL instead of rebuilding it from a filename', async () => {
+  const workspace = await renderWorkspace('edit')
+  const url = '/images/organizations/11111111-1111-4111-8111-111111111111/users/22222222-2222-4222-8222-222222222222/objects/33333333-3333-4333-8333-333333333333/product.png'
+  workspace.environment.fetch = async () => ({saved: ['product.png'], savedFiles: [{name: 'product.png', url}], failed: []})
+  await workspace.exposed.uploadFiles([new File(['test'], 'product.png', {type: 'image/png'})])
+  assert.equal(workspace.store.editSource, url)
+  assert.equal(workspace.exposed.errorMsg.value, null)
+})
+
+for (const outcome of ['success', 'failure'] as const) {
+  test(`a generation ${outcome} arriving after an account switch cannot change the next user's workspace`, async () => {
+    const workspace = await renderWorkspace('edit', {editSource: '/images/alice.png'})
+    let resolve!: (value: unknown) => void
+    let reject!: (error: unknown) => void
+    workspace.environment.fetch = () => new Promise((yes, no) => { resolve = yes; reject = no })
+    const previousWindow = (globalThis as any).window
+    const mounted = await mountWorkspace('edit', workspace.environment)
+    const request = mounted.exposed.submit()
+    try {
+      assert.equal(workspace.store.pendingGenerations.length, 1)
+      workspace.environment.account.epoch.value += 1
+      workspace.environment.account.identity.value = 'org.bob'
+      workspace.store.editSource = '/images/bob.png'
+      workspace.store.composerPrompt = 'Bob private prompt'
+      const bobJob: PendingGeneration = {id: 'bob-active', prompt: 'Bob private prompt', model: workspace.store.selectedModel,
+        inputImages: ['/images/bob.png'], modelImages: [], startedAt: Date.now(), status: 'pending'}
+      workspace.store.pendingGenerations = [bobJob]
+      await nextTick()
+      if (outcome === 'success') resolve({ok: true, obj: [{outputImage: '/images/output/alice.png', errors: 'Alice private error'}]})
+      else reject({data: {statusMessage: 'Alice private failure'}})
+      await request
+      assert.equal(workspace.store.editSource, '/images/bob.png')
+      assert.equal(workspace.store.composerPrompt, 'Bob private prompt')
+      assert.deepEqual(workspace.store.pendingGenerations, [bobJob])
+      assert.equal(mounted.exposed.previewOutput.value, null)
+      assert.equal(mounted.exposed.errorMsg.value, null)
+      assert.deepEqual(workspace.environment.refreshes, [], 'a stale request must not refresh a new account history')
+      const privateKeys = workspace.environment.fetchKeys.filter((entry: any) => entry.url !== '/api/image-models')
+      assert.ok(privateKeys.every((entry: any) => entry.key.value.endsWith(':org.bob:2')))
+    } finally {
+      resolve({ok: true, obj: []})
+      await request
+      mounted.app.unmount()
+      ;(globalThis as any).window = previousWindow
+    }
+  })
+}
+
+test('late upload and paginated history results are discarded after an account switch', async () => {
+  const workspace = await renderWorkspace('edit', {editSource: '/images/alice.png'})
+  const originalUseFetch = workspace.environment.useFetch
+  workspace.environment.useFetch = function(url: string, options: any) {
+    const result = originalUseFetch.call(this, url, options)
+    if (url === '/api/systemprompts') result.data.value = {count: 2, items: [{id: 1, TextPrompt: 'Alice previous', outputImage: null}]}
+    return result
+  }
+  const responses: Array<(value: unknown) => void> = []
+  workspace.environment.fetch = () => new Promise(resolve => { responses.push(resolve) })
+  const previousWindow = (globalThis as any).window
+  const mounted = await mountWorkspace('edit', workspace.environment)
+  const upload = mounted.exposed.uploadFiles([new File(['test'], 'product.png', {type: 'image/png'})])
+  const history = mounted.exposed.loadMoreHistory()
+  try {
+    assert.equal(responses.length, 2)
+    workspace.environment.account.epoch.value += 1
+    workspace.environment.account.identity.value = 'org.bob'
+    workspace.store.editSource = '/images/bob.png'
+    responses[0]!({savedFiles: [{url: '/images/alice-new.png'}], failed: [{filename: 'private.png', reason: 'Alice error'}]})
+    responses[1]!({count: 2, items: [{id: 2, TextPrompt: 'Alice private history', outputImage: '/images/alice-output.png'}]})
+    await Promise.all([upload, history])
+    assert.equal(workspace.store.editSource, '/images/bob.png')
+    assert.equal(mounted.exposed.errorMsg.value, null)
+    assert.equal(mounted.exposed.uploading.value, false)
+    assert.equal(mounted.exposed.displayedHistory.value.some((item: any) => item.id === 2), false)
+  } finally {
+    responses.forEach(resolve => resolve({savedFiles: [], failed: [], count: 0, items: []}))
+    await Promise.all([upload, history])
+    mounted.app.unmount()
     ;(globalThis as any).window = previousWindow
   }
 })
