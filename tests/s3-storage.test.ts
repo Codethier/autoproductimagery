@@ -7,7 +7,7 @@ import {
     ListObjectsV2Command, PutObjectCommand,
 } from "@aws-sdk/client-s3"
 import {
-    createS3ImageStorage, DELETE_TREE_ENTRY_LIMIT,
+    createS3ImageStorage, DELETE_TREE_ENTRY_LIMIT, ASSET_LIST_SCAN_PAGE_LIMIT,
     type ImageStorageCommand, type ImageStorageTransport,
 } from "../server/utils/useFS.ts"
 import { canonicalImageExtension, detectImageType, inspectDecodedImage, MAX_STORED_IMAGE_BYTES } from "../server/utils/imageValidation.ts"
@@ -116,6 +116,60 @@ test("canonical image paths reject traversal, URLs, separators, ambiguous encodi
     assert.throws(() => createS3ImageStorage({ client, bucket: "private-images", prefix: "../outside" }))
     await assert.rejects(storage.deleteFileOrFolder("/"), (error: { statusCode?: number }) => error.statusCode === 400)
     assert.equal(client.commands.length, 0)
+})
+
+test('asset library scans nested images with scoped pagination and preserves terminal overflow', async () => {
+    const {client, storage} = fixture()
+    const bytes = await png()
+    for (const key of ['catalog/a.png', 'catalog/nested/b.png', 'output/img-123.png', 'z.png']) {
+        client.objects.set('test-images/' + key, {bytes, contentType: 'image/png'})
+    }
+    client.objects.set('outside/secret.png', {bytes, contentType: 'image/png'})
+    client.objects.set('test-images/private.txt', {bytes, contentType: 'text/plain'})
+    client.objects.set('test-images/catalog/%2e%2e/secret.png', {bytes, contentType: 'image/png'})
+    const seen: string[] = []
+    let cursor: string | undefined
+    do {
+        const page = await storage.listAssets({limit: 1, cursor})
+        assert.ok(page.files.length <= 1)
+        seen.push(...page.files.map(file => file.url))
+        cursor = page.nextCursor
+    } while (cursor)
+    assert.deepEqual(seen, ['/images/catalog/a.png', '/images/catalog/nested/b.png', '/images/output/img-123.png', '/images/z.png'])
+    assert.equal(client.commands.some(command => command instanceof GetObjectCommand), false, 'listings never load image contents')
+    const first = await storage.listAssets({limit: 1})
+    assert.ok(first.nextCursor)
+    for (const options of [{scope: 'uploads' as const}, {query: 'catalog'}, {path: '/catalog'}]) {
+        await assert.rejects(storage.listAssets({limit: 1, cursor: first.nextCursor, ...options}), (error: {statusCode?: number}) => error.statusCode === 400)
+    }
+    assert.deepEqual((await storage.listAssets({scope: 'generated'})).files.map(file => file.url), ['/images/output/img-123.png'])
+    assert.deepEqual((await storage.listAssets({scope: 'uploads'})).files.map(file => file.url), ['/images/catalog/a.png', '/images/catalog/nested/b.png', '/images/z.png'])
+    assert.deepEqual((await storage.listAssets({path: '/catalog', query: 'NESTED'})).files.map(file => file.url), ['/images/catalog/nested/b.png'])
+})
+
+test('keyword searches remain bounded and continue beyond empty pages without skipping a later match', async () => {
+    const {client, storage} = fixture()
+    const bytes = await png()
+    for (let index = 0; index < 20; index++) client.objects.set(`test-images/a-${index.toString().padStart(2, '0')}.png`, {bytes, contentType: 'image/png'})
+    client.objects.set('test-images/z-match.png', {bytes, contentType: 'image/png'})
+    const initialCommands = client.commands.length
+    const first = await storage.listAssets({limit: 1, query: 'match'})
+    assert.deepEqual(first.files, [])
+    assert.ok(first.nextCursor)
+    assert.equal(client.commands.length - initialCommands, ASSET_LIST_SCAN_PAGE_LIMIT)
+    let cursor = first.nextCursor
+    let found: string[] = []
+    do {
+        const page = await storage.listAssets({limit: 1, query: 'match', cursor})
+        found.push(...page.files.map(file => file.name))
+        cursor = page.nextCursor!
+    } while (cursor)
+    assert.deepEqual(found, ['z-match.png'])
+    const commandCount = client.commands.length
+    for (const options of [{path: '/../outside'}, {path: '//private'}, {limit: 101}, {query: 'x'.repeat(201)}, {cursor: '../token'}]) {
+        await assert.rejects(storage.listAssets(options), (error: {statusCode?: number}) => error.statusCode === 400)
+    }
+    assert.equal(client.commands.length, commandCount)
 })
 
 test("S3 folders persist empty directories and delimiter listing remains paginated and scoped", async () => {

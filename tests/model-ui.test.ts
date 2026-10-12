@@ -85,7 +85,7 @@ test('mask preflight and replay UI preserve every source and stored settings', (
   const formSource = readFileSync(new URL('../app/components/GeminiForm.vue', import.meta.url), 'utf8')
   const historyCardSource = readFileSync(new URL('../app/components/systemPromp.vue', import.meta.url), 'utf8')
 
-  assert.match(formSource, /maskSources[\s\S]*data\.inputImages\.length > 0[\s\S]*data\.inputImages/)
+  assert.match(formSource, /maskSources[\s\S]*sourceImages\.value\.length > 0[\s\S]*sourceImages\.value/)
   assert.match(historyCardSource, /const replayMask = replayInputs\.length > 0 \|\| modelImages\.length > 0/)
   assert.match(historyCardSource, /settings:\s*config\.settings/)
   assert.match(historyCardSource, /loadOutputDetails/)

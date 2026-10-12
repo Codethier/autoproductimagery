@@ -7,12 +7,14 @@ import {
     type ListObjectsV2CommandOutput, type DeleteObjectsCommandOutput,
 } from "@aws-sdk/client-s3"
 import type { SelectableFile } from "~~/schemas/main.dto"
+import type { AssetFile, AssetListingPage } from "~~/schemas/image-storage"
 import type { BufferedUploadFile } from "./uploadPolicy"
 import { canonicalImageExtension, hasSupportedImageExtension, inspectDecodedImage, MAX_STORED_IMAGE_BYTES } from "./imageValidation"
 import { imagePathToUrl, normalizeImageStoragePrefix, parseImagePath, validateImagePathSegment } from "./imageStoragePaths"
 
 export const DELETE_TREE_ENTRY_LIMIT = 10_000
 export const S3_OPERATION_TIMEOUT_MS = 30_000
+export const ASSET_LIST_SCAN_PAGE_LIMIT = 4
 const DEFAULT_DIRECTORY_PAGE_SIZE = 100
 const MAX_DIRECTORY_PAGE_SIZE = 500
 const MAX_FILENAME_ATTEMPTS = 32
@@ -251,6 +253,96 @@ export function createS3ImageStorage(options: {
             url: imagePathToUrl([...parts, entry.name]),
         }))
     }
+    // A global library does not traverse folders one by one or read image bytes.
+    // Searches scan a fixed number of bounded S3 pages, returning continuation
+    // even when this request found no matches.
+    async function listAssets(options: {
+        scope?: 'all' | 'uploads' | 'generated'; path?: string; query?: string; cursor?: string; limit?: number
+    } = {}): Promise<AssetListingPage> {
+        const scope = options.scope ?? 'all'
+        const query = (options.query ?? '').trim().toLocaleLowerCase()
+        const limit = options.limit ?? 60
+        if (!['all', 'uploads', 'generated'].includes(scope) || !Number.isInteger(limit) || limit < 1 || limit > 100
+            || query.length > 200 || /[\x00-\x1f\x7f]/.test(query)) {
+            throw createError({statusCode: 400, statusMessage: 'Invalid asset listing request'})
+        }
+        const parts = parseImagePath(options.path ?? '/', true)
+        if (scope === 'generated' && parts.length) throw createError({statusCode: 400, statusMessage: 'Invalid generated asset folder'})
+        const listingPrefix = scope === 'generated' ? folderKey(['output']) : folderKey(parts)
+        const assetScope = createHash('sha256').update(JSON.stringify([bucket, listingPrefix, scope, query])).digest('base64url')
+        function assetForKey(key: string, bytes?: number, modifiedAt?: string): AssetFile | undefined {
+            if (!key.startsWith(listingPrefix) || key.endsWith('/')) return undefined
+            const parts = key.slice(prefix.length).split('/')
+            try {
+                if (!parts.length || parts.length > 64 || (scope === 'uploads' && parts[0] === 'output')) return undefined
+                parts.forEach(validateImagePathSegment)
+                const name = parts.at(-1)!
+                if (!hasSupportedImageExtension(name) || (query && !parts.join('/').toLocaleLowerCase().includes(query))) return undefined
+                boundedKey(key)
+                return {
+                    name, url: imagePathToUrl(parts), folder: parts.length > 1 ? '/' + parts.slice(0, -1).join('/') : '/',
+                    selectedImage: false, selectedModel: false, selectedMask: false,
+                    ...(typeof bytes === 'number' && Number.isSafeInteger(bytes) && bytes >= 0 ? {bytes} : {}),
+                    ...(modifiedAt && Number.isFinite(Date.parse(modifiedAt)) ? {modifiedAt} : {}),
+                }
+            } catch { return undefined }
+        }
+        let token: string | undefined
+        let exhausted = false
+        let pending: AssetFile[] = []
+        if (options.cursor) {
+            try {
+                if (options.cursor.length > 8192 || !/^[a-zA-Z\d_-]+$/.test(options.cursor)) throw new Error('invalid')
+                const record = JSON.parse(Buffer.from(options.cursor, 'base64url').toString('utf8')) as Record<string, unknown>
+                if (!record || typeof record !== 'object' || Array.isArray(record)
+                    || Object.keys(record).some(key => !['scope', 'token', 'exhausted', 'pending'].includes(key))
+                    || record.scope !== assetScope || typeof record.exhausted !== 'boolean' || !Array.isArray(record.pending)
+                    || record.pending.length > 1 || (record.exhausted ? record.token !== undefined
+                        : typeof record.token !== 'string' || !record.token || Buffer.byteLength(record.token) > 4096)) throw new Error('invalid')
+                exhausted = record.exhausted
+                token = record.token as string | undefined
+                pending = record.pending.map((key: unknown) => {
+                    if (typeof key !== 'string') throw new Error('invalid')
+                    const file = assetForKey(key)
+                    if (!file) throw new Error('invalid')
+                    return file
+                })
+            } catch { throw createError({statusCode: 400, statusMessage: 'Invalid asset listing cursor'}) }
+        }
+        const files = pending.splice(0, limit)
+        for (let page = 0; page < ASSET_LIST_SCAN_PAGE_LIMIT && files.length < limit && !exhausted; page += 1) {
+            const requestedKeys = Math.max(2, limit - files.length)
+            const result = await execute<ListObjectsV2CommandOutput>(new ListObjectsV2Command({
+                Bucket: bucket, Prefix: listingPrefix, MaxKeys: requestedKeys, ContinuationToken: token,
+            }))
+            if ((result.Contents?.length ?? 0) > requestedKeys || result.CommonPrefixes?.length) {
+                throw storageError(503, 'Image storage returned an invalid response', 'storage_unavailable', true)
+            }
+            for (const entry of result.Contents ?? []) {
+                if (!entry.Key) continue
+                const date = entry.LastModified
+                const file = assetForKey(entry.Key, entry.Size, date instanceof Date && Number.isFinite(date.getTime()) ? date.toISOString() : undefined)
+                if (!file) continue
+                if (files.length < limit) files.push(file)
+                else pending.push(file)
+            }
+            const nextToken = result.IsTruncated ? result.NextContinuationToken : undefined
+            if (result.IsTruncated && (!nextToken || nextToken === token || Buffer.byteLength(nextToken) > 4096)) {
+                throw storageError(503, 'Image storage returned an invalid response', 'storage_unavailable', true)
+            }
+            token = nextToken
+            exhausted = !result.IsTruncated
+        }
+        let nextCursor: string | undefined
+        if (pending.length || !exhausted) {
+            nextCursor = Buffer.from(JSON.stringify({
+                scope: assetScope, token, exhausted,
+                pending: pending.map(file => objectKey(parseImagePath(file.url))),
+            })).toString('base64url')
+            if (nextCursor.length > 8192) throw storageError(503, 'Image storage returned an invalid response', 'storage_unavailable', true)
+        }
+        return {files, nextCursor}
+    }
     async function createFolder(relative: string, folderName: string) {
         const parts = parseImagePath(relative, true)
         const name = validateImagePathSegment(folderName)
@@ -424,7 +516,7 @@ export function createS3ImageStorage(options: {
         if (parts.length === 1 && parts[0] === "output") outputFolderReady = undefined
     }
     return {
-        readDir,
+        readDir, listAssets,
         listDirs: async (relative: string) => (await readDir(relative)).dirs,
         listFiles: async (relative: string) => (await readDir(relative)).files,
         parseFileDirEntToSelectableFile, createFolder, saveFile, deleteFileOrFolder,

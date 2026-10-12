@@ -4,6 +4,14 @@ Generate product imagery through Vercel AI Gateway, using independent jobs for e
 
 ![Example generated image](public/examples/image2.png)
 
+## Image workspace
+
+The app opens at **Edit** (`/edit`), with an image-only upload area and an Assets picker. Choose one product image to open the canvas, write a prompt, and attach optional shared reference images or a model-specific mask. The canvas supports zoom, download, replacement, and using a generated result as the next input. Model settings remain specific to each current model; favourites, New tags, warnings, reference limits and exact replay are preserved.
+
+**Same-origin batch** (`/same-origin-batch`) applies one prompt and the same shared references to each selected input image. Each input creates an independent generation job; selecting several references does not multiply the jobs. Edit and batch keep separate input selections while sharing the prompt and model settings. Active requests stay visible across workspace navigation, and generation history remains available in both views.
+
+**Assets** (`/assets`) provides the private image library, folder browsing, uploads, keyword search, previews, downloads, favourites and multi-selection. The reusable picker supplies Edit inputs, batch inputs, shared references and PNG masks. Favourites are a browser-local preference; image bytes and file management remain authenticated server operations. Listing and search use bounded S3 pagination, so large libraries can continue loading without reading every image into memory. The Generated images view shows the output folder; retention eligibility comes from generation records rather than this view.
+
 ## Storage and runtime
 
 - Uploaded and generated images are validated raster images in a **private S3-compatible bucket**. Railway Storage Buckets are supported.
