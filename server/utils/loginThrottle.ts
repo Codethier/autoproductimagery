@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto"
+import { coordinationTransaction, getCoordinationPool, type CoordinationPool } from './databaseCoordination'
 
 export const LOGIN_THROTTLE_WINDOW_MS = 15 * 60 * 1000
 export const LOGIN_IP_ATTEMPT_LIMIT = 30
@@ -96,3 +97,54 @@ const LOGIN_THROTTLE_SYMBOL = Symbol.for("autoproductimagery.loginThrottle.v1")
 const processState = globalThis as typeof globalThis & { [LOGIN_THROTTLE_SYMBOL]?: LoginThrottle }
 export const loginThrottle = processState[LOGIN_THROTTLE_SYMBOL]
     ?? (processState[LOGIN_THROTTLE_SYMBOL] = new LoginThrottle())
+
+/** Shared attempt accounting survives cold starts and multiple app instances. */
+export class DurableLoginThrottle {
+    private readonly pool: CoordinationPool
+    private readonly namespace: string
+    constructor(pool: CoordinationPool, namespace = 'login') {
+        this.pool = pool
+        this.namespace = namespace
+    }
+
+    async consume(ip: string | undefined, username: string): Promise<LoginThrottleDecision> {
+        const ipKey = `${this.namespace}:ip:${createHash('sha256').update(normalizeIp(ip)).digest('base64url')}`
+        const userKey = `${this.namespace}:account:${accountKey(username)}`
+        return coordinationTransaction(this.pool, `autoproductimagery:${this.namespace}:throttle:v1`, async connection => {
+            await connection.query('DELETE FROM login_attempt WHERE reset_at <= CURRENT_TIMESTAMP')
+            const buckets = await connection.query(
+                'SELECT key, attempts, GREATEST(1, CEIL(EXTRACT(EPOCH FROM (reset_at - CURRENT_TIMESTAMP)))) AS retry_after FROM login_attempt WHERE key = ANY($1::text[])',
+                [[ipKey, userKey]],
+            )
+            let retryAfterSeconds = 0
+            for (const bucket of buckets.rows) {
+                const limit = bucket.key === ipKey ? LOGIN_IP_ATTEMPT_LIMIT : LOGIN_ACCOUNT_ATTEMPT_LIMIT
+                if (Number(bucket.attempts) >= limit) retryAfterSeconds = Math.max(retryAfterSeconds, Number(bucket.retry_after))
+            }
+            if (retryAfterSeconds) return { allowed: false, retryAfterSeconds }
+            const count = await connection.query('SELECT COUNT(*) AS count FROM login_attempt')
+            if (Number(count.rows[0]?.count) + 2 - buckets.rows.length > MAX_TRACKED_LOGIN_KEYS) {
+                // Reject new keys when bounded capacity is exhausted. Evicting
+                // live keys would allow a credential attack to reset its limit.
+                return { allowed: false, retryAfterSeconds: Math.ceil(LOGIN_THROTTLE_WINDOW_MS / 1000) }
+            }
+            await connection.query(
+                `INSERT INTO login_attempt (key, attempts, reset_at, updated_at)
+                 SELECT key, 1, CURRENT_TIMESTAMP + ($2 * INTERVAL '1 millisecond'), CURRENT_TIMESTAMP
+                 FROM unnest($1::text[]) AS key
+                 ON CONFLICT (key) DO UPDATE SET attempts = login_attempt.attempts + 1, updated_at = CURRENT_TIMESTAMP`,
+                [[ipKey, userKey], LOGIN_THROTTLE_WINDOW_MS],
+            )
+            return { allowed: true, retryAfterSeconds: 0 }
+        })
+    }
+
+    async clearSuccessfulAccount(username: string) {
+        const key = `${this.namespace}:account:${accountKey(username)}`
+        await this.pool.query('DELETE FROM login_attempt WHERE key = $1', [key])
+    }
+}
+
+export async function getDurableLoginThrottle() {
+    return new DurableLoginThrottle(await getCoordinationPool())
+}

@@ -18,6 +18,7 @@ type SystemPrompt = {
   serverImages?: string[] | null
   modelImages?: string[] | null
   outputImage: string | null
+  outputImageDeletedAt?: string | null
   generationModel?: string | null
   inputTokens?: number | null
   outputTokens?: number | null
@@ -86,7 +87,7 @@ const settingsSummary = computed(() => {
   if (!isGeminiImageSettings(settings)) {
     return [('size' in settings ? settings.size : undefined) || ('aspectRatio' in settings ? settings.aspectRatio : undefined),
       'resolution' in settings ? settings.resolution : undefined,
-      'outputFormat' in settings ? settings.outputFormat.toUpperCase() : undefined].filter(Boolean).join(' � ') || 'Model defaults'
+      'outputFormat' in settings ? settings.outputFormat.toUpperCase() : undefined].filter(Boolean).join(' · ') || 'Model defaults'
   }
   const size = 'imageSize' in settings ? settings.imageSize : '1K'
   return `${settings.aspectRatio || 'input/default ratio'} · ${size}`
@@ -150,12 +151,16 @@ async function loadOutputDetails() {
 const chatInput = ref('')
 const chatLoading = ref(false)
 // Current output for this card. Regenerate can advance this value.
-const currentImage = ref<string | null>(props.data?.outputImage || null)
+const currentImage = ref<string | null>(props.data?.outputImageDeletedAt ? null : props.data?.outputImage || null)
+const outputImageExpired = computed(() => !!props.data?.outputImageDeletedAt && !currentImage.value)
+const outputImageDeletedAt = computed(() => props.data?.outputImageDeletedAt
+  ? new Date(props.data.outputImageDeletedAt).toLocaleString()
+  : '')
 
 watch(
-  () => props.data?.outputImage,
-  (v) => {
-    if (!regenLoading.value) currentImage.value = v || null
+  () => [props.data?.outputImage, props.data?.outputImageDeletedAt] as const,
+  ([image, deletedAt]) => {
+    if (!regenLoading.value) currentImage.value = deletedAt ? null : image || null
   }
 )
 
@@ -163,7 +168,11 @@ async function sendRefine() {
   const text = chatInput.value.trim()
   if (!text || chatLoading.value) return
   if (!currentImage.value) {
-    toast.add({ title: 'No image to refine', color: 'warning' })
+    toast.add({
+      title: 'No image to refine',
+      description: outputImageExpired.value ? 'This generated image expired under the retention policy.' : undefined,
+      color: 'warning',
+    })
     return
   }
   const sourceImage = currentImage.value
@@ -255,10 +264,12 @@ async function regenerate() {
           .catch(() => undefined)
         parent = response?.item
       }
-      if (!parent?.outputImage) {
+      if (!parent?.outputImage || parent.outputImageDeletedAt) {
         toast.add({
           title: 'Cannot reproduce this refinement',
-          description: 'Its exact source image is no longer available.',
+          description: parent?.outputImageDeletedAt
+            ? 'Its generated source image expired under the retention policy. Exact replay is unavailable.'
+            : 'Its exact source image is no longer available.',
           color: 'warning',
         })
         return
@@ -305,7 +316,11 @@ async function regenerate() {
     toast.add({ title: 'Regeneration started', description: `Created ${count} job${count > 1 ? 's' : ''}.` })
   } catch (e: any) {
     console.error(e)
-    toast.add({ title: 'Regeneration failed', color: 'warning' })
+    toast.add({
+      title: 'Regeneration failed',
+      description: e?.data?.statusMessage || e?.statusMessage || e?.message || 'Request failed',
+      color: 'warning',
+    })
   } finally {
     await refreshNuxtData('systemPrompts')
     regenLoading.value = false
@@ -317,15 +332,21 @@ async function regenerate() {
   <div
     class="group relative overflow-hidden rounded-xl border border-gray-200 dark:border-gray-800 bg-white/70 dark:bg-gray-900/50 shadow-sm hover:shadow-lg transition-all duration-200"
   >
-    <div v-if="props.data?.outputImage" class="relative">
+    <div v-if="currentImage" class="relative">
       <DownloadableImage
-        :src="currentImage || props.data?.outputImage || ''"
+        :src="currentImage"
         :alt="props.data?.TextPrompt || 'Output image'"
         class="w-full h-auto object-contain bg-gray-50 dark:bg-gray-800"
       />
       <span class="absolute top-2 left-2 px-2 py-0.5 text-[10px] font-medium rounded bg-white/80 dark:bg-gray-900/70 text-gray-800 dark:text-gray-200 border border-gray-200 dark:border-gray-700">
         Output
       </span>
+    </div>
+    <div v-else-if="outputImageExpired" role="status" class="flex flex-col items-center gap-2 p-6 bg-gray-50 dark:bg-gray-800/60 text-gray-600 dark:text-gray-300 border-b border-gray-200 dark:border-gray-800 text-center">
+      <UIcon name="i-lucide-image-off" class="size-6" aria-hidden="true" />
+      <span class="text-sm font-medium">Image expired</span>
+      <p class="text-xs">Automatically deleted under the generated-image retention policy on {{ outputImageDeletedAt }}.</p>
+      <p class="text-xs">The prompt, settings, and generation history are retained. You can regenerate if the original source images are still available.</p>
     </div>
     <div v-else class="relative flex items-center gap-2 justify-center p-6 bg-red-50 dark:bg-red-900/30 text-red-700 dark:text-red-300 border-b border-red-200 dark:border-red-800">
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-5 h-5">
@@ -483,7 +504,7 @@ async function regenerate() {
       </div>
 
       <!-- Standalone refinement -->
-      <div v-if="props.data?.outputImage" class="mt-2 border-t border-gray-200 dark:border-gray-800 pt-2">
+      <div v-if="currentImage" class="mt-2 border-t border-gray-200 dark:border-gray-800 pt-2">
         <div class="text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Refine</div>
         <div class="flex items-end gap-2">
           <UTextarea

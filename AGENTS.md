@@ -12,10 +12,13 @@
 
 ## Stack and integration boundaries
 
+- Read the ignored `private-agents.md` when present for locally scoped development resource IDs. Keep credentials in ignored environment files or platform secret variables, never in either agents file.
+
 - Framework: Nuxt 4 on Node 26.
 - Railpack must install `libatomic1` in both the build and final runtime image through `railpack.json`. Node 26 requires `libatomic.so.1` on Linux. Deployment checks must verify the final runtime's shared libraries; a successful build alone is insufficient.
 - Coolify currently uses Railpack 0.23.0. Use explicit Apt package names in `railpack.json`; do not use the `"..."` list-extension syntax from newer Railpack documentation, because this version can pass it literally to `apt-get`. Check configuration compatibility against the deployed Railpack version.
-- ORM/database: Drizzle with local SQLite/libSQL.
+- ORM/database: Drizzle with PostgreSQL. Runtime code must not fall back to a local SQLite file.
+- Uploaded and generated images live in a private S3-compatible Railway bucket. Runtime file operations must use the storage backend; do not require a local disk or persistent app volume. Keep object keys within the configured prefix and serve images through authenticated endpoints.
 - All AI calls must use Vercel AI SDK through Vercel AI Gateway. Do not add direct provider SDK/API calls.
 - Curated image-model profiles and their runtime schemas live in `schemas/image-generation.ts` and `schemas/catalog-image-models.ts`. Record the catalog audit and exclusions in `docs/image-model-catalog.md`. Exact model IDs and discriminated settings—not names, descriptions, or regex heuristics—must choose adapters and capabilities.
 - All Gateway providers are in scope. Keep an explicit, verified per-model whitelist and record exclusions when a catalog model cannot use uploaded pictures through Gateway or returns unsupported media such as SVG.
@@ -32,7 +35,7 @@
 ## Generation reliability
 
 - Provider calls require a bounded timeout/abort signal and normalized, redacted, retryable timeout errors.
-- Generation concurrency and queue depth are process-wide and bounded. Reject overload with an explicit `429`; never accumulate an unbounded queue of future paid calls.
+- Generation concurrency and queue depth are bounded across all instances through PostgreSQL leases, with process-wide memory limits as an additional safeguard. Reject overload with an explicit `429`; never accumulate an unbounded queue of future paid calls. Keep generation work awaited within the request lifetime and use a bounded request deadline.
 - Create pending rows before provider work. Terminal state changes must be atomic and conditional on `status = 'pending'`; a failed sibling must never overwrite a successful output.
 - Recover abandoned pending rows using a conservative stale timeout or durable lease/heartbeat. Process start time is not job ownership and must not be used to fail another worker's live job.
 - Persist every provider output independently, release image buffers promptly, and clean up only the exact output file whose persistence failed.
@@ -43,7 +46,7 @@
 - Never store configured usernames/passwords or other server credentials in client-readable cookies or browser storage.
 - Authenticate through a server endpoint and issue an opaque/signed, expiring `HttpOnly`, `SameSite` session cookie; use `Secure` in production/HTTPS and timing-safe comparisons for secrets/signatures.
 - Parse multipart uploads as bounded streams; enforce request, file-count, per-file, aggregate-byte, and concurrent-upload limits during consumption. Do not reintroduce whole-body multipart parsers for large image uploads.
-- Keep all image reads, writes, listings, and serving confined to the designated image root after resolving real paths. Reject symlinks/junctions/reparse points within managed image paths.
+- Keep all image reads, writes, listings, and serving confined to the configured S3 prefix. Validate canonical object-key segments, reject traversal/URLs/ambiguous encoding, paginate listings, and bound recursive deletions. Local import tools must resolve real paths and reject symlinks/junctions/reparse points.
 - Determine trusted image MIME/extension from successfully decoded content, not caller filenames or magic prefixes alone. Reject corrupt, truncated, arbitrary ISO-BMFF/video, and unsupported image payloads before storage.
 - Login and other credential-verification endpoints require bounded, process-wide attempt throttling in addition to timing-safe comparison.
 
@@ -52,7 +55,7 @@
 - NEVER hand-edit generated files under `drizzle/` or `drizzle/meta/`.
 - Change `server/db/schema.ts`, then generate with `npm run drizzle:generate -- --name=<name>` and review the generated SQL.
 - Test migrations on a disposable/local database before applying them. Use `npm run drizzle:migrate`; do not use `drizzle:push` for schema changes in this project.
-- Keep `drizzle-orm` and `drizzle-kit` pinned to the same tested v1 release, currently `1.0.0-rc.4`. Migration SQL and snapshots live together in timestamped folders under `drizzle/`. Use `npm run drizzle:up` for a migration-format upgrade, review generated changes, and preserve existing SQL and migration timestamps. It is not a routine startup command.
+- Keep `drizzle-orm` and `drizzle-kit` pinned to the same tested v1 release, currently `1.0.0-rc.4`. PostgreSQL migration SQL and snapshots live together in timestamped folders under `drizzle/postgres/`; existing SQLite histories under `drizzle/` are retained as archives. Use `npm run drizzle:up` for a migration-format upgrade, review generated changes, and preserve existing SQL and migration timestamps. It is not a routine startup command. Never run migrations on each serverless cold start; apply them once through an explicit migration command.
 - For a Drizzle upgrade, test fresh databases and existing v0 migration histories, including pending migrations, data preservation, repeated migration runs, and conditional generation updates. The v1 SQLite migrator upgrades its bookkeeping table when `npm run drizzle:migrate` runs.
 - List/history endpoints must paginate in SQL and should not deserialize large per-generation metadata unless the caller requests details.
 

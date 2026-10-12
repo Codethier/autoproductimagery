@@ -78,3 +78,25 @@ test('outer failure repair excludes already-terminal output siblings', () => {
     [1, 3],
   )
 })
+
+test('cancelled memory waiters leave the bounded queue immediately and never start work', async () => {
+  const limiter = new GenerationLimiter(1, 1)
+  let release!: () => void
+  const first = limiter.run(() => new Promise<void>(resolve => { release = resolve }))
+  const abort = new AbortController()
+  const reason = new Error('Request expired')
+  let cancelledWorkStarted = false
+  const cancelled = limiter.run(async () => { cancelledWorkStarted = true }, abort.signal)
+  abort.abort(reason)
+  await assert.rejects(cancelled, error => error === reason)
+  assert.equal(limiter.snapshot().queued, 0)
+  let replacementStarted = false
+  const replacement = limiter.run(async () => { replacementStarted = true })
+  assert.equal(limiter.snapshot().queued, 1)
+  await Promise.resolve()
+  release()
+  await Promise.all([first, replacement])
+  assert.equal(cancelledWorkStarted, false)
+  assert.equal(replacementStarted, true)
+  assert.equal(limiter.snapshot().active, 0)
+})

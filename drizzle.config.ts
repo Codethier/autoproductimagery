@@ -3,11 +3,13 @@ import {defineConfig} from "drizzle-kit";
 
 export default defineConfig({
     schema: "./server/db/schema.ts",
-    out: "./drizzle",
+    // Preserve the historical SQLite migrations in drizzle/ unchanged.
+    // PostgreSQL has its own generated migration history.
+    out: "./drizzle/postgres",
     dbCredentials: {
-        url: process.env.DATABASE_URL as string | undefined,
+        url: process.env.DATABASE_URL ?? "",
     },
-    dialect: "sqlite",
+    dialect: "postgresql",
     verbose: true,
     strict: true,
 });

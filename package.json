@@ -4,6 +4,8 @@
   "private": true,
   "scripts": {
     "build": "nuxt build",
+    "build:retention": "node scripts/build-retention-worker.mjs",
+    "images:cleanup": "npm run build:retention && node .output/cleanup-generated-images.mjs",
     "dev": "nuxt dev",
     "generate": "nuxt generate",
     "preview": "nuxt preview",
@@ -17,18 +19,20 @@
   "dependencies": {
     "@ai-sdk/provider-utils": "^4.0.27",
     "@ai-sdk/vue": "^3.0.177",
+    "@aws-sdk/client-s3": "^3.1149.0",
     "@fastify/busboy": "^3.2.0",
-    "@libsql/client": "^0.15.15",
     "@nuxt/image": "~2.0.0",
     "@nuxt/scripts": "^0.11.13",
     "@nuxt/ui": "^4.10.0",
     "@unhead/vue": "^2.0.14",
     "ai": "^6.0.177",
     "dotenv": "^17.2.1",
+    "drizzle-kit": "1.0.0-rc.4",
     "drizzle-orm": "1.0.0-rc.4",
     "mime": "^4.0.7",
     "mime-types": "^3.0.1",
     "nuxt": "^4.4.2",
+    "pg": "^8.23.1",
     "sharp": "^0.34.5",
     "typescript": "^5.9.2",
     "unstorage": "^1.17.1",
@@ -38,10 +42,12 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@libsql/client": "^0.15.15",
     "@pinia/nuxt": "^0.11.2",
     "@types/mime-types": "^3.0.1",
     "@types/node": "^26.2.0",
-    "drizzle-kit": "1.0.0-rc.4",
+    "@types/pg": "^8.23.1",
+    "esbuild": "0.25.12",
     "vue-tsc": "^3.3.9"
   },
   "engines": {

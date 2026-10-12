@@ -8,10 +8,6 @@ import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import test from 'node:test'
-import { createClient } from '@libsql/client'
-import { drizzle } from 'drizzle-orm/libsql'
-import { and, eq } from 'drizzle-orm'
-import { systemPrompt } from '../server/db/schema.ts'
 
 const root = fileURLToPath(new URL('../', import.meta.url))
 const migrationsFolder = join(root, 'drizzle')
@@ -34,7 +30,6 @@ for (const appliedCount of [0, 5, 7]) {
   test(`Drizzle v1 migrates a database with ${appliedCount} legacy migrations and can rerun safely`, async () => {
     const directory = mkdtempSync(join(tmpdir(), 'imagery-migrations-test-'))
     const databasePath = join(directory, 'test.db')
-    let client: ReturnType<typeof createClient> | undefined
     try {
       const sqlite = new DatabaseSync(databasePath)
       try {
@@ -80,24 +75,21 @@ for (const appliedCount of [0, 5, 7]) {
           assert.equal(upgraded.prepare('SELECT TextPrompt FROM systemPrompt WHERE id = 1').get()?.TextPrompt, 'Preserve this product')
           assert.equal(upgraded.prepare('SELECT serverImages FROM systemPrompt WHERE id = 1').get()?.serverImages, '["input/original.png"]')
         }
+        // Keep the legacy SQLite migration/data-preservation regression while
+        // the application runtime schema moves entirely to PostgreSQL.
+        const created = upgraded.prepare('INSERT INTO systemPrompt (TextPrompt, outputImage, serverImages, status) VALUES (?, ?, ?, ?) RETURNING *')
+          .get('Round trip', '', '["input/test.png"]', 'pending')!
+        assert.deepEqual(JSON.parse(String(created.serverImages)), ['input/test.png'])
+        assert.ok(created.createdAt)
+        assert.equal(upgraded.prepare("UPDATE systemPrompt SET status = 'succeeded', outputImage = ? WHERE id = ? AND status = 'pending'")
+          .run('output/test.png', created.id!).changes, 1)
+        assert.equal(upgraded.prepare("UPDATE systemPrompt SET status = 'failed' WHERE id = ? AND status = 'pending'")
+          .run(created.id!).changes, 0)
+        assert.equal(upgraded.prepare('SELECT status FROM systemPrompt WHERE id = ?').get(created.id!)?.status, 'succeeded')
       } finally {
         upgraded.close()
       }
-      client = createClient({ url: pathToFileURL(databasePath).href })
-      const db = drizzle({ client })
-      const [created] = await db.insert(systemPrompt).values({
-        TextPrompt: 'Round trip', outputImage: '', serverImages: ['input/test.png'], status: 'pending',
-      }).returning()
-      assert.ok(created)
-      assert.deepEqual(created.serverImages, ['input/test.png'])
-      assert.ok(created.createdAt)
-      assert.equal((await db.update(systemPrompt).set({ status: 'succeeded', outputImage: 'output/test.png' })
-        .where(and(eq(systemPrompt.id, created.id), eq(systemPrompt.status, 'pending'))).returning()).length, 1)
-      assert.equal((await db.update(systemPrompt).set({ status: 'failed' })
-        .where(and(eq(systemPrompt.id, created.id), eq(systemPrompt.status, 'pending'))).returning()).length, 0)
-      assert.equal((await db.select().from(systemPrompt).where(eq(systemPrompt.id, created.id)))[0]?.status, 'succeeded')
     } finally {
-      client?.close()
       await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
     }
   })

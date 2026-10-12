@@ -650,7 +650,7 @@ export async function useGateway() {
         _modelCache = null
     }
 
-    async function loadInputFiles(opts: ImageGenerationRequest) {
+    async function loadInputFiles(opts: ImageGenerationRequest, requestAbortSignal?: AbortSignal) {
         const paths = [...opts.inputImages, ...opts.modelImages]
         const files: Array<{buffer: Buffer; mediaType: string}> = []
         const allowedMediaTypes = isGeminiImageSettings(opts.settings)
@@ -660,7 +660,9 @@ export async function useGateway() {
                 : new Set(['image/png', 'image/jpeg'])
         let totalBytes = 0
         for (const imagePath of paths) {
+            requestAbortSignal?.throwIfAborted()
             const image = await fs.getImageFile(imagePath)
+            requestAbortSignal?.throwIfAborted()
             if (!allowedMediaTypes.has(image.mimeType)) {
                 throw createError({
                     statusCode: 415,
@@ -682,9 +684,11 @@ export async function useGateway() {
         return files
     }
 
-    async function loadMaskFile(opts: ImageGenerationRequest): Promise<Buffer | undefined> {
+    async function loadMaskFile(opts: ImageGenerationRequest, requestAbortSignal?: AbortSignal): Promise<Buffer | undefined> {
         if (!opts.maskImage) return undefined
+        requestAbortSignal?.throwIfAborted()
         const mask = await fs.getImageFile(opts.maskImage)
+        requestAbortSignal?.throwIfAborted()
         return mask.buffer
     }
 
@@ -798,7 +802,7 @@ export async function useGateway() {
      * Gemini image models are multimodal language models. Their exact profile,
      * not a Gateway catalog heuristic, determines this generateText path.
      */
-    async function generateImageViaLanguageModel(opts: ImageGenerationRequest): Promise<GeneratedImage[]> {
+    async function generateImageViaLanguageModel(opts: ImageGenerationRequest, requestAbortSignal?: AbortSignal): Promise<GeneratedImage[]> {
         const request = validateGenerationRequest(opts)
         if (!isGeminiImageSettings(request.settings)) {
             validationError([{
@@ -820,7 +824,7 @@ export async function useGateway() {
         }
 
         const settings = request.settings
-        const files = await loadInputFiles(request)
+        const files = await loadInputFiles(request, requestAbortSignal)
         const safetySettings = [
             {category: 'HARM_CATEGORY_HATE_SPEECH', threshold: settings.safety.hateSpeech},
             {category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: settings.safety.dangerousContent},
@@ -845,7 +849,10 @@ export async function useGateway() {
             ? createGoogleSearch(grounding)
             : undefined
         const timeoutMs = getImageGenerationTimeoutMs()
-        const abortSignal = AbortSignal.timeout(timeoutMs)
+        const abortSignal = requestAbortSignal
+            ? AbortSignal.any([requestAbortSignal, AbortSignal.timeout(timeoutMs)])
+            : AbortSignal.timeout(timeoutMs)
+        abortSignal.throwIfAborted()
 
         const callGateway = () => generateText({
             model: gateway.languageModel(request.model),
@@ -882,6 +889,7 @@ export async function useGateway() {
         try {
             response = await callGateway()
         } catch (error) {
+            if (requestAbortSignal?.aborted) throw requestAbortSignal.reason
             if (abortSignal.aborted || isTimeoutLikeError(error)) {
                 throwGatewayTimeout('Gateway Gemini request', timeoutMs, error)
             }
@@ -924,7 +932,7 @@ export async function useGateway() {
      * Native image models use the Gateway image adapter. Only options validated
      * against the selected model settings schema are forwarded.
      */
-    async function generateImageViaImageModel(opts: ImageGenerationRequest): Promise<GeneratedImage[]> {
+    async function generateImageViaImageModel(opts: ImageGenerationRequest, requestAbortSignal?: AbortSignal): Promise<GeneratedImage[]> {
         const request = validateGenerationRequest(opts)
         if (isGeminiImageSettings(request.settings)) {
             validationError([{
@@ -946,8 +954,8 @@ export async function useGateway() {
         }
 
         const settings = request.settings
-        const files = await loadInputFiles(request)
-        const mask = await loadMaskFile(request)
+        const files = await loadInputFiles(request, requestAbortSignal)
+        const mask = await loadMaskFile(request, requestAbortSignal)
         const imageOptions = isOpenAiImageSettings(settings)
             ? {
                 referenceMode: 'images' as const,
@@ -971,7 +979,10 @@ export async function useGateway() {
             }
             : request.prompt
         const timeoutMs = getImageGenerationTimeoutMs()
-        const abortSignal = AbortSignal.timeout(timeoutMs)
+        const abortSignal = requestAbortSignal
+            ? AbortSignal.any([requestAbortSignal, AbortSignal.timeout(timeoutMs)])
+            : AbortSignal.timeout(timeoutMs)
+        abortSignal.throwIfAborted()
 
         let response: Awaited<ReturnType<typeof aiGenerateImage>>
         try {
@@ -984,6 +995,7 @@ export async function useGateway() {
                 ...gatewayOptions,
             })
         } catch (error) {
+            if (requestAbortSignal?.aborted) throw requestAbortSignal.reason
             if (abortSignal.aborted || isTimeoutLikeError(error)) {
                 throwGatewayTimeout('Gateway image request', timeoutMs, error)
             }
@@ -1009,12 +1021,13 @@ export async function useGateway() {
         }))
     }
 
-    async function generateAnyImage(opts: ImageGenerationRequest): Promise<GeneratedImage[]> {
+    async function generateAnyImage(opts: ImageGenerationRequest, requestAbortSignal?: AbortSignal): Promise<GeneratedImage[]> {
+        requestAbortSignal?.throwIfAborted()
         const request = validateGenerationRequest(opts)
         const profile = IMAGE_MODEL_PROFILES[request.model]
         return profile.adapter === 'gateway-language-image'
-            ? generateImageViaLanguageModel(request)
-            : generateImageViaImageModel(request)
+            ? generateImageViaLanguageModel(request, requestAbortSignal)
+            : generateImageViaImageModel(request, requestAbortSignal)
     }
 
     return {

@@ -1,4 +1,5 @@
 import { createError, send, setHeader } from "h3"
+import {imagePathFromRequestUrl} from '../../utils/imageServingPath'
 
 export default defineEventHandler(async (event) => {
     useAuth(event)
@@ -8,12 +9,12 @@ export default defineEventHandler(async (event) => {
     if (!params || params.name == null) {
         throw createError({ statusCode: 400, statusMessage: "Missing image path" })
     }
-    const rawSegments = Array.isArray(params.name) ? params.name : [params.name]
-    const imagePath = `/${rawSegments.join("/")}`
+    const imagePath = imagePathFromRequestUrl(event.node.req.url ?? event.path)
     const imageFs = await useFS()
     const image = await imageFs.getImageFile(imagePath)
     setHeader(event, "content-type", image.mimeType)
     setHeader(event, "content-length", image.buffer.byteLength)
     setHeader(event, "x-content-type-options", "nosniff")
+    setHeader(event, "cache-control", "private, no-store")
     await send(event, image.buffer)
 })

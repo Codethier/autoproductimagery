@@ -33,10 +33,12 @@ export default defineNuxtConfig({
          AiGatewayApiKey: '',
          authUser: '',
          authPassword: '',
+         authSessionSecret: '',
          imageGenerationConcurrency: 3,
          imageGenerationMaxQueue: 25,
          imageGenerationTimeoutMs: 180_000,
          imageGenerationStaleTtlMs: 15 * 60_000,
+         imageGenerationRequestTimeoutMs: 270_000,
         //     public
         public: {}
     },

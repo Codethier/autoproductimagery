@@ -1,0 +1,2 @@
+ALTER TABLE "systemPrompt" ADD COLUMN "outputImageDeletedAt" timestamp with time zone;--> statement-breakpoint
+CREATE INDEX "systemPrompt_image_retention_idx" ON "systemPrompt" ("createdAt","id") WHERE "outputImageDeletedAt" IS NULL AND "outputImage" <> '' AND ("status" = 'succeeded' OR "status" IS NULL);

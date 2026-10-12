@@ -269,7 +269,9 @@ export function minimumGeminiImageTokens(settings: ImageGenerationSettings): num
 export const ImagePathSchema = z.string()
   .trim()
   .min(1)
-  .max(1024)
+  // Canonical URLs encode each UTF-8 byte as up to three characters; the S3
+  // backend separately enforces its 1024-byte object-key limit.
+  .max(4096)
   .refine(value => value.startsWith('/images/'), 'Image paths must be inside /images/.')
   .refine(value => !/(^|[/\\])\.\.([/\\]|$)/.test(value), 'Parent path segments are not allowed.')
   .refine(value => !/[\0\r\n]/.test(value), 'Invalid image path.')

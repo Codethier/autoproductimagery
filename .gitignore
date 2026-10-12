@@ -18,6 +18,10 @@ logs
 .fleet
 .idea
 
+# Local Codex reports and audit tools
+/.codex/artifacts/
+/private-agents.md
+
 # Local env files
 .env
 .env.*

@@ -1,15 +1,17 @@
 import { createError } from "h3"
 import { installBoundedRawBody } from "../utils/boundedRequestBody"
+import {CreateImageFolderSchema} from '~~/schemas/image-storage'
 
 export default defineEventHandler(async (event) => {
     useAuth(event)
     assertMethod(event, "POST")
 
     await installBoundedRawBody(event, 16 * 1024)
-    const body = await readBody<{ path?: string; name?: string }>(event)
-    if (!body?.name) {
-        throw createError({ statusCode: 400, statusMessage: "Missing folder name" })
+    const parsed = CreateImageFolderSchema.safeParse(await readBody(event))
+    if (!parsed.success) {
+        throw createError({ statusCode: 400, statusMessage: "Invalid folder request" })
     }
+    const body = parsed.data
 
     const fs = await useFS()
     await fs.createFolder(body.path ?? "/", body.name)

@@ -1,18 +1,18 @@
+import {pgTable, serial, integer, text, jsonb, timestamp, uuid, index} from "drizzle-orm/pg-core";
 import {sql} from "drizzle-orm";
-import {sqliteTable, integer, text, index} from "drizzle-orm/sqlite-core";
 import type {
     OutputMetadata,
     StoredGenerationConfig,
     StoredGenerationError,
 } from "~~/schemas/image-generation";
 
-export const systemPrompt = sqliteTable("systemPrompt", {
-    id: integer("id").primaryKey({autoIncrement: true}),
+export const systemPrompt = pgTable("systemPrompt", {
+    id: serial("id").primaryKey(),
     TextPrompt: text("TextPrompt").notNull(),
-    // Store arrays as JSON in TEXT
-    serverImages: text("serverImages", {mode: "json"}).$type<string[]>(),
-    modelImages: text("modelImages", {mode: "json"}).$type<string[]>(),
+    serverImages: jsonb("serverImages").$type<string[]>(),
+    modelImages: jsonb("modelImages").$type<string[]>(),
     outputImage: text("outputImage").notNull(),
+    outputImageDeletedAt: timestamp("outputImageDeletedAt", {mode: "string", withTimezone: true}),
     generationModel: text("generationModel"),
     inputTokens: integer("inputTokens"),
     outputTokens: integer("outputTokens"),
@@ -22,30 +22,32 @@ export const systemPrompt = sqliteTable("systemPrompt", {
     priceUsd: text("priceUsd"),
     priceSource: text("priceSource"),
     gatewayGenerationId: text("gatewayGenerationId"),
-    usageJson: text("usageJson", {mode: "json"}).$type<Record<string, unknown>>(),
-    createdAt: text("createdAt").default(sql`CURRENT_TIMESTAMP`).notNull(),
-    updatedAt: text("updatedAt").default(sql`CURRENT_TIMESTAMP`).notNull(),
+    usageJson: jsonb("usageJson").$type<Record<string, unknown>>(),
+    createdAt: timestamp("createdAt", {mode: "string", withTimezone: true}).defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt", {mode: "string", withTimezone: true}).defaultNow().notNull(),
     errors: text("errors"),
     status: text("status").$type<'pending' | 'succeeded' | 'failed'>(),
     batchId: text("batchId"),
     parentSystemPromptId: integer("parentSystemPromptId"),
-    generationConfig: text("generationConfig", {mode: "json"}).$type<StoredGenerationConfig>(),
-    outputMetadata: text("outputMetadata", {mode: "json"}).$type<OutputMetadata>(),
-    errorJson: text("errorJson", {mode: "json"}).$type<StoredGenerationError>(),
+    generationConfig: jsonb("generationConfig").$type<StoredGenerationConfig>(),
+    outputMetadata: jsonb("outputMetadata").$type<OutputMetadata>(),
+    errorJson: jsonb("errorJson").$type<StoredGenerationError>(),
 }, (table) => [
     index("systemPrompt_batchId_idx").on(table.batchId),
     index("systemPrompt_parentSystemPromptId_idx").on(table.parentSystemPromptId),
     index("systemPrompt_status_updatedAt_idx").on(table.status, table.updatedAt),
+    index("systemPrompt_outputImage_idx").on(table.outputImage),
+    index("systemPrompt_image_retention_idx").on(table.createdAt, table.id).where(sql`${table.outputImageDeletedAt} IS NULL AND ${table.outputImage} <> '' AND (${table.status} = 'succeeded' OR ${table.status} IS NULL)`),
 ]);
 
-export const aiGatewayLog = sqliteTable("aiGatewayLog", {
-    id: integer("id").primaryKey({autoIncrement: true}),
+export const aiGatewayLog = pgTable("aiGatewayLog", {
+    id: serial("id").primaryKey(),
     systemPromptId: integer("systemPromptId"),
     status: text("status").notNull(),
     model: text("model").notNull(),
     prompt: text("prompt").notNull(),
-    inputImages: text("inputImages", {mode: "json"}).$type<string[]>(),
-    modelImages: text("modelImages", {mode: "json"}).$type<string[]>(),
+    inputImages: jsonb("inputImages").$type<string[]>(),
+    modelImages: jsonb("modelImages").$type<string[]>(),
     outputImage: text("outputImage"),
     outputMimeType: text("outputMimeType"),
     inputTokens: integer("inputTokens"),
@@ -54,16 +56,16 @@ export const aiGatewayLog = sqliteTable("aiGatewayLog", {
     priceUsd: text("priceUsd"),
     priceSource: text("priceSource"),
     gatewayGenerationId: text("gatewayGenerationId"),
-    requestJson: text("requestJson", {mode: "json"}).$type<Record<string, unknown>>(),
-    responseJson: text("responseJson", {mode: "json"}).$type<Record<string, unknown>>(),
+    requestJson: jsonb("requestJson").$type<Record<string, unknown>>(),
+    responseJson: jsonb("responseJson").$type<Record<string, unknown>>(),
     error: text("error"),
     durationMs: integer("durationMs"),
     batchId: text("batchId"),
     attemptNumber: integer("attemptNumber"),
     providerRequestId: text("providerRequestId"),
-    resolvedConfigJson: text("resolvedConfigJson", {mode: "json"}).$type<StoredGenerationConfig>(),
-    errorJson: text("errorJson", {mode: "json"}).$type<StoredGenerationError>(),
-    createdAt: text("createdAt").default(sql`CURRENT_TIMESTAMP`).notNull(),
+    resolvedConfigJson: jsonb("resolvedConfigJson").$type<StoredGenerationConfig>(),
+    errorJson: jsonb("errorJson").$type<StoredGenerationError>(),
+    createdAt: timestamp("createdAt", {mode: "string", withTimezone: true}).defaultNow().notNull(),
 }, (table) => [
     index("aiGatewayLog_systemPromptId_idx").on(table.systemPromptId),
     index("aiGatewayLog_batchId_idx").on(table.batchId),
@@ -71,6 +73,30 @@ export const aiGatewayLog = sqliteTable("aiGatewayLog", {
 ]);
 
 export type SystemPrompt = typeof systemPrompt.$inferSelect;
+
+// Shared capacity and credential-attempt accounting must survive warm-worker
+// eviction and coordinate across independently scaled serverless instances.
+export const runtimeLease = pgTable("runtime_lease", {
+    id: uuid("id").primaryKey(),
+    scope: text("scope").notNull(),
+    owner: uuid("owner").notNull(),
+    state: text("state").$type<'queued' | 'running'>().notNull(),
+    expiresAt: timestamp("expires_at", {mode: "string", withTimezone: true}).notNull(),
+    createdAt: timestamp("created_at", {mode: "string", withTimezone: true}).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", {mode: "string", withTimezone: true}).defaultNow().notNull(),
+}, (table) => [
+    index("runtime_lease_scope_state_expires_idx").on(table.scope, table.state, table.expiresAt),
+    index("runtime_lease_owner_expires_idx").on(table.owner, table.expiresAt),
+]);
+
+export const durableLoginAttempt = pgTable("login_attempt", {
+    key: text("key").primaryKey(),
+    attempts: integer("attempts").default(0).notNull(),
+    resetAt: timestamp("reset_at", {mode: "string", withTimezone: true}).notNull(),
+    updatedAt: timestamp("updated_at", {mode: "string", withTimezone: true}).defaultNow().notNull(),
+}, (table) => [
+    index("login_attempt_reset_idx").on(table.resetAt),
+]);
 export type NewSystemPrompt = typeof systemPrompt.$inferInsert;
 export type AiGatewayLog = typeof aiGatewayLog.$inferSelect;
 export type NewAiGatewayLog = typeof aiGatewayLog.$inferInsert;

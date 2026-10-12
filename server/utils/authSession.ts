@@ -39,9 +39,22 @@ export function credentialsMatch(
     return userMatches && passwordMatches
 }
 
-function signingKey(authUser: string, authPassword: string): Buffer {
+export function getAuthSessionSecret(runtimeConfig: Record<string, unknown> = {}): string {
+    const value = runtimeConfig.authSessionSecret
+        || process.env.NUXT_AUTH_SESSION_SECRET
+        || process.env.AUTH_SESSION_SECRET
+    const secret = typeof value === 'string' ? value : ''
+    if ((process.env.NODE_ENV === 'production' || secret) && secret.length < 32) {
+        throw new Error('AUTH_SESSION_SECRET must contain at least 32 characters')
+    }
+    return secret
+}
+
+function signingKey(authUser: string, authPassword: string, sessionSecret: string): Buffer {
     return createHash("sha256")
         .update(SIGNING_CONTEXT, "utf8")
+        .update("\0", "utf8")
+        .update(sessionSecret, "utf8")
         .update("\0", "utf8")
         .update(authUser, "utf8")
         .update("\0", "utf8")
@@ -49,8 +62,8 @@ function signingKey(authUser: string, authPassword: string): Buffer {
         .digest()
 }
 
-function sign(encodedPayload: string, authUser: string, authPassword: string): Buffer {
-    return createHmac("sha256", signingKey(authUser, authPassword))
+function sign(encodedPayload: string, authUser: string, authPassword: string, sessionSecret: string): Buffer {
+    return createHmac("sha256", signingKey(authUser, authPassword, sessionSecret))
         .update(encodedPayload, "ascii")
         .digest()
 }
@@ -59,6 +72,7 @@ export function createAuthSessionToken(
     authUser: string,
     authPassword: string,
     nowMs = Date.now(),
+    sessionSecret = '',
 ): string {
     const issuedAt = Math.floor(nowMs / 1000)
     const payload: SessionPayload = {
@@ -68,7 +82,7 @@ export function createAuthSessionToken(
         nonce: randomBytes(18).toString("base64url"),
     }
     const encodedPayload = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url")
-    const signature = sign(encodedPayload, authUser, authPassword).toString("base64url")
+    const signature = sign(encodedPayload, authUser, authPassword, sessionSecret).toString("base64url")
     return `${encodedPayload}.${signature}`
 }
 
@@ -77,7 +91,9 @@ export function verifyAuthSessionToken(
     authUser: string,
     authPassword: string,
     nowMs = Date.now(),
+    sessionSecret = '',
 ): boolean {
+    if (token.length > 2048) return false
     const separator = token.indexOf(".")
     if (separator <= 0 || token.indexOf(".", separator + 1) !== -1) return false
 
@@ -90,7 +106,7 @@ export function verifyAuthSessionToken(
         return false
     }
 
-    const expectedSignature = sign(encodedPayload, authUser, authPassword)
+    const expectedSignature = sign(encodedPayload, authUser, authPassword, sessionSecret)
     if (suppliedSignature.length !== expectedSignature.length
         || !timingSafeEqual(suppliedSignature, expectedSignature)) {
         return false
