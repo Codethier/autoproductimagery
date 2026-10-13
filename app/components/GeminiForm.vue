@@ -353,6 +353,13 @@ const dragging = ref(false)
 const pickerOpen = ref(false)
 const pickerKind = ref<'source' | 'references' | 'mask'>('source')
 const pickerSelection = ref<string[]>([])
+const backgroundRemovalSources = ref<string[]>([])
+function openBackgroundRemoval(urls: string[]) { backgroundRemovalSources.value = [...urls] }
+async function useCutout(url: string) {
+  backgroundRemovalSources.value = []
+  if (isEdit.value) data.editSource = url
+  else await navigateTo({path: '/edit', query: {source: url}})
+}
 type GenerationResult = GenerationPrice & {id?: number; outputImage?: string | null; outputImageDeletedAt?: string | null; errors?: string | null; status?: string | null}
 const previewResult = ref<GenerationResult | null>(null)
 const previewOutput = computed(() => previewResult.value && hasConfirmedGenerationPrice(previewResult.value)
@@ -410,6 +417,7 @@ watch(account.epoch, () => {
   dragging.value = false
   pickerOpen.value = false
   pickerSelection.value = []
+  backgroundRemovalSources.value = []
   previewResult.value = null
   billingPollAttempts = 0
   if (billingPollTimer) clearTimeout(billingPollTimer)
@@ -665,6 +673,9 @@ async function submit() {
                       @confirm="confirmPicker" />
       </template>
     </UModal>
+    <div v-if="backgroundRemovalSources.length" class="studio-cutout-backdrop" @click.self="backgroundRemovalSources = []">
+      <BackgroundRemovalPanel :source-urls="backgroundRemovalSources" @close="backgroundRemovalSources = []" @use-output="useCutout" />
+    </div>
     <div class="studio-workspace" :class="{ 'studio-workspace--editing': hasSources }">
       <section class="studio-canvas-area" aria-label="Image canvas" @dragover.prevent="dragging = true" @dragleave.prevent="dragging = false" @drop.prevent="onDrop">
         <div v-if="!hasSources" class="studio-start">
@@ -696,6 +707,7 @@ async function submit() {
             <div class="studio-toolbar-actions">
               <UButton v-if="previewOutput" color="neutral" variant="ghost" size="sm" @click="data.editSource = previewOutput">Use as input</UButton>
               <UButton color="neutral" variant="ghost" size="sm" icon="i-lucide-folder" @click="openPicker('source')">Replace</UButton>
+              <UButton v-if="previewImage && !sourceUnavailable" color="neutral" variant="soft" size="sm" icon="i-lucide-scissors" @click="openBackgroundRemoval([previewImage])">Remove background</UButton>
               <UButton v-if="previewImage" :href="imageDownloadUrl(previewImage)" :download="imageName(previewImage)" external color="neutral" variant="soft" size="sm" icon="i-lucide-download">Download</UButton>
             </div>
           </div>
@@ -723,6 +735,7 @@ async function submit() {
             <div class="studio-toolbar-actions">
               <UButton color="neutral" variant="ghost" size="sm" @click="clearInputImages">Clear</UButton>
               <UButton color="neutral" variant="soft" size="sm" icon="i-lucide-folder" @click="openPicker('source')">Assets</UButton>
+              <UButton color="neutral" variant="soft" size="sm" icon="i-lucide-scissors" @click="openBackgroundRemoval(sourceImages)">Remove backgrounds</UButton>
               <UButton size="sm" icon="i-lucide-plus" :loading="uploading" @click="uploadInput?.click()">Add images</UButton>
             </div>
           </div>
@@ -822,6 +835,8 @@ async function submit() {
 </template>
 
 <style scoped>
+.studio-cutout-backdrop { position: fixed; inset: 0; z-index: 100; padding: 24px; display: flex; align-items: center; justify-content: center; background: #14100bbd; backdrop-filter: blur(5px); }
+@media (max-width: 600px) { .studio-cutout-backdrop { padding: 12px; } }
 .studio-generation-price{font-size:10px;line-height:1.7;color:#e3c19a;margin-top:12px}.studio-generation-credit{font-size:10px;color:var(--workspace-muted);margin-top:8px}
 .generation-studio { color: var(--workspace-text); }
 .studio-route-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; min-height: 76px; padding: 18px 32px; border-bottom: 1px solid var(--workspace-border); background: var(--workspace-bg); }

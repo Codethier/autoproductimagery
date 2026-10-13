@@ -1,6 +1,11 @@
 {
   "$schema": "https://schema.railpack.com",
   "buildAptPackages": ["libatomic1"],
+  "steps": {
+    "install": {
+      "variables": { "ONNXRUNTIME_NODE_INSTALL": "skip" }
+    }
+  },
   "deploy": {
     "aptPackages": ["libatomic1"]
   }

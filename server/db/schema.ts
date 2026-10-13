@@ -5,6 +5,7 @@ import type {
     StoredGenerationConfig,
     StoredGenerationError,
 } from "~~/schemas/image-generation";
+import type {BackgroundRemovalModel, BackgroundRemovalStatus, BackgroundRemovalError} from '../../schemas/background-removal';
 
 export const organizations = pgTable('organization', {
     id: uuid('id').primaryKey(),
@@ -56,7 +57,7 @@ export const assets = pgTable('asset', {
     name: text('name').notNull(),
     kind: text('kind').$type<'file' | 'folder'>().notNull(),
     url: text('url').notNull(),
-    category: text('category').$type<'uploaded' | 'generated'>().default('uploaded').notNull(),
+    category: text('category').$type<'uploaded' | 'generated' | 'processed'>().default('uploaded').notNull(),
     byteSize: bigint('byte_size', {mode: 'number'}),
     mimeType: text('mime_type'),
     width: integer('width'),
@@ -69,7 +70,44 @@ export const assets = pgTable('asset', {
     index('asset_owner_parent_idx').on(table.organizationId, table.ownerUserId, table.parentId, table.name),
     index('asset_parent_idx').on(table.parentId),
     check('asset_kind_check', sql`${table.kind} IN ('file', 'folder')`),
-    check('asset_category_check', sql`${table.category} IN ('uploaded', 'generated')`),
+    check('asset_category_check', sql`${table.category} IN ('uploaded', 'generated', 'processed')`),
+]);
+
+// Local CPU processing has its own durable queue and a known zero provider
+// charge. It never creates or masquerades as a Vercel Gateway billing record.
+export const backgroundRemovalJobs = pgTable('background_removal_job', {
+    id: uuid('id').primaryKey(),
+    organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+    userId: uuid('user_id').notNull().references(() => users.id),
+    sourceAssetId: uuid('source_asset_id').notNull().references(() => assets.id),
+    sourceUrl: text('source_url').notNull(),
+    model: text('model').$type<BackgroundRemovalModel>().notNull(),
+    modelVersion: text('model_version').notNull(),
+    status: text('status').$type<BackgroundRemovalStatus>().default('queued').notNull(),
+    idempotencyKey: uuid('idempotency_key').notNull(),
+    attempts: integer('attempts').default(0).notNull(),
+    leaseOwner: uuid('lease_owner'),
+    leaseExpiresAt: timestamp('lease_expires_at', {mode: 'string', withTimezone: true}),
+    heartbeatAt: timestamp('heartbeat_at', {mode: 'string', withTimezone: true}),
+    outputAssetId: uuid('output_asset_id').references(() => assets.id),
+    outputUrl: text('output_url'),
+    providerPriceUsd: text('provider_price_usd').default('0').notNull(),
+    errorJson: jsonb('error_json').$type<BackgroundRemovalError>(),
+    createdAt: timestamp('created_at', {mode: 'string', withTimezone: true}).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', {mode: 'string', withTimezone: true}).defaultNow().notNull(),
+    startedAt: timestamp('started_at', {mode: 'string', withTimezone: true}),
+    completedAt: timestamp('completed_at', {mode: 'string', withTimezone: true}),
+}, table => [
+    uniqueIndex('background_removal_idempotency_unique').on(table.organizationId, table.userId, table.idempotencyKey),
+    index('background_removal_owner_history_idx').on(table.organizationId, table.userId, table.createdAt, table.id),
+    index('background_removal_queue_idx').on(table.status, table.createdAt, table.id),
+    index('background_removal_lease_idx').on(table.status, table.leaseExpiresAt),
+    check('background_removal_model_check', sql`${table.model} IN ('birefnet-lite', 'birefnet')`),
+    check('background_removal_status_check', sql`${table.status} IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')`),
+    check('background_removal_attempts_check', sql`${table.attempts} BETWEEN 0 AND 2`),
+    check('background_removal_provider_price_check', sql`${table.providerPriceUsd} = '0'`),
+    check('background_removal_lease_check', sql`(${table.status} = 'running' AND ${table.leaseOwner} IS NOT NULL AND ${table.leaseExpiresAt} IS NOT NULL) OR (${table.status} <> 'running' AND ${table.leaseOwner} IS NULL AND ${table.leaseExpiresAt} IS NULL)`),
+    check('background_removal_output_check', sql`(${table.status} = 'succeeded' AND ${table.outputAssetId} IS NOT NULL AND ${table.outputUrl} IS NOT NULL) OR (${table.status} <> 'succeeded' AND ${table.outputAssetId} IS NULL AND ${table.outputUrl} IS NULL)`),
 ]);
 
 export const assetShares = pgTable('asset_share', {

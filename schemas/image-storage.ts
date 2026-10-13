@@ -35,7 +35,7 @@ export type AssetPermissions = {view: boolean; edit: boolean; share: boolean}
 export type AssetFile = SelectableFile & {
     folder: string; bytes?: number; modifiedAt?: string; id?: string; kind?: 'file' | 'folder'; itemCount?: number;
     ownerUserId?: string; permissions?: AssetPermissions; source?: AssetSource; sharedBy?: AssetSource;
-    category?: 'uploaded' | 'generated'; priceUsd?: string | null; priceSource?: string | null;
+    category?: 'uploaded' | 'generated' | 'processed'; priceUsd?: string | null; priceSource?: string | null;
     billingState?: 'pending' | 'awaiting' | 'confirmed' | 'released' | null;
 }
 export type AssetFolder = Pick<AssetFile, 'name' | 'url' | 'id' | 'kind' | 'ownerUserId' | 'permissions' | 'source' | 'sharedBy' | 'itemCount'> & {path: string}

@@ -11,6 +11,9 @@ import sharp from 'sharp'
 import {createImageDeliveryCache, type ImageRepresentation} from './imageDeliveryCache'
 import {imageDeliveryEtag, imageDeliveryRevision, matchesImageEtag, IMAGE_PREVIEW_SIZES, type ImagePreviewSize} from './imageDeliveryPolicy'
 import {MAX_IMAGE_PIXELS} from './imageValidation'
+import {and, asc, eq, inArray, isNull, sql} from 'drizzle-orm'
+import {assets, assetShares, users} from '../db/schema'
+import type {BackgroundRemovalTransaction} from './backgroundRemovalJobs'
 
 type RawStorage = Awaited<ReturnType<typeof useFS>>
 // One warm-instance cache per storage backend; no disk dependency or cross-backend key collisions.
@@ -154,6 +157,54 @@ export async function useUserFS(actor: AssetActor, storage?: RawStorage, databas
             throw error
         }
     }
+    /** Stage one immutable cutout. Its registry row is published only with a successful job. */
+    async function prepareProcessedImage(data: Buffer) {
+        await ensureRawFolders([...ownParts, 'cutouts'])
+        const output = await raw.saveGeneratedImage(data, 'image/png', {organizationId: actor.organizationId, userId: actor.userId})
+        return {
+            ...output,
+            discard: () => raw.removeGeneratedImage(output.url),
+            register: async (tx: BackgroundRemovalTransaction, source: {id: string; url: string}) => {
+                // Serialize with owner subtree deletion and repeat authorization after inference.
+                await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${actor.organizationId + ':' + actor.userId}, 0))`)
+                const fresh = createAssetRepository(actor, tx as unknown as typeof database)
+                const candidate = await fresh.requireAsset(source.url)
+                const chain = await fresh.ancestors(candidate.row)
+                // Hold publication's source/grant checks until commit. Revocation and
+                // subtree tombstoning either finish first or serialize after publication.
+                await tx.select({id: assets.id}).from(assets).where(and(eq(assets.organizationId, actor.organizationId),
+                    inArray(assets.id, chain.map(row => row.id)))).orderBy(asc(assets.id)).for('share')
+                if (candidate.row.ownerUserId !== actor.userId) {
+                    await tx.select({id: assetShares.id}).from(assetShares).where(and(eq(assetShares.organizationId, actor.organizationId),
+                        eq(assetShares.recipientUserId, actor.userId), inArray(assetShares.assetId, chain.map(row => row.id))))
+                        .orderBy(asc(assetShares.id)).for('share')
+                }
+                const [enabled] = await tx.select({id: users.id}).from(users).where(and(eq(users.id, actor.userId),
+                    eq(users.organizationId, actor.organizationId), isNull(users.disabledAt))).for('share')
+                if (!enabled) throw createError({statusCode: 401, statusMessage: 'Unauthorized'})
+                const original = await fresh.requireAsset(source.url)
+                if (original.row.id !== source.id || original.row.kind !== 'file') throw createError({statusCode: 404, statusMessage: 'Image not found'})
+                const folderUrl = imagePathToUrl([...ownParts, 'cutouts'])
+                let [folder] = await tx.select().from(assets).where(and(eq(assets.url, folderUrl),
+                    eq(assets.organizationId, actor.organizationId), isNull(assets.deletedAt))).limit(1)
+                if (folder && (folder.kind !== 'folder' || folder.ownerUserId !== actor.userId || folder.category !== 'processed')) {
+                    throw createError({statusCode: 409, statusMessage: 'Cutout folder is unavailable'})
+                }
+                if (!folder) {
+                    ;[folder] = await tx.insert(assets).values({id: randomUUID(), organizationId: actor.organizationId,
+                        ownerUserId: actor.userId, createdByUserId: actor.userId, parentId: null,
+                        url: folderUrl, name: 'Cutouts', kind: 'folder', category: 'processed'}).returning()
+                }
+                if (!folder) throw new Error('Could not register cutout folder')
+                const id = randomUUID()
+                await tx.insert(assets).values({id, organizationId: actor.organizationId, ownerUserId: actor.userId,
+                    createdByUserId: actor.userId, parentId: folder.id, url: output.url,
+                    name: `Cutout · ${original.row.name.replace(/\.[^.]+$/, '')}.png`, kind: 'file', category: 'processed',
+                    byteSize: output.bytes, mimeType: output.mimeType, width: output.width, height: output.height})
+                return {outputAssetId: id, outputUrl: output.url}
+            },
+        }
+    }
     async function removeGeneratedImage(url: string) {
         const {row} = await repository.requireAsset(url, 'edit')
         if (row.category !== 'generated' || row.kind !== 'file' || row.ownerUserId !== actor.userId) throw createError({statusCode: 403, statusMessage: 'Only your generated outputs can be removed here'})
@@ -198,6 +249,7 @@ export async function useUserFS(actor: AssetActor, storage?: RawStorage, databas
         assertReadableImages: safe(assertReadableImages), saveUpload: safe(saveUpload),
         saveFile: safe(async (path: string, file: BufferedUploadFile) => (await saveUpload(path, file)).name),
         saveGeneratedImage: safe(saveGeneratedImage), removeGeneratedImage: safe(removeGeneratedImage),
+        prepareProcessedImage: safe(prepareProcessedImage),
         createFolder: safe(createFolder), deleteFileOrFolder: safe(deleteFileOrFolder),
         listAssets: safe(repository.list),
         readDir: safe(async (path: string, pagination: {cursor?: string; limit?: number; folderId?: string} = {}) => repository.list({path, ...pagination, direct: true})),

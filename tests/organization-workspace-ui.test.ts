@@ -28,7 +28,7 @@ registerHooks({
     if (url !== browserUrl && url !== legacyFilesUrl && url !== layoutUrl && url !== balanceUrl && url !== teamUrl) return nextLoad(url, context)
     const filename = fileURLToPath(url)
     let source = readFileSync(filename, 'utf8')
-    if (url === browserUrl) source = source.replace('</script>', 'defineExpose({files, directories, rootFolders, loading, openSharing, shareTarget, shareRecipient, saveShare, revokeShare, grants, currentFolder, preview, selection, selectedMetadata, confirmSelection, fetchPage, view})\n</script>')
+    if (url === browserUrl) source = source.replace('</script>', 'defineExpose({files, directories, rootFolders, loading, openSharing, shareTarget, shareRecipient, saveShare, revokeShare, grants, currentFolder, preview, selection, selectedMetadata, confirmSelection, fetchPage, view, backgroundRemovalSources, openBackgroundRemoval})\n</script>')
     if (url === legacyFilesUrl) source = source.replace('import {useDataStore} from "~/stores/data.store";', '')
     if (url === teamUrl) source = source.replace('</script>', 'defineExpose({openBalance, saveBalance, balanceForm, balanceDetails, balanceError})\n</script>')
     const {descriptor} = parse(source, {filename})
@@ -74,6 +74,7 @@ async function renderBrowser(options: {shared?: boolean; files?: AssetFile[]; di
   }}
   const app = createSSRApp({render: () => h(component, {initialScope: options.shared ? 'shared' : 'all', sharedOnly: options.shared})})
   app.component('UIcon', {render: () => h('span', {'aria-hidden': 'true'})})
+  app.component('BackgroundRemovalPanel', {render: () => null})
   app.component('NuxtLink', {props: ['to'], setup: (props: any, {slots}: any) => () => h('a', {href: typeof props.to === 'string' ? props.to : props.to.path}, slots.default?.())})
   const warnings: string[] = []; app.config.warnHandler = message => warnings.push(message)
   const html = await renderToString(app)
@@ -220,6 +221,27 @@ test('shared library grids request small previews while the modal and download k
   assert.equal(browser.html.includes(`href="/api/data${file.url}"`), true)
   assert.equal(browser.html.includes(`src="/api/data${file.url}"`), false, 'a CSS thumbnail must not download an original')
   assert.match(browser.html, /decoding="async"/)
+})
+
+test('library previews and selected shared images offer cutouts while the source stays read-only', async () => {
+  const source = fixtureFile('shared-product.png', 'alice', 'view')
+  const browser = await renderBrowser({shared: true, files: [source], selected: true, preview: true})
+  assert.match(browser.html, /Remove background/)
+  assert.match(browser.html, /Remove backgrounds/)
+  browser.exposed.openBackgroundRemoval([source.url])
+  assert.deepEqual(browser.exposed.backgroundRemovalSources.value, [source.url])
+  assert.equal(browser.exposed.preview.value, undefined)
+  assert.equal(browser.exposed.files.value[0].url, source.url)
+  assert.deepEqual(browser.calls, [])
+})
+
+test('completed local cutouts use normal library previews with their separate zero provider charge', async () => {
+  const cutout: AssetFile = {...fixtureFile('product-cutout.png', 'alice', 'owner'), category: 'processed', priceUsd: '0', priceSource: 'local-processing'}
+  const browser = await renderBrowser({files: [cutout], actorId: 'alice', preview: true})
+  assert.match(browser.html, /\$0 provider charge · background removal/)
+  assert.equal(browser.html.includes(`src="/api/data${cutout.url}?preview=480"`), true)
+  assert.equal(browser.html.includes(`href="/api/data${cutout.url}"`), true)
+  assert.doesNotMatch(browser.html, /Confirming price|estimate/)
 })
 
 test('balance summary separates available credit, outstanding estimates and exact confirmed charges', async () => {

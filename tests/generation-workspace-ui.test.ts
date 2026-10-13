@@ -25,7 +25,7 @@ registerHooks({
     if (url === formUrl || (url.startsWith(settingsDirectory) && url.endsWith('.vue'))) {
       const filename = fileURLToPath(url)
       let source = readFileSync(filename, 'utf8')
-      if (url === formUrl) source = source.replace('</script>', 'defineExpose({ submit, uploadFiles, loadMoreHistory, sourceImages, data, pickerKind, confirmPicker, previewOutput, previewResult, recentImages, canSubmit, prompt, pendingGenerations, activeGenerationCount, errorMsg, uploading, displayedHistory, historyOpen, confirmedHistory })\n</script>')
+      if (url === formUrl) source = source.replace('</script>', 'defineExpose({ submit, uploadFiles, loadMoreHistory, sourceImages, data, pickerKind, confirmPicker, previewOutput, previewResult, recentImages, canSubmit, prompt, pendingGenerations, activeGenerationCount, errorMsg, uploading, displayedHistory, historyOpen, confirmedHistory, backgroundRemovalSources, openBackgroundRemoval, useCutout })\n</script>')
       const { descriptor } = parse(source, { filename })
       const compiled = compileScript(descriptor, { id: filename, inlineTemplate: true })
       const nuxtServices = url === formUrl ? `
@@ -102,6 +102,7 @@ function registerUiPrimitives(app: ReturnType<typeof createSSRApp>) {
   app.component('UIcon', { render: () => h('span', { 'aria-hidden': 'true' }) })
   app.component('UModal', { render: () => null })
   app.component('AssetBrowser', { render: () => null })
+  app.component('BackgroundRemovalPanel', { render: () => null })
   // The parent must not mount result components until their exact prices exist.
   // A marked stub makes that boundary observable independently of the child's
   // defensive visibility gate tested in generated-image-retention-ui.test.ts.
@@ -211,6 +212,24 @@ test('the Asset picker replaces only the active workspace selection', async () =
   workspace.exposed.confirmPicker([{ name: 'light.png', url: '/images/light.png' }])
   assert.deepEqual(workspace.store.models, ['/images/light.png'])
   assert.equal(workspace.store.editSource, '/images/new.png')
+})
+
+test('the editor and batch expose local background removal without changing Gateway model settings or originals', async () => {
+  const editor = await renderWorkspace('edit', {editSource: '/images/original.png'})
+  assert.match(editor.html, /Remove background/)
+  const settings = JSON.stringify(editor.store.generationSettings)
+  editor.exposed.openBackgroundRemoval(['/images/original.png'])
+  assert.deepEqual(editor.exposed.backgroundRemovalSources.value, ['/images/original.png'])
+  assert.equal(editor.store.editSource, '/images/original.png')
+  assert.equal(JSON.stringify(editor.store.generationSettings), settings)
+  await editor.exposed.useCutout('/images/cutout.png')
+  assert.equal(editor.store.editSource, '/images/cutout.png')
+  assert.deepEqual(editor.exposed.backgroundRemovalSources.value, [])
+  assert.equal(editor.requests.length, 0)
+  const batch = await renderWorkspace('batch', {inputImages: ['/images/first.png', '/images/second.png']})
+  assert.match(batch.html, /Remove backgrounds/)
+  batch.exposed.openBackgroundRemoval(batch.exposed.sourceImages.value)
+  assert.deepEqual(batch.exposed.backgroundRemovalSources.value, ['/images/first.png', '/images/second.png'])
 })
 
 test('the editor withholds generated previews until confirmed billing arrives in account history', async () => {

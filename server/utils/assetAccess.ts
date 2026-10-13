@@ -156,7 +156,8 @@ export function createAssetRepository(actor: AssetActor, db: Database = getDatab
         const price = await confirmedOutput(row)
         const count = row.kind === 'folder' ? itemCount ?? (await folderItemCounts([row])).get(row.id) ?? 0 : undefined
         return {id: row.id, kind: row.kind, name: row.name, url: row.url,
-            category: row.category, ...(price ?? {}),
+            category: row.category, ...(price ?? (row.kind === 'file' && row.category === 'processed'
+                ? {priceUsd: '0', priceSource: 'local-processing'} : {})),
             ...(count !== undefined ? {itemCount: count} : {}),
             folder: row.kind === 'folder' ? path : containingFolder ? logicalPath(containingFolder) : '/',
             ownerUserId: row.ownerUserId, permissions: grant.permissions, source: owner,

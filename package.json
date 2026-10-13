@@ -3,7 +3,8 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "build": "nuxt build",
+    "build": "nuxt build && npm run build:background-removal",
+    "build:background-removal": "node scripts/build-background-removal.mjs",
     "build:retention": "node scripts/build-retention-worker.mjs",
     "images:cleanup": "npm run build:retention && node .output/cleanup-generated-images.mjs",
     "dev": "nuxt dev",
@@ -32,6 +33,7 @@
     "mime": "^4.0.7",
     "mime-types": "^3.0.1",
     "nuxt": "^4.4.2",
+    "onnxruntime-node": "1.30.0",
     "pg": "^8.23.1",
     "sharp": "^0.34.5",
     "typescript": "^5.9.2",

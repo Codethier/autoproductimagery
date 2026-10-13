@@ -4,6 +4,7 @@ import {closeDatabasePool, getDatabasePool} from "../server/utils/lib/db.ts"
 import {parseRetentionDays, runGeneratedImageRetention} from "../server/utils/generatedImageRetention.ts"
 import {closeImageStorage, useFS} from "../server/utils/useFS.ts"
 import {verifyRetentionRuntime} from "../server/utils/retentionRuntime.ts"
+import {runProcessedImageRetention} from "../server/utils/processedImageRetention.ts"
 
 let storage: Awaited<ReturnType<typeof useFS>> | undefined
 try {
@@ -17,15 +18,17 @@ try {
     await verifyRetentionRuntime()
     // Disabled jobs and dry runs do not need S3 credentials or initialize its client.
     storage = retentionDays !== 0 && !dryRun ? await useFS() : undefined
-    const result = await runGeneratedImageRetention({
+    const options = {
         pool: retentionDays === 0 ? {connect: async () => { throw new Error("Disabled cleanup must not connect.") }} : getDatabasePool(),
         storage: storage ?? {removeGeneratedImage: async () => { throw new Error("Dry run must not delete objects.") }},
         retentionDays,
         dryRun,
-    })
+    }
+    const result = await runGeneratedImageRetention(options)
+    const processed = await runProcessedImageRetention(options)
     // Counts and cutoff only: never log object URLs, driver errors or credentials.
-    console.log(JSON.stringify(result))
-    if (result.failed) process.exitCode = 1
+    console.log(JSON.stringify({generated: result, processed}))
+    if (result.failed || processed.failed) process.exitCode = 1
 } catch {
     console.error("Generated image cleanup failed. Check retention, PostgreSQL and S3 configuration and service health.")
     process.exitCode = 1
