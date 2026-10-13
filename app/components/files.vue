@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import {imagePreviewUrl} from '../utils/imageDelivery'
 import type {BreadcrumbItem} from "#ui/components/Breadcrumb.vue";
 import {useDataStore} from "~/stores/data.store";
 import type {SelectableFile} from "~~/schemas/main.dto";
@@ -340,7 +341,7 @@ onBeforeUnmount(() => window.removeEventListener('paste', handlePaste))
       </div>
       <div v-for="file of displayedFiles" :key="file.url"
            class="text-center text-balance flex flex-col gap-2 justify-center items-center w-full h-full">
-        <img :src="`/api/data${file.url}`" :alt="file.name" class="w-full object-contain" loading="lazy">
+        <img :src="imagePreviewUrl(file.url, 480)" :alt="file.name" class="w-full object-contain" loading="lazy" decoding="async">
         <p class="w-full truncate text-center">{{ file.name }}</p>
         <UCheckbox v-if="props.isModelSelect" v-model="file.selectedModel"
                    @change="syncSelectToStore(file)"></UCheckbox>

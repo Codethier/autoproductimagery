@@ -336,6 +336,7 @@ async function regenerate() {
     <div v-if="currentImage" class="generation-preview">
       <DownloadableImage
         :src="currentImage"
+        :preview-size="480"
         :alt="props.data?.TextPrompt || 'Output image'"
         class="generation-preview-image"
       />
@@ -444,6 +445,7 @@ async function regenerate() {
             v-for="(source, index) in props.data.serverImages"
             :key="source"
             :src="source"
+            :preview-size="160"
             :alt="`Input image ${index + 1}`"
             class="generation-source-image"
           />
@@ -457,6 +459,7 @@ async function regenerate() {
             v-for="(source, index) in props.data.modelImages"
             :key="source"
             :src="source"
+            :preview-size="160"
             :alt="`Reference image ${index + 1}`"
             class="generation-source-image"
           />

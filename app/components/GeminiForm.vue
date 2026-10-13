@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import {imageDownloadUrl, imagePreviewUrl, type ImagePreviewSize} from '../utils/imageDelivery'
 import type { Component } from 'vue'
 import type { SelectableFile } from '../../schemas/main.dto'
 import { buildComposerRequest, composerSources, imageName, type GenerationComposerMode, type PendingGeneration } from '../utils/generationComposer'
@@ -463,7 +464,7 @@ function confirmPicker(files: SelectableFile[]) {
   pickerOpen.value = false
 }
 
-function sourceUrl(source: string) { return `/api/data${source}` }
+function sourceUrl(source: string, size: ImagePreviewSize = 160) { return imagePreviewUrl(source, size) }
 
 async function uploadFiles(files: File[]) {
   if (!files.length || uploading.value) return
@@ -683,7 +684,7 @@ async function submit() {
             <span>Continue editing</span>
             <div class="studio-recent-grid">
               <button v-for="item in recentImages" :key="item.id" type="button" :aria-label="`Edit result: ${item.TextPrompt}`" :title="item.TextPrompt" @click="chooseSource(item.outputImage!)">
-                <img :src="sourceUrl(item.outputImage!)" alt="Recent generated image" loading="lazy">
+                <img :src="sourceUrl(item.outputImage!)" alt="Recent generated image" loading="lazy" decoding="async">
                 <span class="studio-recent-price">{{ generationPriceLabel(item) }}</span>
               </button>
             </div>
@@ -695,12 +696,12 @@ async function submit() {
             <div class="studio-toolbar-actions">
               <UButton v-if="previewOutput" color="neutral" variant="ghost" size="sm" @click="data.editSource = previewOutput">Use as input</UButton>
               <UButton color="neutral" variant="ghost" size="sm" icon="i-lucide-folder" @click="openPicker('source')">Replace</UButton>
-              <UButton v-if="previewImage" :href="sourceUrl(previewImage)" :download="imageName(previewImage)" external color="neutral" variant="soft" size="sm" icon="i-lucide-download">Download</UButton>
+              <UButton v-if="previewImage" :href="imageDownloadUrl(previewImage)" :download="imageName(previewImage)" external color="neutral" variant="soft" size="sm" icon="i-lucide-download">Download</UButton>
             </div>
           </div>
           <div class="studio-image-stage" :class="{ 'studio-image-stage--dragging': dragging }">
             <div class="studio-image-sheet" :style="{ transform: `scale(${zoom})` }">
-              <img v-if="previewImage" :key="previewImage" :src="sourceUrl(previewImage)" :alt="previewOutput ? 'Generated result' : 'Image being edited'" @load="onPreviewLoad" @error="onPreviewError">
+              <img v-if="previewImage" :key="previewImage" :src="sourceUrl(previewImage, 1600)" decoding="async" :alt="previewOutput ? 'Generated result' : 'Image being edited'" @load="onPreviewLoad" @error="onPreviewError">
             </div>
             <div v-if="activeGenerationCount" class="studio-generating-overlay" role="status"><UIcon name="i-lucide-loader-circle" class="size-5 animate-spin" /><span>Creating your image…</span></div>
           </div>
@@ -727,7 +728,7 @@ async function submit() {
           </div>
           <div class="studio-batch-grid" :class="{ 'studio-batch-grid--dragging': dragging }">
             <div v-for="(image, index) in sourceImages" :key="image" class="studio-input-card">
-              <div class="studio-input-preview"><img :src="sourceUrl(image)" :alt="`Input ${index + 1}: ${imageName(image)}`" loading="lazy"><span class="studio-input-number">{{ index + 1 }}</span><button type="button" :aria-label="`Remove ${imageName(image)} from batch`" @click="removeSource(image)"><UIcon name="i-lucide-x" class="size-4" /></button></div>
+              <div class="studio-input-preview"><img :src="sourceUrl(image, 480)" :alt="`Input ${index + 1}: ${imageName(image)}`" loading="lazy" decoding="async"><span class="studio-input-number">{{ index + 1 }}</span><button type="button" :aria-label="`Remove ${imageName(image)} from batch`" @click="removeSource(image)"><UIcon name="i-lucide-x" class="size-4" /></button></div>
               <div class="studio-input-caption"><span :title="imageName(image)">{{ imageName(image) }}</span><small>{{ outputsPerJob }} output{{ outputsPerJob === 1 ? '' : 's' }}</small></div>
             </div>
             <button v-if="sourceImages.length < 20" type="button" class="studio-add-card" @click="uploadInput?.click()"><UIcon name="i-lucide-plus" class="size-7" /><span>Add images</span><small>or drop them here</small></button>
@@ -762,7 +763,7 @@ async function submit() {
           <div class="studio-control-group studio-references">
             <div class="studio-group-title"><label>Reference images <span class="studio-optional">Optional</span></label><button v-if="data.models.length" type="button" @click="clearModels">Clear</button></div>
             <div class="studio-reference-thumbnails">
-              <div v-for="image in data.models" :key="image" class="studio-reference-thumb"><img :src="sourceUrl(image)" :alt="`Shared reference: ${imageName(image)}`"><button type="button" :aria-label="`Remove shared reference ${imageName(image)}`" @click="data.models = data.models.filter(source => source !== image)"><UIcon name="i-lucide-x" class="size-3" /></button></div>
+              <div v-for="image in data.models" :key="image" class="studio-reference-thumb"><img :src="sourceUrl(image)" :alt="`Shared reference: ${imageName(image)}`" loading="lazy" decoding="async"><button type="button" :aria-label="`Remove shared reference ${imageName(image)}`" @click="data.models = data.models.filter(source => source !== image)"><UIcon name="i-lucide-x" class="size-3" /></button></div>
               <button type="button" class="studio-reference-add" aria-label="Choose shared reference images" @click="openPicker('references')"><UIcon name="i-lucide-plus" class="size-5" /></button>
             </div>
             <p class="studio-help">{{ referenceSummary }}</p>
@@ -770,7 +771,7 @@ async function submit() {
           </div>
           <div v-if="selectedProfile.supportsMask" class="studio-control-group">
             <div class="studio-group-title"><label>{{ luminanceMask ? 'Fill mask' : 'Edit mask' }} <span class="studio-optional">{{ selectedProfile.requiresMask ? 'Required' : 'Optional' }}</span></label><button v-if="data.maskImage" type="button" @click="clearMaskImage">Clear</button></div>
-            <button type="button" class="studio-mask-picker" @click="openPicker('mask')"><img v-if="data.maskImage" :src="sourceUrl(data.maskImage)" alt="Selected edit mask"><UIcon v-else name="i-lucide-scan" class="size-5" /><span>{{ data.maskImage ? imageName(data.maskImage) : 'Choose a PNG mask' }}</span><UIcon name="i-lucide-chevron-right" class="size-4" /></button>
+            <button type="button" class="studio-mask-picker" @click="openPicker('mask')"><img v-if="data.maskImage" :src="sourceUrl(data.maskImage)" alt="Selected edit mask" decoding="async"><UIcon v-else name="i-lucide-scan" class="size-5" /><span>{{ data.maskImage ? imageName(data.maskImage) : 'Choose a PNG mask' }}</span><UIcon name="i-lucide-chevron-right" class="size-4" /></button>
             <p class="studio-help">{{ luminanceMask ? 'White areas are replaced, black areas are preserved. Match the source dimensions.' : 'Transparent areas guide the edit. The PNG mask and every source must have identical dimensions.' }}</p>
           </div>
           <p v-if="referenceOverflow" class="studio-validation" role="alert">Remove {{ referenceOverflow }} shared reference{{ referenceOverflow === 1 ? '' : 's' }} to meet this model’s limit.</p>
@@ -799,7 +800,7 @@ async function submit() {
     <div v-if="errorMsg" role="alert" class="studio-error"><UIcon name="i-lucide-triangle-alert" class="size-4 shrink-0" /><span>{{ errorMsg }}</span><button type="button" aria-label="Dismiss error" @click="errorMsg = null"><UIcon name="i-lucide-x" class="size-4" /></button></div>
     <section v-if="pendingGenerations.length" class="studio-pending" aria-live="polite">
       <div class="studio-section-heading"><h2>{{ activeGenerationCount ? `${activeGenerationCount} input jobs running` : 'Unfinished requests' }}</h2><UButton v-if="failedGenerationCount" size="xs" color="neutral" variant="ghost" @click="clearFailedJobs">Clear failed</UButton></div>
-      <div class="studio-pending-grid"><div v-for="job in pendingGenerations" :key="job.id" class="studio-pending-card"><img :src="sourceUrl(job.inputImages[0]!)" alt="Generation source"><div><UIcon :name="job.status === 'failed' ? 'i-lucide-triangle-alert' : 'i-lucide-loader-circle'" :class="{ 'animate-spin': job.status === 'pending' }" class="size-4" /><strong>{{ job.status === 'failed' ? 'Failed' : 'Generating' }}</strong><span>{{ elapsedLabel(job.startedAt) }}</span><p v-if="job.error">{{ job.error }}</p></div></div></div>
+      <div class="studio-pending-grid"><div v-for="job in pendingGenerations" :key="job.id" class="studio-pending-card"><img :src="sourceUrl(job.inputImages[0]!)" alt="Generation source" loading="lazy" decoding="async"><div><UIcon :name="job.status === 'failed' ? 'i-lucide-triangle-alert' : 'i-lucide-loader-circle'" :class="{ 'animate-spin': job.status === 'pending' }" class="size-4" /><strong>{{ job.status === 'failed' ? 'Failed' : 'Generating' }}</strong><span>{{ elapsedLabel(job.startedAt) }}</span><p v-if="job.error">{{ job.error }}</p></div></div></div>
     </section>
     <details class="studio-history" :open="historyOpen" @toggle="historyOpen = ($event.target as HTMLDetailsElement).open">
       <summary><span>Generation history <span v-if="confirmedHistory.length" class="studio-history-count">{{ confirmedHistory.length }}</span></span><UIcon name="i-lucide-chevron-down" class="size-4" /></summary>

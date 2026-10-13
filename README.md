@@ -127,6 +127,14 @@ History and balance reads reconcile a small number of provider calls, with Postg
 
 Only ordinary Gateway-funded prices can be fully confirmed. BYOK generation records remain held because Gateway's charge excludes the external provider invoice, and its upstream cost is a market estimate. See the [Vercel generation lookup reference](https://vercel.com/docs/ai-gateway/sdks-and-apis/rest-api#look-up-a-generation).
 
+## Image previews and private caching
+
+Library grids and image strips request bounded WebP previews (160 or 480 pixels); the editor and larger previews request up to 1600 pixels. Resize fits the image inside the requested square, preserves its proportions and transparency, applies orientation, and never upscales. Downloads and generation inputs always use the original validated bytes.
+
+The authenticated image endpoint supports only fixed `preview=160`, `480`, `960`, or `1600` presets; omitting the query returns the original. Successful responses use `Cache-Control: private, no-cache, must-revalidate`, `Vary: Cookie` and account/representation-scoped ETags. Browsers may retain the image and revalidate it with a bodyless `304`. Session, organization, sharing, deletion and confirmed-price checks run before every cache hit or `304`; errors use `no-store`. Images are never made public through a CDN or image optimizer.
+
+Each warm server instance retains at most 64 MiB of image bytes: 48 MiB of fully validated originals and 16 MiB of previews, with LRU eviction and a five-minute absolute lifetime. Identical concurrent reads coalesce. Original reads and preview transforms each have two active slots and a bounded queue; overload returns a retryable `429`. A serverless cold start begins with an empty memory cache. Full validation still runs when an original enters the cache, so corrupt images never become cached previews. The cache requires no disk, persistent app volume, database migration or new service variables.
+
 ## Generated image retention
 
 Set `GENERATED_IMAGE_RETENTION_DAYS` on the cleanup service to choose how long generated images are retained. The default is **180 days**. Use a whole number from 1 to 36500, or `0` to disable cleanup. Invalid or blank values fail without deleting anything. Changing the number applies to existing generated outputs on the next run: lowering it can make older images immediately eligible.

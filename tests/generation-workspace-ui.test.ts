@@ -169,6 +169,8 @@ test('Edit renders the canvas and submits only the independent Edit source throu
   assert.match(workspace.html, /Image being edited/)
   assert.match(workspace.html, /Model settings/)
   assert.match(workspace.html, /Zoom in/)
+  assert.match(workspace.html, /src="\/api\/data\/images\/edit\.png\?preview=1600"/)
+  assert.match(workspace.html, /src="\/api\/data\/images\/reference\.png\?preview=160"/)
   assert.equal(workspace.exposed.canSubmit.value, true)
   await workspace.exposed.submit()
   assert.equal(workspace.requests.length, 1)
@@ -187,6 +189,9 @@ test('Same-origin batch renders per-input cards and submits one bounded request 
   assert.match(workspace.html, /Same-origin batch/)
   assert.match(workspace.html, /2 inputs/)
   assert.match(workspace.html, /Input 2: batch-b.png/)
+  assert.match(workspace.html, /src="\/api\/data\/images\/batch-a\.png\?preview=480"/)
+  assert.match(workspace.html, /src="\/api\/data\/images\/batch-b\.png\?preview=480"/)
+  assert.match(workspace.html, /src="\/api\/data\/images\/reference-a\.png\?preview=160"/)
   await workspace.exposed.submit()
   assert.equal(workspace.requests.length, 1)
   const body = workspace.requests[0]!.options.body as any
@@ -220,8 +225,8 @@ test('the editor withholds generated previews until confirmed billing arrives in
     await nextTick()
     assert.equal(mounted.exposed.previewOutput.value, null)
     const imageSources = (node: MemoryNode): unknown[] => [node.props.src, ...node.children.flatMap(imageSources)].filter(Boolean)
-    assert.equal(imageSources(mounted.rootNode).includes(`/api/data${pending.outputImage}`), false)
-    assert.equal(imageSources(mounted.rootNode).includes('/api/data/images/edit.png'), true, 'the original input remains visible while generated output awaits its final price')
+    assert.equal(imageSources(mounted.rootNode).some(src => String(src).startsWith(`/api/data${pending.outputImage}`)), false)
+    assert.equal(imageSources(mounted.rootNode).includes('/api/data/images/edit.png?preview=1600'), true, 'the original input remains visible through a bounded preview while generated output awaits its final price')
     assert.doesNotMatch(renderedText(mounted.rootNode), /confirming price|Pending confirmation|Result ·|Check prices?/)
     workspace.environment.history.value = {count: 1, items: [pending]}
     await nextTick()
@@ -231,6 +236,10 @@ test('the editor withholds generated previews until confirmed billing arrives in
     await nextTick()
     assert.equal(mounted.exposed.previewOutput.value, pending.outputImage)
     assert.equal(mounted.exposed.recentImages.value.length, 1)
+    assert.equal(imageSources(mounted.rootNode).includes(`/api/data${pending.outputImage}?preview=1600`), true, 'the active editor uses a larger bounded preview')
+    workspace.store.editSource = null
+    await nextTick()
+    assert.equal(imageSources(mounted.rootNode).includes(`/api/data${pending.outputImage}?preview=160`), true, 'recent images on the empty editor landing use small thumbnails')
     workspace.environment.account.identity.value = 'org.bob'
     workspace.environment.account.epoch.value += 1
     workspace.store.editSource = '/images/bob.png'

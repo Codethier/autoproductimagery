@@ -442,3 +442,102 @@ test('shared recipients cannot delete a folder named objects; owner deletion onl
     await assert.rejects(aliceFS.getImageFile(sharedImage.url), status(404))
     assert.deepEqual((await aliceFS.listAssets()).files.map(file => file.url), [privateImage.url])
 }))
+
+test('delivery coalesces original S3 reads, caches bounded previews, and keeps downloads byte-exact', integration, async () => fixture(async f => {
+    const aliceFS = await useUserFS(f.alice, f.storage, f.db)
+    const bytes = await sharp({create: {width: 2400, height: 1600, channels: 4, background: '#246d6c'}}).png().toBuffer()
+    const image = await aliceFS.saveUpload('/', upload(bytes, 'large-product.png'))
+    const before = f.s3.commands.filter(command => command instanceof GetObjectCommand).length
+    const deliveries = await Promise.all([
+        aliceFS.getImageForDelivery(image.url), aliceFS.getImageForDelivery(image.url, 160),
+        aliceFS.getImageForDelivery(image.url, 480), aliceFS.getImageForDelivery(image.url, 960),
+        aliceFS.getImageForDelivery(image.url, 1600), aliceFS.getImageForDelivery(image.url, 480),
+    ])
+    assert.equal(f.s3.commands.filter(command => command instanceof GetObjectCommand).length - before, 1, 'concurrent representations fetch and validate the original once')
+    const [original, ...previews] = deliveries
+    assert.ok(original && !original.notModified)
+    assert.equal(original.mimeType, 'image/png')
+    assert.deepEqual(original.buffer, bytes, 'downloads and generation source originals retain their exact image bytes')
+    const sizes = [160, 480, 960, 1600, 480]
+    for (const [index, preview] of previews.entries()) {
+        assert.equal(preview.notModified, false)
+        if (preview.notModified) continue
+        const metadata = await sharp(preview.buffer).metadata()
+        assert.equal(preview.mimeType, 'image/webp')
+        assert.equal(metadata.format, 'webp')
+        assert.ok(preview.width <= sizes[index]! && preview.height <= sizes[index]!)
+        assert.equal(preview.width, sizes[index])
+        assert.equal(preview.height, Math.round(sizes[index]! * 2 / 3))
+        assert.equal(metadata.width, preview.width)
+        assert.equal(metadata.height, preview.height)
+    }
+    assert.equal(new Set(deliveries.slice(0, 5).map(delivery => delivery.etag)).size, 5, 'each preview size and the original have a distinct ETag')
+    const nextRequestFS = await useUserFS(f.alice, f.storage, f.db)
+    const again = await nextRequestFS.getImageForDelivery(image.url, 480)
+    assert.equal(again.notModified, false)
+    assert.equal(again.etag, deliveries[2]!.etag)
+    if (!again.notModified && !deliveries[2]!.notModified) assert.deepEqual(again.buffer, deliveries[2]!.buffer)
+    assert.equal(f.s3.commands.filter(command => command instanceof GetObjectCommand).length - before, 1, 'warm preview reads need no S3 transfer')
+    const revalidated = await (await useUserFS(f.alice, f.storage, f.db)).getImageForDelivery(image.url, 480, again.etag)
+    assert.deepEqual(revalidated, {etag: again.etag, notModified: true})
+    assert.equal(f.s3.commands.filter(command => command instanceof GetObjectCommand).length - before, 1, 'authorized conditional reads do not load the original')
+}))
+
+test('warm delivery caches and known ETags cannot bypass sharing revocation, deletion, or organization boundaries', integration, async () => fixture(async f => {
+    const aliceFS = await useUserFS(f.alice, f.storage, f.db), bobFS = await useUserFS(f.bob, f.storage, f.db)
+    const outsiderFS = await useUserFS(f.outsider, f.storage, f.db)
+    const folder = await aliceFS.createFolder('/', 'Cached campaign')
+    const image = await aliceFS.saveUpload('/Cached campaign', upload(f.bytes))
+    await aliceFS.share(folder.id!, f.bob.userId, 'view')
+    const owned = await aliceFS.getImageForDelivery(image.url, 480)
+    const shared = await bobFS.getImageForDelivery(image.url, 480)
+    assert.notEqual(owned.etag, shared.etag, 'browser ETags bind a representation to the current authenticated account')
+    assert.deepEqual(await bobFS.getImageForDelivery(image.url, 480, shared.etag), {etag: shared.etag, notModified: true})
+    const foreignValidator = await bobFS.getImageForDelivery(image.url, 480, owned.etag)
+    assert.equal(foreignValidator.notModified, false, 'another account’s validator cannot produce a 304')
+    const beforeDenied = f.s3.commands.length
+    for (const knownTag of [undefined, owned.etag, shared.etag, '*']) {
+        await assert.rejects(outsiderFS.getImageForDelivery(image.url, 480, knownTag), status(404))
+    }
+    await aliceFS.revoke(folder.id!, f.bob.userId)
+    for (const knownTag of [undefined, shared.etag, '*']) {
+        await assert.rejects(bobFS.getImageForDelivery(image.url, 480, knownTag), status(404))
+    }
+    assert.equal(f.s3.commands.length, beforeDenied, 'denied cache reads must not request any storage metadata or bytes')
+    await aliceFS.deleteFileOrFolder(folder.url!, 'directory')
+    const afterDeleted = f.s3.commands.length
+    for (const knownTag of [undefined, owned.etag, '*']) {
+        await assert.rejects(aliceFS.getImageForDelivery(image.url, 480, knownTag), status(404))
+    }
+    assert.equal(f.s3.commands.length, afterDeleted, 'a tombstoned image stays inaccessible even when its preview bytes are cached')
+}))
+
+test('delivery authorization checks current exact pricing before warm bytes or a conditional 304', integration, async () => fixture(async f => {
+    const aliceFS = await useUserFS(f.alice, f.storage, f.db), bobFS = await useUserFS(f.bob, f.storage, f.db)
+    const output = await aliceFS.saveGeneratedImage(f.bytes)
+    const asset = await createAssetRepository(f.alice, f.db).byUrl(output.url)
+    assert.ok(asset)
+    assert.ok(asset.parentId)
+    await aliceFS.share(asset.parentId, f.bob.userId, 'view')
+    const beforeHeld = f.s3.commands.length
+    for (const fs of [aliceFS, bobFS]) {
+        await assert.rejects(fs.getImageForDelivery(output.url, 480), status(425))
+        await assert.rejects(fs.getImageForDelivery(output.url, 480, '*'), status(425))
+    }
+    assert.equal(f.s3.commands.length, beforeHeld, 'unpriced generated images never reach storage')
+    const row = await pricedGeneration(f.db, f.alice, output.url, {priceUsd: '0.000000000000'})
+    const owned = await aliceFS.getImageForDelivery(output.url, 480)
+    const shared = await bobFS.getImageForDelivery(output.url, 480)
+    assert.equal(owned.notModified, false)
+    assert.equal(shared.notModified, false)
+    assert.deepEqual(await bobFS.getImageForDelivery(output.url, 480, shared.etag), {etag: shared.etag, notModified: true})
+    await f.db.update(systemPrompt).set({billingState: 'awaiting', priceSource: 'estimate'}).where(eq(systemPrompt.id, row.id))
+    const beforeReheld = f.s3.commands.length
+    const currentAliceFS = await useUserFS(f.alice, f.storage, f.db), currentBobFS = await useUserFS(f.bob, f.storage, f.db)
+    await assert.rejects(currentAliceFS.getImageForDelivery(output.url, 480, owned.etag), status(425))
+    await assert.rejects(currentBobFS.getImageForDelivery(output.url, 480, shared.etag), status(425))
+    await assert.rejects(currentBobFS.getImageForDelivery(output.url, 480), status(425))
+    assert.equal(f.s3.commands.length, beforeReheld, 'price checks must run again for every memory-cache hit and conditional request')
+    const uploaded = await aliceFS.saveUpload('/', upload(f.bytes, 'uploaded-price-independent.png'))
+    assert.equal((await aliceFS.getImageForDelivery(uploaded.url, 160)).notModified, false, 'ordinary uploads do not require a generation price')
+}))

@@ -7,8 +7,26 @@ import {imagePathToUrl, parseImagePath, validateImagePathSegment} from './imageS
 import {inspectDecodedImage} from './imageValidation'
 import type {BufferedUploadFile} from './uploadPolicy'
 import type {AssetFile} from '../../schemas/image-storage'
+import sharp from 'sharp'
+import {createImageDeliveryCache, type ImageRepresentation} from './imageDeliveryCache'
+import {imageDeliveryEtag, imageDeliveryRevision, matchesImageEtag, IMAGE_PREVIEW_SIZES, type ImagePreviewSize} from './imageDeliveryPolicy'
+import {MAX_IMAGE_PIXELS} from './imageValidation'
 
 type RawStorage = Awaited<ReturnType<typeof useFS>>
+// One warm-instance cache per storage backend; no disk dependency or cross-backend key collisions.
+type DeliveryCaches = {original: ReturnType<typeof createImageDeliveryCache>; preview: ReturnType<typeof createImageDeliveryCache>}
+const deliveryCaches = new WeakMap<RawStorage, DeliveryCaches>()
+function deliveryCache(storage: RawStorage) {
+    let cache = deliveryCaches.get(storage)
+    if (!cache) {
+        // Separate limiter pools avoid nested-cache deadlocks. Reserve the preview slot BEFORE
+        // fetching its original, so queued transforms cannot retain dozens of evicted buffers.
+        cache = {original: createImageDeliveryCache({maxBytes: 48 * 1024 * 1024}),
+            preview: createImageDeliveryCache({maxBytes: 16 * 1024 * 1024, maxEntries: 256})}
+        deliveryCaches.set(storage, cache)
+    }
+    return cache
+}
 function rawDirectory(parts: readonly string[]) { return '/' + parts.map(encodeURIComponent).join('/') }
 function safeAssetOperation<T>(work: () => Promise<T>): Promise<T> {
     return work().catch(error => {
@@ -45,6 +63,29 @@ export async function useUserFS(actor: AssetActor, storage?: RawStorage, databas
         const {row} = await repository.requireAsset(url)
         if (row.kind !== 'file') throw createError({statusCode: 404, statusMessage: 'Image not found'})
         return raw.getImageFile(row.url)
+    }
+    async function getImageForDelivery(url: string, preview?: ImagePreviewSize, ifNoneMatch?: string) {
+        if (preview !== undefined && !IMAGE_PREVIEW_SIZES.includes(preview)) {
+            throw createError({statusCode: 400, statusMessage: 'Invalid image preview size'})
+        }
+        // Fresh registry access on EVERY delivery, before either a 304 or an in-memory hit.
+        // A cached buffer never authorizes a revoked share, deleted asset or unpaid output.
+        const {row} = await createAssetRepository(actor, database).requireAsset(url)
+        if (row.kind !== 'file') throw createError({statusCode: 404, statusMessage: 'Image not found'})
+        const etag = imageDeliveryEtag(actor, row, preview)
+        if (matchesImageEtag(ifNoneMatch, etag)) return {etag, notModified: true as const}
+        const cache = deliveryCache(raw)
+        // Fetch and fully validate once per cache admission; rejected/corrupt images are never cached.
+        const original = () => cache.original.get(imageDeliveryRevision(row), () => raw.getImageFile(row.url))
+        const image: ImageRepresentation = preview === undefined ? await original()
+            : await cache.preview.get(imageDeliveryRevision(row, preview), async () => {
+                const source = await original()
+                const {data, info} = await sharp(source.buffer, {failOn: 'error', limitInputPixels: MAX_IMAGE_PIXELS, sequentialRead: true})
+                    .rotate().resize(preview, preview, {fit: 'inside', withoutEnlargement: true})
+                    .webp({quality: 82, effort: 3}).toBuffer({resolveWithObject: true})
+                return {buffer: data, mimeType: 'image/webp', width: info.width, height: info.height}
+            })
+        return {...image, etag, notModified: false as const}
     }
     async function saveUpload(path: string, file: BufferedUploadFile) {
         const target = await writeTarget(path)
@@ -152,6 +193,7 @@ export async function useUserFS(actor: AssetActor, storage?: RawStorage, databas
     }
     const safe = <A extends unknown[], R>(fn: (...args: A) => Promise<R>) => (...args: A) => safeAssetOperation(() => fn(...args))
     return {
+        getImageForDelivery: safe(getImageForDelivery),
         getImageFile: safe(readImage), getFile: safe(async (url: string) => (await readImage(url)).buffer),
         assertReadableImages: safe(assertReadableImages), saveUpload: safe(saveUpload),
         saveFile: safe(async (path: string, file: BufferedUploadFile) => (await saveUpload(path, file)).name),

@@ -159,13 +159,25 @@ test('library thumbnails and previews withhold generated files with pending pric
   const browser = await renderBrowser({files: [generated, upload], actorId: 'alice', preview: true})
   assert.match(browser.html, /Confirming price/)
   assert.match(browser.html, /\$0\.05 · estimate, final price pending/)
-  assert.equal(browser.html.includes(`src="/api/data${generated.url}"`), false)
+  assert.equal(browser.html.includes(`/api/data${generated.url}`), false)
   assert.equal(browser.html.includes(`href="/api/data${generated.url}"`), false)
-  assert.equal(browser.html.includes(`src="/api/data${upload.url}"`), true)
+  assert.equal(browser.html.includes(`src="/api/data${upload.url}?preview=480"`), true)
   const confirmed = await renderBrowser({files: [{...generated, priceUsd: '0.000000000000', priceSource: 'gateway', billingState: 'confirmed'}], actorId: 'alice', preview: true})
-  assert.equal(confirmed.html.includes(`src="/api/data${generated.url}"`), true)
+  assert.equal(confirmed.html.includes(`src="/api/data${generated.url}?preview=480"`), true)
+  assert.equal(confirmed.html.includes(`src="/api/data${generated.url}?preview=1600"`), true)
+  assert.equal(confirmed.html.includes(`href="/api/data${generated.url}"`), true, 'downloads preserve the original image bytes')
   assert.match(confirmed.html, /\$0\.00 · confirmed/)
   assert.match(confirmed.html, /Download/)
+})
+
+test('shared library grids request small previews while the modal and download keep separate image representations', async () => {
+  const file = fixtureFile('shared-product.png', 'alice', 'view')
+  const browser = await renderBrowser({shared: true, files: [file], preview: true})
+  assert.equal(browser.html.includes(`src="/api/data${file.url}?preview=480"`), true)
+  assert.equal(browser.html.includes(`src="/api/data${file.url}?preview=1600"`), true)
+  assert.equal(browser.html.includes(`href="/api/data${file.url}"`), true)
+  assert.equal(browser.html.includes(`src="/api/data${file.url}"`), false, 'a CSS thumbnail must not download an original')
+  assert.match(browser.html, /decoding="async"/)
 })
 
 test('balance summary separates available credit, outstanding estimates and exact confirmed charges', async () => {
