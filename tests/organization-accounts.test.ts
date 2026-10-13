@@ -87,8 +87,11 @@ test('existing PostgreSQL history migrates without data loss; exactly one bootst
     try {
         await mkdir(temporaryFolder, {recursive: true})
         const migrationFolders = (await readdir(migrationsFolder)).filter(folder => /^\d{14}_/.test(folder)).sort()
-        assert.ok(migrationFolders.some(folder => folder.endsWith('_organization_accounts_and_sharing')))
-        for (const folder of migrationFolders.filter(folder => !folder.endsWith('_organization_accounts_and_sharing'))) await cp(join(migrationsFolder, folder), join(temporaryFolder, folder), {recursive: true})
+        const accountsMigration = migrationFolders.find(folder => folder.endsWith('_organization_accounts_and_sharing'))
+        assert.ok(accountsMigration)
+        // Only the actual predecessor history belongs in the upgrade fixture.
+        // Later migrations can depend on account tables and must run afterwards.
+        for (const folder of migrationFolders.filter(folder => folder < accountsMigration!)) await cp(join(migrationsFolder, folder), join(temporaryFolder, folder), {recursive: true})
         await migrate(context.db, {migrationsFolder: temporaryFolder, migrationsSchema: context.schema})
         await context.pool.query(`INSERT INTO "systemPrompt" ("TextPrompt", "outputImage", "status") VALUES ('Legacy saved prompt', '/images/output/legacy.png', 'succeeded')`)
         await context.pool.query(`INSERT INTO "aiGatewayLog" ("status", "model", "prompt") VALUES ('success', 'legacy-model', 'Legacy saved prompt')`)

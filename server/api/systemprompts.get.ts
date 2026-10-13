@@ -1,10 +1,14 @@
 import { useDB } from "~~/server/utils/useDB";
 import { getGenerationRuntimeSettings } from "~~/server/utils/generationLimiter";
 import { randomUUID } from "node:crypto";
+import {setHeader} from 'h3'
+import {publicGeneration} from '../utils/generationVisibility'
+import {refreshPendingAccountBilling} from '../utils/reconcilePendingAccountBilling'
 
 export default defineEventHandler(async (event) => {
   // Require auth (same as other endpoints)
   const account = await useAuth(event)
+  setHeader(event, 'cache-control', 'no-store')
 
   const db = await useDB(undefined, account)
   const runtime = getGenerationRuntimeSettings(
@@ -28,6 +32,7 @@ export default defineEventHandler(async (event) => {
 
   const safeTake = Number.isFinite(take) ? Math.max(1, Math.min(200, Math.floor(take))) : 50
   const safeSkip = Number.isFinite(skip) ? Math.max(0, Math.floor(skip)) : 0
+  await refreshPendingAccountBilling(account)
   let rows: Awaited<ReturnType<typeof db.getSystemPrompts>>
   let count: number
   try {
@@ -44,7 +49,7 @@ export default defineEventHandler(async (event) => {
       data: { diagnosticId },
     })
   }
-  const normalizedRows = rows.map(row => ({
+  const normalizedRows = rows.map(row => publicGeneration({
     ...row,
     outputImage: row.outputImage || null,
     status: row.status ?? (row.errors ? 'failed' : 'succeeded'),

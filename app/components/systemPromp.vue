@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { refreshNuxtData } from '#app'
+import {hasConfirmedGenerationPrice} from '~~/schemas/generation-billing'
+import {formatUsd} from '../utils/generationPrice'
 import {
   ImageModelIdSchema,
   isOpenAiImageSettings,
@@ -25,6 +27,7 @@ type SystemPrompt = {
   totalTokens?: number | null
   priceUsd?: string | null
   priceSource?: string | null
+  billingState?: string | null
   gatewayGenerationId?: string | null
   createdAt: string
   errors?: string | null
@@ -121,12 +124,10 @@ const tokenUsageText = computed(() => {
   return parts.join(' / ')
 })
 const priceText = computed(() => {
-  const price = props.data?.priceUsd ? Number(props.data.priceUsd) : NaN
-  if (!Number.isFinite(price)) return ''
-  return price < 0.01 ? `$${price.toFixed(6)}` : `$${price.toFixed(4)}`
+  return formatUsd(currentResult.value?.priceUsd)
 })
 const priceSourceText = computed(() => {
-  const source = (props.data as any)?.priceSource
+  const source = currentResult.value?.priceSource
   if (source === 'gateway') return 'Gateway'
   if (source === 'estimate') return 'Estimated'
   return ''
@@ -160,24 +161,30 @@ async function loadOutputDetails() {
 const chatInput = ref('')
 const chatLoading = ref(false)
 // Current output for this card. Regenerate can advance this value.
-const currentImage = ref<string | null>(props.data?.outputImageDeletedAt ? null : props.data?.outputImage || null)
-const outputImageExpired = computed(() => !!props.data?.outputImageDeletedAt && !currentImage.value)
+const currentResult = ref<SystemPrompt>(props.data)
+const priceConfirmed = computed(() => hasConfirmedGenerationPrice(currentResult.value))
+const currentImage = computed(() => cardIsCurrent.value && priceConfirmed.value && !currentResult.value.outputImageDeletedAt
+  ? currentResult.value.outputImage || null : null)
+const pricePending = computed(() => !priceConfirmed.value && !currentResult.value.errors
+  && (currentResult.value.status === 'succeeded' || !!currentResult.value.outputImage))
+const outputImageExpired = computed(() => !!currentResult.value.outputImageDeletedAt && !currentImage.value)
 const outputImageDeletedAt = computed(() => props.data?.outputImageDeletedAt
   ? new Date(props.data.outputImageDeletedAt).toLocaleString()
   : '')
 
 watch(cardIsCurrent, current => {
   if (current) return
-  currentImage.value = null
+  currentResult.value = {...currentResult.value, outputImage: null}
   detailData.value = null
   chatInput.value = ''
 }, {flush: 'sync'})
 
 watch(
-  () => [props.data?.outputImage, props.data?.outputImageDeletedAt] as const,
-  ([image, deletedAt]) => {
-    if (cardIsCurrent.value && !regenLoading.value) currentImage.value = deletedAt ? null : image || null
+  () => props.data,
+  (row) => {
+    if (cardIsCurrent.value && !regenLoading.value) currentResult.value = row
   }
+  , {deep: true}
 )
 
 async function sendRefine() {
@@ -218,8 +225,8 @@ async function sendRefine() {
     })
     if (!cardIsCurrent.value) return
     const row = res?.obj?.[0]
-    if (row?.outputImage && !row.errors) {
-      toast.add({ title: 'Refinement created' })
+    if (row && !row.errors && (row.status === 'succeeded' || row.outputImage)) {
+      toast.add({ title: hasConfirmedGenerationPrice(row) ? 'Refinement created' : 'Refinement created · price pending' })
       await refreshNuxtData(historyKey)
     } else {
       toast.add({ title: 'Refinement failed', description: row?.errors || 'Unknown error', color: 'warning' })
@@ -235,9 +242,10 @@ async function refreshBilling() {
   if (!cardIsCurrent.value || billingLoading.value || !props.data?.id) return
   billingLoading.value = true
   try {
-    await $fetch(`/api/systemprompts/${props.data.id}/billing-refresh`, { method: 'POST' })
+    const response = await $fetch<{ok: true; item: SystemPrompt}>(`/api/systemprompts/${currentResult.value.id}/billing-refresh`, {method: 'POST'})
     if (!cardIsCurrent.value) return
-    toast.add({ title: 'Cost refreshed' })
+    currentResult.value = response.item
+    toast.add({ title: hasConfirmedGenerationPrice(response.item) ? 'Price confirmed' : 'Price is still pending' })
     await refreshNuxtData(historyKey)
   } catch (e: any) {
     if (!cardIsCurrent.value) return
@@ -284,7 +292,7 @@ async function regenerate() {
         if (!cardIsCurrent.value) return
         parent = response?.item
       }
-      if (!parent?.outputImage || parent.outputImageDeletedAt) {
+      if (!parent?.outputImage || parent.outputImageDeletedAt || !hasConfirmedGenerationPrice(parent)) {
         toast.add({
           title: 'Cannot reproduce this refinement',
           description: parent?.outputImageDeletedAt
@@ -328,8 +336,8 @@ async function regenerate() {
       })
       if (!cardIsCurrent.value) return
       const row = res?.obj?.[0]
-      if (row?.outputImage && !row.errors) {
-        currentImage.value = row.outputImage
+      if (row && !row.errors && (row.status === 'succeeded' || row.outputImage)) {
+        currentResult.value = row
       } else {
         throw new Error(row?.errors || 'Unknown generation error')
       }
@@ -373,6 +381,11 @@ async function regenerate() {
       <p class="text-xs">Automatically deleted under the generated-image retention policy on {{ outputImageDeletedAt }}.</p>
       <p class="text-xs">The prompt, settings, and generation history are retained. You can regenerate if the original source images are still available.</p>
     </div>
+    <div v-else-if="pricePending" role="status" class="generation-price-pending">
+      <UIcon name="i-lucide-receipt-text" class="size-6" aria-hidden="true" />
+      <span>Image ready · confirming price</span>
+      <p>Your result will appear when Gateway confirms its final cost.</p>
+    </div>
     <div v-else class="relative flex items-center gap-2 justify-center p-6 bg-red-50 dark:bg-red-900/30 text-red-700 dark:text-red-300 border-b border-red-200 dark:border-red-800">
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-5 h-5">
         <path fill-rule="evenodd" d="M8.257 3.099c.765-1.36 2.721-1.36 3.486 0l6.518 11.58c.75 1.333-.213 2.996-1.742 2.996H3.48c-1.53 0-2.492-1.663-1.743-2.996L8.257 3.1zM11 14a1 1 0 10-2 0 1 1 0 002 0zm-1-2a.75.75 0 01-.75-.75v-3.5a.75.75 0 011.5 0v3.5A.75.75 0 0110 12z" clip-rule="evenodd" />
@@ -386,7 +399,7 @@ async function regenerate() {
       </p>
 
       <div
-        v-if="generationModelText || tokenUsageText || priceText || settingsSummary || outputDimensions"
+        v-if="generationModelText || tokenUsageText || settingsSummary || outputDimensions || currentResult"
         class="grid grid-cols-1 gap-1 text-[11px] text-gray-600 dark:text-gray-400 bg-gray-50 dark:bg-gray-800/70 rounded p-2"
       >
         <div v-if="generationModelText">
@@ -406,23 +419,23 @@ async function regenerate() {
           <span class="font-medium text-gray-700 dark:text-gray-300">Tokens:</span>
           {{ tokenUsageText }}
         </div>
-        <div v-if="priceText || props.data?.gatewayGenerationId" class="flex items-center justify-between gap-2">
+        <div class="flex items-center justify-between gap-2" data-generation-price>
           <span>
             <span class="font-medium text-gray-700 dark:text-gray-300">Price:</span>
             <span v-if="priceText">
-              {{ priceText }}<span v-if="priceSourceText"> ({{ priceSourceText }})</span>
+              {{ priceText }}<span>{{ priceConfirmed ? ' · confirmed' : priceSourceText ? ` · ${priceSourceText.toLowerCase()}` : ' · unconfirmed' }}</span>
             </span>
-            <span v-else>Pending</span>
+            <span v-else>Pending confirmation</span>
           </span>
           <UButton
-              v-if="props.data?.gatewayGenerationId && priceSourceText !== 'Gateway'"
+              v-if="pricePending"
               size="xs"
               variant="ghost"
               :loading="billingLoading"
               :disabled="billingLoading"
               @click="refreshBilling"
           >
-            Refresh cost
+            Check price
           </UButton>
         </div>
       </div>
@@ -556,6 +569,9 @@ async function regenerate() {
 </template>
 
 <style scoped>
+.generation-price-pending { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 30px 22px; text-align: center; background: #362c23; color: #edc9a6; border-bottom: 1px solid #5d4631; }
+.generation-price-pending > span { font-size: 13px; font-weight: 600; }
+.generation-price-pending > p { max-width: 270px; font-size: 11px; line-height: 1.7; color: #c1ae98; }
 .line-clamp-3 {
   display: -webkit-box;
   -webkit-line-clamp: 3;

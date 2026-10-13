@@ -20,12 +20,16 @@ const template = compileTemplate({
 assert.deepEqual(template.errors, [])
 const vueUrl = new URL('../node_modules/vue/index.mjs', import.meta.url).href
 const schemaUrl = new URL('../schemas/image-generation.ts', import.meta.url).href
+const billingSchemaUrl = new URL('../schemas/generation-billing.ts', import.meta.url).href
+const priceFormatterUrl = new URL('../app/utils/generationPrice.ts', import.meta.url).href
 const combined = `${script.content.replace('export default', 'const component =')}
 ${template.code.replace('export function render', 'function render')}
 component.render = render;
 export default component;`
   .replace(/import\s*\{\s*refreshNuxtData\s*\}\s*from\s*['"]#app['"]/g, 'const refreshNuxtData = (...args) => globalThis.refreshNuxtData(...args)')
   .replace(/(['"])~~\/schemas\/image-generation\1/g, JSON.stringify(schemaUrl))
+  .replace(/(['"])~~\/schemas\/generation-billing\1/g, JSON.stringify(billingSchemaUrl))
+  .replace(/(['"])\.\.\/utils\/generationPrice\1/g, JSON.stringify(priceFormatterUrl))
   .replace(/(['"])vue\1/g, JSON.stringify(vueUrl))
 const javascript = transpileModule(combined, {
   compilerOptions: {module: ModuleKind.ESNext, target: ScriptTarget.ES2022},
@@ -43,6 +47,7 @@ const original = {
   generationModel: config.effectiveModel, generationConfig: config,
   serverImages: ['/images/products/product.png'], modelImages: [],
   createdAt: '2026-01-01T00:00:00.000Z', status: 'succeeded',
+  priceUsd: '0.04500000', priceSource: 'gateway', billingState: 'confirmed',
 }
 
 async function renderCard(data: Record<string, unknown>, history: Record<string, unknown>[] = [], fetcher?: (url: string, options?: unknown) => Promise<unknown>) {
@@ -165,11 +170,51 @@ test('retention errors from generation sources are visible when an exact replay 
 })
 
 test('history card caches and billing refreshes use the original account and session namespace', async () => {
-  const card = await renderCard(original, [], async () => ({ok: true}))
+  const card = await renderCard(original, [], async () => ({ok: true, item: original}))
   try {
     assert.deepEqual(card.historyKeys, ['systemPrompts:studio.alice:1'])
     await card.bindings.refreshBilling()
     assert.deepEqual(card.refreshedKeys, ['systemPrompts:studio.alice:1'])
+  } finally {card.restore()}
+})
+
+test('generated image markup is withheld for pending and estimated prices, including an output URL already in the response', async () => {
+  for (const billing of [
+    {priceUsd: null, priceSource: null, billingState: 'pending'},
+    {priceUsd: '0.03000000', priceSource: 'estimate', billingState: 'pending'},
+    {priceUsd: '0.04500000', priceSource: 'gateway', billingState: 'pending'},
+  ]) {
+    const card = await renderCard({...original, ...billing})
+    try {
+      assert.equal(card.html.includes(output), false)
+      assert.match(card.html, /Image ready · confirming price/)
+      assert.match(card.html, /Price:/)
+      assert.doesNotMatch(card.html, />Refine</)
+      assert.equal(card.bindings.currentImage.value, null)
+    } finally {card.restore()}
+  }
+})
+
+test('a confirmed zero price unlocks the generated output and displays the exact free price', async () => {
+  const card = await renderCard({...original, priceUsd: '0.00000000'})
+  try {
+    assert.equal(card.html.includes(output), true)
+    assert.match(card.html, /\$0\.00/)
+    assert.match(card.html, /confirmed/)
+  } finally {card.restore()}
+})
+
+test('billing refresh unlocks a pending result only when the reloaded generation is confirmed', async () => {
+  let confirmed = false
+  const card = await renderCard({...original, priceSource: 'estimate', billingState: 'pending'}, [], async url => ({ok: true,
+    item: {...original, billingState: confirmed ? 'confirmed' : 'pending'}}))
+  try {
+    assert.equal(card.bindings.currentImage.value, null)
+    await card.bindings.refreshBilling()
+    assert.equal(card.bindings.currentImage.value, null)
+    confirmed = true
+    await card.bindings.refreshBilling()
+    assert.equal(card.bindings.currentImage.value, output)
   } finally {card.restore()}
 })
 

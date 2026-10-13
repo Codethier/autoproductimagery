@@ -5,7 +5,8 @@ import {fileURLToPath} from 'node:url'
 import test from 'node:test'
 import {compileScript, parse} from '@vue/compiler-sfc'
 import {renderToString} from '@vue/server-renderer'
-import {createSSRApp, h, ref} from 'vue'
+import {computed, createSSRApp, h, ref, watch} from 'vue'
+import {formatBalanceUsd, formatUsd} from '../app/utils/generationPrice.ts'
 import {createAssetFavourites} from '../app/utils/assetPreferences.ts'
 import {createImageModelFavourites} from '../app/utils/imageModelFavourites.ts'
 import type {AssetFile, AssetFolder} from '../schemas/image-storage.ts'
@@ -13,6 +14,8 @@ import type {AssetFile, AssetFolder} from '../schemas/image-storage.ts'
 const root = new URL('../', import.meta.url)
 const browserUrl = new URL('app/components/AssetBrowser.vue', root).href
 const layoutUrl = new URL('app/layouts/workspace.vue', root).href
+const balanceUrl = new URL('app/components/AccountBalanceSummary.vue', root).href
+const teamUrl = new URL('app/pages/team.vue', root).href
 const environmentKey = '__organizationWorkspaceUiTest'
 registerHooks({
   resolve(specifier, context, nextResolve) {
@@ -21,21 +24,27 @@ registerHooks({
     return nextResolve(specifier, context)
   },
   load(url, context, nextLoad) {
-    if (url !== browserUrl && url !== layoutUrl) return nextLoad(url, context)
+    if (url !== browserUrl && url !== layoutUrl && url !== balanceUrl && url !== teamUrl) return nextLoad(url, context)
     const filename = fileURLToPath(url)
     let source = readFileSync(filename, 'utf8')
     if (url === browserUrl) source = source.replace('</script>', 'defineExpose({files, directories, loading, openSharing, shareTarget, shareRecipient, saveShare, revokeShare, grants, currentFolder, preview, selection, selectedMetadata, confirmSelection, fetchPage, view})\n</script>')
+    if (url === teamUrl) source = source.replace('</script>', 'defineExpose({openBalance, saveBalance, balanceForm, balanceDetails, balanceError})\n</script>')
     const {descriptor} = parse(source, {filename})
     const compiled = compileScript(descriptor, {id: filename, inlineTemplate: true})
     const services = `
       const useRoute = () => ({path: '/assets'});
       const useAccount = () => globalThis.${environmentKey}.session;
+      const useDataStore = () => ({pendingGenerations: []});
+      const useAccountBalance = () => ({balance: ref(null), pending: ref(false), error: ref(''), refresh: async () => {}});
+      const definePageMeta = () => {};
+      const useHead = () => {};
+      const useFetch = () => ({data: ref({users: [], total: 0}), status: ref('success'), error: ref(null), refresh: async () => {}});
       const useToast = () => ({add: () => undefined});
       const useRequestFetch = () => (...args) => globalThis.${environmentKey}.fetch(...args);
       const $fetch = (...args) => globalThis.${environmentKey}.fetch(...args);
       const useAssetFavourites = () => ({urls: ref([]), persistent: ref(true), toggle: () => undefined, remove: () => undefined});
     `
-    return {format: 'module', shortCircuit: true, source: stripTypeScriptTypes(`import {computed, ref, watch, nextTick, onMounted, onBeforeUnmount, provide} from 'vue';\n${services}\n${compiled.content}`)}
+    return {format: 'module', shortCircuit: true, source: stripTypeScriptTypes(`import {computed, ref, reactive, watch, nextTick, onMounted, onBeforeUnmount, onServerPrefetch, provide} from 'vue';\n${services}\n${compiled.content}`)}
   },
 })
 
@@ -133,7 +142,7 @@ test('sharing responses from a previous account never populate the current accou
 test('organization owner sees Team navigation while a member does not', async () => {
   const {default: Layout} = await import(layoutUrl)
   for (const isOwner of [false, true]) {
-    ;(globalThis as any)[environmentKey] = {session: {account: ref({displayName: 'Cora', username: 'cora', organizationName: 'Studio'}), identity: ref('org.cora'), isOwner: ref(isOwner)}}
+    ;(globalThis as any)[environmentKey] = {session: {account: ref({displayName: 'Cora', username: 'cora', organizationName: 'Studio'}), identity: ref('org.cora'), epoch: ref(1), isOwner: ref(isOwner)}}
     const app = createSSRApp({render: () => h(Layout)})
     app.component('UIcon', {render: () => h('span')})
     app.component('NuxtLink', {props: ['to'], setup: (props: any, {slots}: any) => () => h('a', {href: props.to}, slots.default?.())})
@@ -142,6 +151,99 @@ test('organization owner sees Team navigation while a member does not', async ()
     assert.match(html, /href="\/shared"/)
     assert.match(html, /Studio/)
   }
+})
+
+test('library thumbnails and previews withhold generated files with pending prices but retain uploaded media', async () => {
+  const generated = {...fixtureFile('pending.png', 'alice', 'owner'), category: 'generated' as const, priceUsd: '0.050000000000', priceSource: 'estimate', billingState: 'pending'}
+  const upload = fixtureFile('uploaded.png', 'alice', 'owner')
+  const browser = await renderBrowser({files: [generated, upload], actorId: 'alice', preview: true})
+  assert.match(browser.html, /Confirming price/)
+  assert.match(browser.html, /\$0\.05 · estimate, final price pending/)
+  assert.equal(browser.html.includes(`src="/api/data${generated.url}"`), false)
+  assert.equal(browser.html.includes(`href="/api/data${generated.url}"`), false)
+  assert.equal(browser.html.includes(`src="/api/data${upload.url}"`), true)
+  const confirmed = await renderBrowser({files: [{...generated, priceUsd: '0.000000000000', priceSource: 'gateway', billingState: 'confirmed'}], actorId: 'alice', preview: true})
+  assert.equal(confirmed.html.includes(`src="/api/data${generated.url}"`), true)
+  assert.match(confirmed.html, /\$0\.00 · confirmed/)
+  assert.match(confirmed.html, /Download/)
+})
+
+test('balance summary separates available credit, outstanding estimates and exact confirmed charges', async () => {
+  const {default: Balance} = await import(balanceUrl)
+  for (const unlimited of [true, false]) {
+    const app = createSSRApp({render: () => h(Balance, {balance: {currency: 'USD', confirmedSpendUsd: '0.000000000001', outstandingEstimateUsd: '0.120000000000', outstandingCount: 3, outstandingUnknownCount: 1, actualBalanceUsd: unlimited ? null : '-0.005000000001', unlimited}})})
+    app.component('UIcon', {render: () => h('span')})
+    const html = await renderToString(app)
+    assert.match(html, /Actual balance/)
+    assert.match(html, /Outstanding balance/)
+    assert.match(html, /Confirmed spend/)
+    assert.match(html, /\$0\.000000000001/)
+    assert.match(html, /\$0\.12/)
+    assert.match(html, /3 generations awaiting final cost/)
+    assert.match(html, /1 without an estimate/)
+    assert.match(html, unlimited ? /<strong>Unlimited<\/strong>/ : /−\$0\.005000000001/)
+  }
+  assert.equal(formatUsd('0.000000000001'), '$0.000000000001')
+  assert.equal(formatBalanceUsd('-0.000000000001'), '−$0.000000000001')
+})
+
+test('a late balance response cannot populate or override another user’s active balance request', async () => {
+  const source = stripTypeScriptTypes(readFileSync(new URL('app/composables/useAccountBalance.ts', root), 'utf8')).replace('export function useAccountBalance', 'return function useAccountBalance')
+  const state = ref<any>({identity: '', epoch: -1, balance: null, pending: false, error: ''})
+  const account = {identity: ref('org.alice'), epoch: ref(1)}
+  const completions: Array<(response: unknown) => void> = []
+  const useBalance = new Function('computed', 'watch', 'useAccount', 'useState', 'useRequestFetch', source)(computed, watch, () => account, () => state, () => () => new Promise(resolve => completions.push(resolve)))
+  const balance = useBalance()
+  const alice = balance.refresh()
+  account.identity.value = 'org.bea'; account.epoch.value += 1
+  assert.equal(balance.balance.value, null)
+  const bea = balance.refresh()
+  completions[0]!({actualBalanceUsd: '500.000000000000', unlimited: false})
+  await alice
+  assert.equal(balance.balance.value, null)
+  assert.equal(balance.pending.value, true)
+  completions[1]!({actualBalanceUsd: null, unlimited: true, outstandingCount: 0})
+  await bea
+  assert.equal(balance.balance.value.unlimited, true)
+  assert.equal(balance.pending.value, false)
+})
+
+test('owner balance controls preserve exact USD input, support Unlimited and discard stale account responses', async () => {
+  const {default: Team} = await import(teamUrl)
+  const session = {account: ref({userId: 'owner', organizationName: 'Studio'}), epoch: ref(1), identity: ref('org.owner'), isOwner: ref(true)}
+  const calls: Array<{url: string; options: any}> = []
+  const baseBalance = {currency: 'USD', confirmedSpendUsd: '0.000000000000', outstandingEstimateUsd: '0.000000000000', outstandingCount: 0, outstandingUnknownCount: 0, actualBalanceUsd: null, unlimited: true}
+  const environment: any = {session, fetch: async (url: string, options: any) => {calls.push({url, options}); return {userId: 'member', balance: baseBalance}}}
+  ;(globalThis as any)[environmentKey] = environment
+  let exposed: any
+  const originalSetup = Team.setup
+  const component = {...Team, setup(props: unknown, context: any) {return originalSetup(props, {...context, expose(value: unknown) {exposed = value; context.expose(value)}})}}
+  const app = createSSRApp({render: () => h(component)})
+  app.component('UIcon', {render: () => h('span')})
+  app.component('AccountBalanceSummary', {render: () => h('div')})
+  await renderToString(app)
+  const member = {id: 'member', username: 'member', displayName: 'Mira', role: 'user', disabled: false, createdAt: '2026-10-13T00:00:00Z'}
+  await exposed.openBalance(member)
+  exposed.balanceForm.unlimited = false
+  exposed.balanceForm.actualBalanceUsd = '12.123456789012'
+  await exposed.saveBalance()
+  assert.deepEqual(calls.at(-1), {url: '/api/org/users/member/balance', options: {method: 'PATCH', body: {actualBalanceUsd: '12.123456789012'}}})
+  exposed.balanceForm.unlimited = true
+  await exposed.saveBalance()
+  assert.equal(calls.at(-1)!.options.body.actualBalanceUsd, null)
+  const savedCalls = calls.length
+  exposed.balanceForm.unlimited = false
+  exposed.balanceForm.actualBalanceUsd = '1e6'
+  await exposed.saveBalance()
+  assert.equal(calls.length, savedCalls)
+  assert.match(exposed.balanceError.value, /nonnegative USD amount/)
+  let finish!: (value: unknown) => void
+  environment.fetch = () => new Promise(resolve => {finish = resolve})
+  const loading = exposed.openBalance(member)
+  session.identity.value = 'org.bea'; session.epoch.value += 1
+  finish({userId: 'member', balance: {...baseBalance, actualBalanceUsd: '900.000000000000', unlimited: false}})
+  await loading
+  assert.equal(exposed.balanceDetails.value, null)
 })
 
 test('asset and model favorites stay isolated between user storage namespaces', () => {

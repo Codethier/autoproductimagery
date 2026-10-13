@@ -42,6 +42,8 @@
 - Recover abandoned pending rows using a conservative stale timeout or durable lease/heartbeat. Process start time is not job ownership and must not be used to fail another worker's live job.
 - Persist every provider output independently, release image buffers promptly, and clean up only the exact output file whose persistence failed.
 - Capture bounded/redacted provider diagnostics, request IDs, attempt data, retryability, warnings, and billing for every attempt. Never expose credentials, image bytes/data URLs, cookies, absolute filesystem paths, or directory listings in API errors.
+- Hold generated images until an exact completed non-BYOK Gateway charge is confirmed. Apply this to public history projections, S3 serving, asset lists, sharing, favorites and generation references. A valid zero charge unlocks; estimates never unlock. Uploaded images are unaffected.
+- Post per-output charges and debit finite user credit atomically with generation/billing transitions. Use integer USD units at 12 decimal places, preserve sibling allocation totals, and never debit twice or revise a confirmed price. Default credit is unlimited; organization owners alone adjust their organization's user balances with an audit record. Unresolved costs remain outstanding rather than being assumed free. Finite accounts admit one unresolved batch and may overdraw on its final cost; block further batches at zero or negative credit.
 
 ## Authentication and request safety
 

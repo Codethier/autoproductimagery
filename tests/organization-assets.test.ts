@@ -9,7 +9,7 @@ import {drizzle} from 'drizzle-orm/node-postgres'
 import {migrate} from 'drizzle-orm/node-postgres/migrator'
 import {eq} from 'drizzle-orm'
 import {DeleteObjectCommand, DeleteObjectsCommand, GetObjectCommand, HeadObjectCommand, ListObjectsV2Command, PutObjectCommand} from '@aws-sdk/client-s3'
-import {assets, assetShares, organizations, users} from '../server/db/schema.ts'
+import {assets, assetShares, organizations, systemPrompt, users} from '../server/db/schema.ts'
 import {createAssetRepository, canonicalAssetUrl, decodeAssetCursor, encodeAssetCursor, assetCursorScope, type AssetActor} from '../server/utils/assetAccess.ts'
 import {createS3ImageStorage, type ImageStorageCommand} from '../server/utils/useFS.ts'
 import {useUserFS} from '../server/utils/useUserFS.ts'
@@ -90,6 +90,12 @@ async function fixture(work: (f: {db: ReturnType<typeof drizzle>; storage: Retur
     }
 }
 const upload = (bytes: Buffer, filename = 'product.png') => ({name: 'files' as const, filename, type: 'image/png', data: bytes})
+async function pricedGeneration(db: ReturnType<typeof drizzle>, actor: AssetActor, outputImage: string, values: Partial<typeof systemPrompt.$inferInsert> = {}) {
+    const [row] = await db.insert(systemPrompt).values({organizationId: actor.organizationId, userId: actor.userId,
+        TextPrompt: 'Disposable local price fixture', outputImage, status: 'succeeded', billingState: 'confirmed',
+        priceUsd: '0.125000000000', priceSource: 'gateway', usageJson: {gatewayBilling: {isByok: false}}, ...values}).returning()
+    return row!
+}
 
 test('asset URLs and listing cursors reject ambiguous paths and another user or query scope', () => {
     const a = actor(randomUUID(), 'alice'), b = {...a, userId: randomUUID()}
@@ -169,6 +175,7 @@ test('historical edit grants remain readable generation sources but cannot autho
     const folder = await aliceFS.createFolder('/', 'Campaign')
     const image = await aliceFS.saveUpload('/Campaign', upload(f.bytes))
     const output = await aliceFS.saveGeneratedImage(f.bytes)
+    await pricedGeneration(f.db, f.alice, output.url)
     const outputAsset = await aliceFS.assetByUrl(output.url)
     const grantId = randomUUID()
     await f.db.insert(assetShares).values([
@@ -194,6 +201,7 @@ test('historical edit grants remain readable generation sources but cannot autho
     await assert.rejects(bobFS.sharesFor(image.id!), status(403))
     assert.equal(f.s3.commands.length, beforeMutations, 'denied shared mutations must not reach S3')
     const derivative = await bobFS.saveGeneratedImage((await bobFS.getImageFile(image.url)).buffer)
+    await pricedGeneration(f.db, f.bob, derivative.url)
     assert.match(derivative.url, new RegExp(`/users/${f.bob.userId}/output/`))
     await assert.rejects(aliceFS.getImageFile(derivative.url), status(404))
     assert.equal((await aliceFS.getImageFile(image.url)).width, 4)
@@ -220,6 +228,7 @@ test('deleting then uploading the same filename cannot reuse replay URLs or inhe
 test('generated images register immutable actor-owned output paths and exact rollback rejects sibling outputs', integration, async () => fixture(async f => {
     const aliceFS = await useUserFS(f.alice, f.storage, f.db), bobFS = await useUserFS(f.bob, f.storage, f.db)
     const output = await aliceFS.saveGeneratedImage(f.bytes)
+    await pricedGeneration(f.db, f.alice, output.url)
     assert.match(output.url, new RegExp(`/organizations/${f.alice.organizationId}/users/${f.alice.userId}/output/img-`))
     assert.equal((await aliceFS.listAssets({scope: 'generated'})).files[0]?.url, output.url)
     assert.equal((await aliceFS.listAssets({scope: 'uploads'})).files.length, 0)
@@ -227,6 +236,121 @@ test('generated images register immutable actor-owned output paths and exact rol
     await aliceFS.removeGeneratedImage(output.url)
     assert.equal((await aliceFS.listAssets({scope: 'generated'})).files.length, 0)
     await assert.rejects(aliceFS.getImageFile(output.url), status(404))
+}))
+
+test('generated images stay locked until an exact same-owner final price exists, with authorization checked before price or S3 access', integration, async () => fixture(async f => {
+    const aliceFS = await useUserFS(f.alice, f.storage, f.db), bobFS = await useUserFS(f.bob, f.storage, f.db)
+    const ownerFS = await useUserFS(f.owner, f.storage, f.db), outsiderFS = await useUserFS(f.outsider, f.storage, f.db)
+    const repository = createAssetRepository(f.alice, f.db)
+    const cases: Array<{label: string; values?: Partial<typeof systemPrompt.$inferInsert>; historyOwner?: AssetActor; visible: boolean; orphan?: boolean}> = [
+        {label: 'orphan', visible: false, orphan: true},
+        {label: 'estimated', visible: false, values: {priceSource: 'estimate', billingState: 'awaiting'}},
+        {label: 'awaiting', visible: false, values: {priceSource: 'gateway', billingState: 'awaiting'}},
+        {label: 'pending-generation', visible: false, values: {status: 'pending'}},
+        {label: 'failed-generation', visible: false, values: {status: 'failed', errors: 'Provider failed'}},
+        {label: 'missing-price', visible: false, values: {priceUsd: null}},
+        {label: 'negative-price', visible: false, values: {priceUsd: '-0.1'}},
+        {label: 'non-decimal-price', visible: false, values: {priceUsd: '1e-7'}},
+        {label: 'BYOK', visible: false, values: {priceUsd: '0', usageJson: {gatewayBilling: {isByok: true, upstreamInferenceCost: 0.12}}}},
+        {label: 'legacy-BYOK', visible: false, values: {billingState: null, priceUsd: '0', usageJson: {gatewayBilling: {isByok: true}}}},
+        {label: 'other-user-price', visible: false, historyOwner: f.bob},
+        {label: 'other-organization-price', visible: false, historyOwner: f.outsider},
+        {label: 'expired-output', visible: false, values: {outputImageDeletedAt: new Date().toISOString()}},
+        {label: 'zero', visible: true, values: {priceUsd: '0.000000000000'}},
+        {label: 'tiny-exact', visible: true, values: {priceUsd: '0.000000000001'}},
+        {label: 'legacy-confirmed', visible: true, values: {status: null, billingState: null, errors: null}},
+    ]
+    const outputs: Array<{url: string; visible: boolean; label: string; priceUsd?: string | null}> = []
+    let folderId: string | undefined
+    for (const entry of cases) {
+        const output = await aliceFS.saveGeneratedImage(f.bytes)
+        const asset = await repository.byUrl(output.url)
+        assert.ok(asset)
+        folderId ??= asset.parentId!
+        if (!entry.orphan) await pricedGeneration(f.db, entry.historyOwner ?? f.alice, output.url, entry.values)
+        outputs.push({url: output.url, visible: entry.visible, label: entry.label, priceUsd: entry.values?.priceUsd ?? '0.125000000000'})
+    }
+    await aliceFS.share(folderId!, f.bob.userId, 'view')
+    for (const output of outputs) {
+        const before = f.s3.commands.length
+        if (output.visible) {
+            const metadata = await aliceFS.assetByUrl(output.url)
+            assert.equal(metadata.priceUsd, output.priceUsd, output.label)
+            assert.equal((await bobFS.getImageFile(output.url)).width, 4, output.label)
+            await bobFS.assertReadableImages([output.url])
+        } else {
+            for (const readable of [aliceFS, bobFS]) {
+                await assert.rejects(readable.getImageFile(output.url), status(425), output.label)
+                await assert.rejects(readable.getFile(output.url), status(425), output.label)
+                await assert.rejects(readable.fileExists(output.url), status(425), output.label)
+                await assert.rejects(readable.assetByUrl(output.url), status(425), output.label)
+                await assert.rejects(readable.assertReadableImages([output.url]), status(425), output.label)
+                assert.deepEqual(await readable.resolveAssets([output.url]), [], output.label)
+            }
+            assert.equal(f.s3.commands.length, before, `${output.label}: held image bytes and object metadata must never be requested`)
+        }
+        for (const unauthorized of [ownerFS, outsiderFS]) {
+            await assert.rejects(unauthorized.getImageFile(output.url), status(404), output.label)
+            await assert.rejects(unauthorized.assertReadableImages([output.url]), status(404), output.label)
+            assert.deepEqual(await unauthorized.resolveAssets([output.url]), [], output.label)
+        }
+    }
+    const visibleUrls = outputs.filter(output => output.visible).map(output => output.url).sort()
+    assert.deepEqual((await aliceFS.listAssets({scope: 'generated'})).files.map(file => file.url).sort(), visibleUrls)
+    assert.deepEqual((await bobFS.readDir('/', {folderId})).files.map(file => file.url).sort(), visibleUrls)
+    assert.deepEqual((await bobFS.resolveAssets(outputs.map(output => output.url))).map(file => file.url).sort(), visibleUrls, 'favorites only resolve confirmed shared images')
+    const orphan = outputs.find(output => output.label === 'orphan')!
+    await assert.rejects(bobFS.removeGeneratedImage(orphan.url), status(403), 'sharing never permits cleanup')
+    await aliceFS.removeGeneratedImage(orphan.url)
+    await assert.rejects(aliceFS.getImageFile(orphan.url), status(404), 'the original owner can remove an unlinked or unpaid output')
+    assert.equal((await bobFS.getImageFile(outputs.find(output => output.label === 'zero')!.url)).width, 4, 'cleanup only deletes its exact output')
+}))
+
+test('shared folder listing filters held outputs before pagination and unlocks a persisted exact price on the next read', integration, async () => fixture(async f => {
+    const aliceFS = await useUserFS(f.alice, f.storage, f.db), bobFS = await useUserFS(f.bob, f.storage, f.db)
+    const repository = createAssetRepository(f.alice, f.db)
+    const generated = []
+    for (let index = 0; index < 6; index++) {
+        const output = await aliceFS.saveGeneratedImage(f.bytes)
+        const asset = await repository.byUrl(output.url)
+        assert.ok(asset)
+        generated.push(asset)
+    }
+    generated.sort((left, right) => left.id.localeCompare(right.id))
+    const folderId = generated[0]!.parentId!
+    await aliceFS.share(folderId, f.bob.userId, 'view')
+    // Earlier UUIDs fill any unfiltered first page. Only the final two are
+    // priced; a SQL LIMIT applied too early would return an empty page here.
+    for (const asset of generated.slice(0, 4)) await pricedGeneration(f.db, f.alice, asset.url, {billingState: 'awaiting', priceSource: 'estimate'})
+    for (const asset of generated.slice(4)) await pricedGeneration(f.db, f.alice, asset.url, {priceUsd: '0.000000000001'})
+    const before = f.s3.commands.length
+    const first = await bobFS.readDir('/', {folderId, limit: 1})
+    assert.deepEqual(first.files.map(file => file.id), [generated[4]!.id])
+    assert.ok(first.nextCursor)
+    const second = await bobFS.readDir('/', {folderId, limit: 1, cursor: first.nextCursor})
+    assert.deepEqual(second.files.map(file => file.id), [generated[5]!.id])
+    assert.equal(second.nextCursor, undefined)
+    assert.equal(f.s3.commands.length, before, 'listing and prices require no S3 object reads')
+    const held = generated[0]!
+    await assert.rejects(bobFS.assertReadableImages([held.url]), status(425))
+    const [history] = await f.db.select().from(systemPrompt).where(eq(systemPrompt.outputImage, held.url))
+    await f.db.update(systemPrompt).set({billingState: 'confirmed', priceSource: 'gateway', priceUsd: '0.000000000000'}).where(eq(systemPrompt.id, history!.id))
+    assert.equal((await bobFS.getImageFile(held.url)).height, 3, 'newly settled zero prices unlock for the recipient')
+    await bobFS.assertReadableImages([held.url])
+    assert.equal((await bobFS.resolveAssets([held.url]))[0]?.priceUsd, '0.000000000000')
+}))
+
+test('listing price prefetch cannot replace a valid output price with failed or BYOK legacy duplicates', integration, async () => fixture(async f => {
+    const aliceFS = await useUserFS(f.alice, f.storage, f.db)
+    const output = await aliceFS.saveGeneratedImage(f.bytes)
+    await pricedGeneration(f.db, f.alice, output.url, {priceUsd: '0.100000000000'})
+    await pricedGeneration(f.db, f.alice, output.url, {status: 'failed', errors: 'Failed legacy duplicate', priceUsd: '90'})
+    await pricedGeneration(f.db, f.alice, output.url, {status: null, errors: 'Interrupted legacy duplicate', priceUsd: '80'})
+    await pricedGeneration(f.db, f.alice, output.url, {billingState: null, priceUsd: '0', usageJson: {gatewayBilling: {isByok: true}}})
+    const listing = await aliceFS.listAssets({scope: 'generated'})
+    assert.equal(listing.files.length, 1)
+    assert.equal(listing.files[0]?.priceUsd, '0.100000000000')
+    assert.equal((await aliceFS.assetByUrl(output.url)).priceUsd, '0.100000000000')
 }))
 
 test('registry pagination binds cursor to actor/source/search, and revoked favorites omit inaccessible metadata', integration, async () => fixture(async f => {

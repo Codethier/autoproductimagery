@@ -25,19 +25,20 @@ registerHooks({
     if (url === formUrl || (url.startsWith(settingsDirectory) && url.endsWith('.vue'))) {
       const filename = fileURLToPath(url)
       let source = readFileSync(filename, 'utf8')
-      if (url === formUrl) source = source.replace('</script>', 'defineExpose({ submit, uploadFiles, loadMoreHistory, sourceImages, data, pickerKind, confirmPicker, previewOutput, canSubmit, prompt, pendingGenerations, activeGenerationCount, errorMsg, uploading, displayedHistory })\n</script>')
+      if (url === formUrl) source = source.replace('</script>', 'defineExpose({ submit, uploadFiles, loadMoreHistory, sourceImages, data, pickerKind, confirmPicker, previewOutput, previewResult, previewPricePending, recentImages, canSubmit, prompt, pendingGenerations, activeGenerationCount, errorMsg, uploading, displayedHistory })\n</script>')
       const { descriptor } = parse(source, { filename })
       const compiled = compileScript(descriptor, { id: filename, inlineTemplate: true })
       const nuxtServices = url === formUrl ? `
         const useDataStore = () => globalThis.${environmentKey}.store;
         const useAccount = () => globalThis.${environmentKey}.account;
+        const useAccountBalance = () => globalThis.${environmentKey}.accountBalance;
         const useFetch = (...args) => globalThis.${environmentKey}.useFetch(...args);
         const useRoute = () => globalThis.${environmentKey}.route;
         const $fetch = (...args) => globalThis.${environmentKey}.fetch(...args);
         const refreshNuxtData = async () => {};
       ` : ''
       return { format: 'module', shortCircuit: true,
-        source: stripTypeScriptTypes(`import { computed, ref, watch, toRef, toRaw, onBeforeUnmount } from 'vue';\n${nuxtServices}\n${compiled.content}`) }
+        source: stripTypeScriptTypes(`import { computed, ref, watch, toRef, toRaw, onMounted, onBeforeUnmount } from 'vue';\n${nuxtServices}\n${compiled.content}`) }
     }
     return nextLoad(url, context)
   },
@@ -63,17 +64,18 @@ async function renderWorkspace(mode: 'edit' | 'batch', overrides: Partial<Store>
   })
   const environment: any = {
     store, route: reactive({ query: {} }), exposed: null,
-    account: {epoch: ref(1), identity: ref('org.alice')}, refreshes: [], fetchKeys: [],
+    account: {epoch: ref(1), identity: ref('org.alice')}, refreshes: [], fetchKeys: [], history: ref({ok: true, count: 0, items: []}),
+    accountBalance: {balance: ref(null), refresh: async () => {}},
     useFetch(url: string, options: {key?: unknown}) {
       this.fetchKeys.push({url, key: options.key})
       const data = url === '/api/image-models'
         ? { ok: true, items: Object.values(IMAGE_MODEL_PROFILES).map(profile => ({ id: profile.id, profile, available: true, catalogStatus: 'available' })) }
         : { ok: true, count: 0, items: [] }
-      return { data: ref(data), status: ref('success'), error: ref(null), refresh: async () => { this.refreshes.push(url) } }
+      return { data: url === '/api/systemprompts' ? this.history : ref(data), status: ref('success'), error: ref(null), refresh: async () => { this.refreshes.push(url) } }
     },
     async fetch(url: string, options: { body?: unknown }) {
       requests.push({ url, options })
-      return { ok: true, obj: [{ outputImage: '/images/output/result.png', errors: null }] }
+      return { ok: true, obj: [{id: 1, status: 'succeeded', outputImage: '/images/output/result.png', errors: null, priceUsd: '0.04500000', priceSource: 'gateway', billingState: 'confirmed'}] }
     },
   }
   ;(globalThis as any)[environmentKey] = environment
@@ -195,6 +197,78 @@ test('the Asset picker replaces only the active workspace selection', async () =
   workspace.exposed.confirmPicker([{ name: 'light.png', url: '/images/light.png' }])
   assert.deepEqual(workspace.store.models, ['/images/light.png'])
   assert.equal(workspace.store.editSource, '/images/new.png')
+})
+
+test('the editor withholds generated previews until confirmed billing arrives in account history', async () => {
+  const workspace = await renderWorkspace('edit', {editSource: '/images/edit.png'})
+  const pending = {id: 7, status: 'succeeded', TextPrompt: 'Waiting for a final cost', outputImage: '/images/output/unconfirmed.png',
+    priceUsd: '0.03000000', priceSource: 'estimate', billingState: 'pending'}
+  workspace.environment.fetch = async () => ({ok: true, obj: [pending]})
+  const previousWindow = (globalThis as any).window
+  const mounted = await mountWorkspace('edit', workspace.environment)
+  try {
+    await mounted.exposed.submit()
+    await nextTick()
+    assert.equal(mounted.exposed.previewOutput.value, null)
+    assert.equal(mounted.exposed.previewPricePending.value, true)
+    const imageSources = (node: MemoryNode): unknown[] => [node.props.src, ...node.children.flatMap(imageSources)].filter(Boolean)
+    assert.equal(imageSources(mounted.rootNode).includes(`/api/data${pending.outputImage}`), false)
+    workspace.environment.history.value = {count: 1, items: [pending]}
+    await nextTick()
+    assert.equal(mounted.exposed.recentImages.value.length, 0)
+    assert.equal(mounted.exposed.previewOutput.value, null)
+    workspace.environment.history.value = {count: 1, items: [{...pending, priceUsd: '0.00000000', priceSource: 'gateway', billingState: 'confirmed'}]}
+    await nextTick()
+    assert.equal(mounted.exposed.previewOutput.value, pending.outputImage)
+    assert.equal(mounted.exposed.recentImages.value.length, 1)
+    workspace.environment.account.identity.value = 'org.bob'
+    workspace.environment.account.epoch.value += 1
+    workspace.store.editSource = '/images/bob.png'
+    workspace.environment.history.value = {count: 0, items: []}
+    await nextTick()
+    assert.equal(mounted.exposed.previewOutput.value, null)
+    assert.equal(mounted.exposed.previewResult.value, null)
+  } finally {
+    mounted.app.unmount()
+    ;(globalThis as any).window = previousWindow
+  }
+})
+
+test('price polling is bounded and finite-credit accounts wait for outstanding prices to settle', async () => {
+  const workspace = await renderWorkspace('edit', {editSource: '/images/edit.png'})
+  workspace.environment.history.value = {count: 1, items: [{id: 9, status: 'succeeded', outputImage: null, priceUsd: null, priceSource: null, billingState: 'pending'}]}
+  workspace.environment.accountBalance.balance.value = {unlimited: false, actualBalanceUsd: '2.000000000000', outstandingCount: 1}
+  const timers: Array<() => Promise<void>> = []
+  const originalTimeout = globalThis.setTimeout
+  const originalDocument = (globalThis as any).document
+  const previousWindow = (globalThis as any).window
+  ;(globalThis as any).setTimeout = (fn: () => Promise<void>, delay: number, ...args: any[]) => delay === 10_000 ? (timers.push(fn), timers.length) : originalTimeout(fn, delay, ...args)
+  ;(globalThis as any).document = {visibilityState: 'visible'}
+  let mounted: Awaited<ReturnType<typeof mountWorkspace>> | undefined
+  try {
+    mounted = await mountWorkspace('edit', workspace.environment)
+    assert.equal(mounted.exposed.canSubmit.value, false)
+    for (let attempt = 0; attempt < 30; attempt++) { const next = timers.shift(); assert.ok(next); await next() }
+    assert.equal(timers.length, 0)
+    assert.equal(workspace.environment.refreshes.filter((url: string) => url === '/api/systemprompts').length, 30)
+    workspace.environment.accountBalance.balance.value = {unlimited: false, actualBalanceUsd: '2.000000000000', outstandingCount: 0}
+    await nextTick()
+    assert.equal(mounted.exposed.canSubmit.value, true)
+    workspace.environment.accountBalance.balance.value = {unlimited: false, actualBalanceUsd: '2.000000000000', outstandingCount: 1, generationBlockedByOutstanding: false}
+    await nextTick()
+    assert.equal(mounted.exposed.canSubmit.value, true, 'historical unpriced entries without a retryable charge do not block new finite-credit generations')
+    workspace.environment.accountBalance.balance.value = {unlimited: false, actualBalanceUsd: '-0.005000000001', outstandingCount: 0}
+    await nextTick()
+    assert.equal(mounted.exposed.canSubmit.value, false)
+    workspace.environment.accountBalance.balance.value = {unlimited: true, actualBalanceUsd: null, outstandingCount: 1}
+    await nextTick()
+    assert.equal(mounted.exposed.canSubmit.value, true)
+  } finally {
+    mounted?.app.unmount()
+    globalThis.setTimeout = originalTimeout
+    ;(globalThis as any).document = originalDocument
+    ;(globalThis as any).window = previousWindow
+  }
 })
 
 test('navigation unmounts and remounts the editor without losing an in-flight request or permitting a duplicate', async () => {

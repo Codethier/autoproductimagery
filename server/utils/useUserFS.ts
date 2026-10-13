@@ -168,7 +168,7 @@ export async function useUserFS(actor: AssetActor, storage?: RawStorage, databas
             const result: AssetFile[] = []
             for (const url of new Set(urls)) {
                 try {const found = await repository.requireAsset(url); if (found.row.kind === 'file') result.push(await repository.dto(found.row, found))}
-                catch (error) {if (!(error && typeof error === 'object' && 'statusCode' in error && error.statusCode === 404)) throw error}
+                catch (error) {if (!(error && typeof error === 'object' && 'statusCode' in error && (error.statusCode === 404 || error.statusCode === 425))) throw error}
             }
             return result
         }),

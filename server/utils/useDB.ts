@@ -6,6 +6,8 @@ import {
     type NewAiGatewayLog,
 } from "../db/schema"
 import { and, desc, eq, inArray, isNotNull, lt, sql as drizzleSql } from "drizzle-orm"
+import {assertGenerationCredit, recordGenerationCharge} from './accountBilling'
+import {hasConfirmedGenerationPrice} from '../../schemas/generation-billing'
 import type {
     OutputMetadata,
     StoredGenerationConfig,
@@ -98,6 +100,7 @@ export async function useDB(db = getDatabase(), owner?: GenerationOwner) {
             outputImage: '',
             generationModel: data.effectiveModel,
             status: 'pending' as const,
+            billingState: 'pending' as const,
             batchId: data.batchId,
             parentSystemPromptId: data.parentSystemPromptId ?? null,
             generationConfig: data.generationConfig,
@@ -115,7 +118,15 @@ export async function useDB(db = getDatabase(), owner?: GenerationOwner) {
         }
         // A single INSERT commits all pending output rows atomically and returns
         // PostgreSQL generated IDs without connection-local SQLite state.
-        const rows = await db.insert(systemPrompt).values(items.map(pendingValues)).returning()
+        const rows = await db.transaction(async tx => {
+            if (owner) {
+                if (new Set(items.map(item => item.batchId)).size !== 1) throw new Error('Pending generations must share one batch')
+                await assertGenerationCredit(tx, owner, items[0]!.batchId)
+            }
+            const inserted = await tx.insert(systemPrompt).values(items.map(pendingValues)).returning()
+            for (const row of inserted) await recordGenerationCharge(tx, row)
+            return inserted
+        })
         if (rows.length !== items.length) throw new Error('Database did not return all pending generations')
         return rows.map(normalizedTimestamps)
     }
@@ -143,6 +154,7 @@ export async function useDB(db = getDatabase(), owner?: GenerationOwner) {
                 errors: null,
                 errorJson: null,
                 ...billingValues(data.billing),
+                billingState: hasConfirmedGenerationPrice(data.billing) ? 'confirmed' : 'awaiting',
                 updatedAt: drizzleSql`CURRENT_TIMESTAMP`,
             }).where(and(
                 eq(systemPrompt.id, id),
@@ -151,6 +163,7 @@ export async function useDB(db = getDatabase(), owner?: GenerationOwner) {
             )).returning()
 
             if (!row) return undefined
+            await recordGenerationCharge(tx, row)
 
             await tx.insert(aiGatewayLog).values({
                 ...data.log,
@@ -169,6 +182,7 @@ export async function useDB(db = getDatabase(), owner?: GenerationOwner) {
         data: {
             error: StoredGenerationError
             billing?: GenerationBilling
+            releaseCharge?: boolean
             log: GenerationLog
         },
     ) {
@@ -180,6 +194,7 @@ export async function useDB(db = getDatabase(), owner?: GenerationOwner) {
                 errors: data.error.message,
                 errorJson: data.error,
                 ...billingValues(billing),
+                billingState: hasConfirmedGenerationPrice(billing) ? 'confirmed' : data.releaseCharge ? 'released' : 'awaiting',
                 updatedAt: drizzleSql`CURRENT_TIMESTAMP`,
             }).where(and(
                 eq(systemPrompt.id, id),
@@ -188,6 +203,7 @@ export async function useDB(db = getDatabase(), owner?: GenerationOwner) {
             )).returning()
 
             if (!row) return undefined
+            await recordGenerationCharge(tx, row, {release: data.releaseCharge})
 
             await tx.insert(aiGatewayLog).values({
                 ...data.log,
@@ -217,17 +233,27 @@ export async function useDB(db = getDatabase(), owner?: GenerationOwner) {
     }
 
     async function updateSystemPromptBilling(id: number, billing: GenerationBilling) {
-        const values: Record<string, unknown> = {
-            ...billingValues(billing),
-            updatedAt: drizzleSql`CURRENT_TIMESTAMP`,
-        }
-        if (!billing.model) delete values.generationModel
-        if (!billing.gatewayGenerationId) delete values.gatewayGenerationId
-
-        await db.update(systemPrompt)
-            .set(values)
-            .where(and(eq(systemPrompt.id, id), generationScope()))
-        return rowById(id)
+        return db.transaction(async tx => {
+            const [prior] = await tx.select().from(systemPrompt).where(and(eq(systemPrompt.id, id), generationScope())).for('update').limit(1)
+            if (!prior) return undefined
+            if (hasConfirmedGenerationPrice(prior)) {
+                if (prior.billingState === null) {
+                    const [registered] = await tx.update(systemPrompt).set({billingState: 'confirmed'}).where(eq(systemPrompt.id, id)).returning()
+                    if (registered) await recordGenerationCharge(tx, registered, {skipDebit: true})
+                    return registered ? normalizedTimestamps(registered) : normalizedTimestamps(prior)
+                }
+                return normalizedTimestamps(prior)
+            }
+            const values = {...billingValues(billing),
+                generationModel: billing.model ?? prior.generationModel,
+                gatewayGenerationId: billing.gatewayGenerationId ?? prior.gatewayGenerationId,
+                usageJson: {...(prior.usageJson ?? {}), ...(billing.usageJson ?? {})},
+                billingState: hasConfirmedGenerationPrice(billing) ? 'confirmed' as const : prior.status === 'pending' ? 'pending' as const : 'awaiting' as const,
+                updatedAt: drizzleSql`CURRENT_TIMESTAMP`}
+            const [row] = await tx.update(systemPrompt).set(values).where(and(eq(systemPrompt.id, id), generationScope())).returning()
+            if (row) await recordGenerationCharge(tx, row)
+            return row ? normalizedTimestamps(row) : undefined
+        })
     }
 
     async function touchPendingGenerations(ids: number[]) {
@@ -262,7 +288,8 @@ export async function useDB(db = getDatabase(), owner?: GenerationOwner) {
             cachedInputTokens: systemPrompt.cachedInputTokens,
             reasoningTokens: systemPrompt.reasoningTokens,
             priceUsd: systemPrompt.priceUsd,
-            priceSource: systemPrompt.priceSource,
+            priceSource: drizzleSql<string | null>`CASE WHEN ${systemPrompt.usageJson}->'gatewayBilling'->>'isByok' = 'true' THEN 'unknown' ELSE ${systemPrompt.priceSource} END`,
+            billingState: systemPrompt.billingState,
             gatewayGenerationId: systemPrompt.gatewayGenerationId,
             createdAt: systemPrompt.createdAt,
             updatedAt: systemPrompt.updatedAt,
@@ -323,6 +350,7 @@ export async function useDB(db = getDatabase(), owner?: GenerationOwner) {
                     status: 'failed',
                     errors: error.message,
                     errorJson: error,
+                    billingState: 'awaiting',
                     updatedAt: drizzleSql`CURRENT_TIMESTAMP`,
                 }).where(and(
                     eq(systemPrompt.id, row.id),
@@ -330,8 +358,9 @@ export async function useDB(db = getDatabase(), owner?: GenerationOwner) {
                     lt(systemPrompt.updatedAt, cutoff),
                     noLiveLease,
                     generationScope(),
-                )).returning({id: systemPrompt.id})
+                )).returning()
                 if (rows.length === 0) continue
+                await recordGenerationCharge(tx, rows[0]!)
                 reconciled += 1
                 await tx.insert(aiGatewayLog).values({
                     systemPromptId: row.id,
@@ -370,6 +399,15 @@ export async function useDB(db = getDatabase(), owner?: GenerationOwner) {
         return rows.map(normalizedTimestamps)
     }
 
+    async function getGenerationBillingVisibility(ids: number[]) {
+        if (ids.length > 200) throw new Error('Too many generation visibility checks')
+        if (!ids.length) return []
+        return db.select({id: systemPrompt.id, priceUsd: systemPrompt.priceUsd, priceSource: systemPrompt.priceSource,
+            billingState: systemPrompt.billingState,
+            usageJson: drizzleSql<{gatewayBilling: {isByok: unknown}}>`jsonb_build_object('gatewayBilling', jsonb_build_object('isByok', ${systemPrompt.usageJson}->'gatewayBilling'->'isByok'))`}).from(systemPrompt)
+            .where(and(inArray(systemPrompt.id, ids), generationScope()))
+    }
+
     return {
         createPendingGeneration,
         createPendingGenerations,
@@ -384,5 +422,6 @@ export async function useDB(db = getDatabase(), owner?: GenerationOwner) {
         reconcileStalePendingGenerations,
         createAiGatewayLog,
         getAiGatewayLogs,
+        getGenerationBillingVisibility,
     }
 }

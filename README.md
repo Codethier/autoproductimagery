@@ -115,6 +115,18 @@ The app uses the `/api/health` readiness check and Railway serverless/sleep mode
 
 Before switching an existing installation, review every deployment target watching `master`. Disable any obsolete target's automatic deployment before pushing this PostgreSQL/S3 version if that target still uses the previous SQLite/filesystem configuration. Preserve its existing application and stored data until a separate cutover is authorized. Production environment changes and migrations still require the explicit confirmation in `AGENTS.md`.
 
+## User credit and confirmed image prices
+
+Each account has **available credit**, **confirmed spending**, and **outstanding charges** in USD. Credit defaults to **Unlimited**. Organization owners can open **Team → Balance** to set a user's available credit, or restore Unlimited; changes are audited and limited to the owner's organization. This is an internal credit ledger, with no payment collection or checkout integration.
+
+Confirmed charges reduce finite credit once, transactionally. Outstanding estimated amounts are labeled separately, and charges without an amount have an unknown count; an unknown cost is never treated as zero. Finite accounts can run one unresolved batch at a time. Because the catalog estimate cannot guarantee the final price, that batch may take the remaining credit below zero; the next batch is blocked until the owner adds credit. Existing historical confirmed spending appears in totals without reducing newly assigned credit again.
+
+Generated images stay unavailable until the final Gateway generation record confirms the exact charge. The editor and history show **Image ready · confirming price**; previews, downloads, Assets, shared folders, favorites and generation references all enforce the same server check. A confirmed zero-cost result is valid. Each revealed result shows its confirmed price without rounding small positive costs to zero. Uploaded images remain usable immediately.
+
+History and balance reads reconcile a small number of provider calls, with PostgreSQL leases, retry backoff and bounded network timeouts. The client checks briefly while results await pricing and retains a manual price refresh. Multi-output calls share the provider total exactly, including charged outputs whose storage failed. Repeated refreshes cannot charge a user again or overwrite a confirmed price with an estimate. Prompts, prices and account charges remain after image retention deletes the bytes.
+
+Only ordinary Gateway-funded prices can be fully confirmed. BYOK generation records remain held because Gateway's charge excludes the external provider invoice, and its upstream cost is a market estimate. See the [Vercel generation lookup reference](https://vercel.com/docs/ai-gateway/sdks-and-apis/rest-api#look-up-a-generation).
+
 ## Generated image retention
 
 Set `GENERATED_IMAGE_RETENTION_DAYS` on the cleanup service to choose how long generated images are retained. The default is **180 days**. Use a whole number from 1 to 36500, or `0` to disable cleanup. Invalid or blank values fail without deleting anything. Changing the number applies to existing generated outputs on the next run: lowering it can make older images immediately eligible.

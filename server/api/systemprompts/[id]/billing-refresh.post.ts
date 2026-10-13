@@ -1,10 +1,9 @@
 import {z} from 'zod'
+import {createError, setHeader} from 'h3'
 import {useDB} from '~~/server/utils/useDB'
-import {useGateway} from '~~/server/utils/useGateway'
-import {
-    allocateGenerationBilling,
-    readGenerationAllocation,
-} from '~~/server/utils/generationBilling'
+import {hasConfirmedGenerationPrice} from '~~/schemas/generation-billing'
+import {publicGeneration} from '../../../utils/generationVisibility'
+import {reconcilePendingAccountBilling} from '../../../utils/reconcilePendingAccountBilling'
 
 const ParamsSchema = z.object({
     id: z.coerce.number().int().positive(),
@@ -12,6 +11,7 @@ const ParamsSchema = z.object({
 
 export default defineEventHandler(async (event) => {
     const account = await useAuth(event)
+    setHeader(event, 'cache-control', 'no-store')
 
     const parsed = ParamsSchema.safeParse(event.context.params)
     if (!parsed.success) {
@@ -23,23 +23,20 @@ export default defineEventHandler(async (event) => {
     if (!row) {
         throw createError({statusCode: 404, statusMessage: 'Generated image record not found'})
     }
+    // Repeated clicks never reprice a settled generation or debit it again.
+    if (hasConfirmedGenerationPrice(row)) return {ok: true, item: publicGeneration(row)}
     if (!row.gatewayGenerationId) {
         throw createError({statusCode: 409, statusMessage: 'No Gateway generation id is stored for this image'})
     }
 
-    const gw = await useGateway()
-    const billing = await gw.getGenerationBilling(row.gatewayGenerationId, row.generationModel || undefined)
-    if (!billing?.priceUsd) {
+    await reconcilePendingAccountBilling(account, {generationId: row.id, limit: 1, lookupTimeoutMs: 10_000})
+    const updated = await db.getSystemPrompt(row.id)
+    if (!updated || !hasConfirmedGenerationPrice(updated)) {
         throw createError({
             statusCode: 425,
             statusMessage: 'Gateway billing is not available yet. Try again shortly.',
         })
     }
 
-    const allocation = readGenerationAllocation(row.usageJson)
-    const effectiveBilling = allocation
-        ? allocateGenerationBilling(billing, allocation.outputIndex, allocation.outputCount)
-        : billing
-    const updated = await db.updateSystemPromptBilling(row.id, effectiveBilling)
-    return {ok: true, item: updated}
+    return {ok: true, item: publicGeneration(updated)}
 })

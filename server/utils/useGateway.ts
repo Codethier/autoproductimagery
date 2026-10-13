@@ -19,6 +19,9 @@ import {
 } from './gatewayMetadata'
 import { resolveGenerationTotalTokens } from './generationBilling'
 import { toBufferView } from './imageBuffer'
+import {extractConfirmedGatewayPrice} from '../../schemas/generation-billing'
+import {createBillingMetadataFetch} from './billingMetadataFetch'
+import {extractGatewayErrorGenerationId} from './billingGatewayError'
 
 // Supported model types reported by the gateway /config endpoint.
 export type GatewayModelType = 'language' | 'image' | 'embedding' | 'reranking' | 'video'
@@ -98,6 +101,8 @@ export type GeneratedImage = {
     warnings: string[]
     grounding?: NonNullable<OutputMetadata['grounding']>
 }
+
+export type ProviderCallStarted = () => void
 
 const googleSearchInputSchema = z.object({}).strict()
 type GoogleSearchArgs = {
@@ -312,7 +317,7 @@ function getGateway() {
             statusMessage: 'AI Gateway API key is missing in runtimeConfig.AiGatewayApiKey (env NUXT_AI_GATEWAY_API_KEY)',
         })
     }
-    _gateway = createGateway({apiKey})
+    _gateway = createGateway({apiKey, fetch: createBillingMetadataFetch()})
     return _gateway
 }
 
@@ -489,7 +494,7 @@ export async function useGateway(imageStorage?: Pick<Awaited<ReturnType<typeof u
     }
 
     function asNumber(value: unknown): number | undefined {
-        return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+        return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined
     }
 
     function normalizeUsage(usage: any): ImageGenerationUsage {
@@ -505,23 +510,25 @@ export async function useGateway(imageStorage?: Pick<Awaited<ReturnType<typeof u
     }
 
     function getGatewayGenerationId(providerMetadata: any): string | undefined {
-        const direct = providerMetadata?.gateway?.generationId ?? providerMetadata?.gateway?.generation_id
-        if (typeof direct === 'string' && direct.length > 0) return direct
+        const validId = (value: unknown): value is string => typeof value === 'string' && /^gen_[A-Za-z0-9_-]{1,120}$/.test(value)
+        const metadata = providerMetadata?.gateway
+        const direct = metadata?.generationId ?? metadata?.generation_id
+        if (validId(direct)) return direct
         const seen = new Set<object>()
-        const visit = (value: unknown): string | undefined => {
-            if (!value || typeof value !== 'object') return undefined
+        const visit = (value: unknown, depth = 0): string | undefined => {
+            if (!value || typeof value !== 'object' || depth > 6 || seen.size >= 100) return undefined
             if (seen.has(value)) return undefined
             seen.add(value)
-            for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
-                if ((key === 'generationId' || key === 'generation_id' || key === 'id') && typeof nested === 'string' && nested.startsWith('gen_')) {
+            for (const [key, nested] of Object.entries(value as Record<string, unknown>).slice(0, 100)) {
+                if ((key === 'generationId' || key === 'generation_id' || key === 'id') && validId(nested)) {
                     return nested
                 }
-                const found = visit(nested)
+                const found = visit(nested, depth + 1)
                 if (found) return found
             }
             return undefined
         }
-        return visit(providerMetadata)
+        return visit(metadata)
     }
 
     function priceTokenCount(count: number | undefined, perTokenUsd: string | undefined): number {
@@ -540,24 +547,24 @@ export async function useGateway(imageStorage?: Pick<Awaited<ReturnType<typeof u
             priceTokenCount(uncachedInputTokens, pricing.input) +
             priceTokenCount(cached, pricing.cachedInputTokens ?? pricing.input) +
             priceTokenCount(usage.outputTokens, pricing.output)
-        return total > 0 ? total.toFixed(8) : undefined
+        return total > 0 ? total.toFixed(12) : undefined
     }
 
     function estimateImageMeteredPriceUsd(info: GatewayModelInfo | undefined, outputImages = 1): string | undefined {
         const component = info?.pricingDetails?.components.find(c => c.kind === 'fixed-image' && c.amountUsd != null)
         if (!component?.amountUsd) return undefined
-        return (component.amountUsd * Math.max(1, outputImages)).toFixed(8)
+        return (component.amountUsd * Math.max(1, outputImages)).toFixed(12)
     }
 
     async function getActualGatewayBilling(generationId: string | undefined) {
-        if (!generationId || typeof (gateway as any).getGenerationInfo !== 'function') return undefined
+        if (!generationId || !/^gen_[A-Za-z0-9_-]{1,120}$/.test(generationId)) return undefined
         try {
             const lookup = gatewayMetadataPool.start(
                 `generation:${generationId}`,
-                () => (gateway as any).getGenerationInfo({id: generationId}) as Promise<any>,
+                () => gateway.getGenerationInfo({id: generationId}),
             )
             if (!lookup) return undefined
-            return await settleWithinMs<any>(
+            return await settleWithinMs(
                 lookup,
                 GATEWAY_METADATA_TIMEOUT_MS,
                 'Gateway billing lookup',
@@ -572,6 +579,7 @@ export async function useGateway(imageStorage?: Pick<Awaited<ReturnType<typeof u
     async function getGenerationBilling(generationId: string | undefined, fallbackModel?: string): Promise<ImageGenerationBilling | undefined> {
         const gatewayBilling = await getActualGatewayBilling(generationId)
         if (!gatewayBilling) return undefined
+        const priceUsd = generationId ? extractConfirmedGatewayPrice(gatewayBilling, generationId) : undefined
         const inputTokens = asNumber(gatewayBilling.promptTokens)
         const outputTokens = asNumber(gatewayBilling.completionTokens)
         return {
@@ -581,12 +589,12 @@ export async function useGateway(imageStorage?: Pick<Awaited<ReturnType<typeof u
             cachedInputTokens: asNumber(gatewayBilling.cachedTokens),
             reasoningTokens: asNumber(gatewayBilling.reasoningTokens),
             totalTokens: resolveGenerationTotalTokens(
-                asNumber(gatewayBilling.totalTokens ?? gatewayBilling.total_tokens),
+                undefined,
                 inputTokens,
                 outputTokens,
             ),
-            priceUsd: asNumber(gatewayBilling.totalCost)?.toFixed(8),
-            priceSource: 'gateway',
+            priceUsd,
+            priceSource: priceUsd !== undefined ? 'gateway' : 'unknown',
             gatewayGenerationId: generationId,
             usageJson: {gatewayBilling: sanitizeProviderMetadata(gatewayBilling)},
         }
@@ -615,7 +623,7 @@ export async function useGateway(imageStorage?: Pick<Awaited<ReturnType<typeof u
         const cachedInputTokens = asNumber(gatewayBilling?.cachedTokens) ?? usage.cachedInputTokens
         const reasoningTokens = asNumber(gatewayBilling?.reasoningTokens) ?? usage.reasoningTokens
         const totalTokens = resolveGenerationTotalTokens(
-            asNumber(gatewayBilling?.totalTokens ?? gatewayBilling?.total_tokens) ?? usage.totalTokens,
+            gatewayBilling ? undefined : usage.totalTokens,
             inputTokens,
             outputTokens,
         )
@@ -627,7 +635,7 @@ export async function useGateway(imageStorage?: Pick<Awaited<ReturnType<typeof u
             reasoningTokens,
         }, enrichedInfo?.pricing)
         const imageMeteredEstimate = estimateImageMeteredPriceUsd(enrichedInfo, outputImages)
-        const gatewayPrice = asNumber(gatewayBilling?.totalCost)?.toFixed(8)
+        const gatewayPrice = generationId ? extractConfirmedGatewayPrice(gatewayBilling, generationId) : undefined
 
         return {
             model: typeof gatewayBilling?.model === 'string' ? gatewayBilling.model : modelId,
@@ -637,7 +645,7 @@ export async function useGateway(imageStorage?: Pick<Awaited<ReturnType<typeof u
             cachedInputTokens,
             reasoningTokens,
             priceUsd: gatewayPrice ?? estimatedPrice ?? imageMeteredEstimate,
-            priceSource: gatewayPrice ? 'gateway' : (estimatedPrice || imageMeteredEstimate ? 'estimate' : 'unknown'),
+            priceSource: gatewayPrice !== undefined ? 'gateway' : (estimatedPrice || imageMeteredEstimate ? 'estimate' : 'unknown'),
             gatewayGenerationId: generationId,
             usageJson: {
                 usage,
@@ -716,8 +724,11 @@ export async function useGateway(imageStorage?: Pick<Awaited<ReturnType<typeof u
         return parsed.data
     }
 
-    function throwGatewayError(prefix: string, error: unknown): never {
+    function throwGatewayError(prefix: string, error: unknown, billing?: ImageGenerationBilling): never {
         const errorData = serializeGatewayError(error)
+        const generationId = extractGatewayErrorGenerationId(error)
+        billing ??= generationId ? {gatewayGenerationId: generationId, priceSource: 'unknown'} : undefined
+        if (billing) errorData.details = {provider: errorData.details, billing}
         const upstreamStatus = errorData.statusCode
         throw createError({
             statusCode: upstreamStatus != null && upstreamStatus >= 400 && upstreamStatus <= 599
@@ -729,13 +740,18 @@ export async function useGateway(imageStorage?: Pick<Awaited<ReturnType<typeof u
     }
 
     function throwGatewayTimeout(prefix: string, timeoutMs: number, error: unknown): never {
+        const generationId = extractGatewayErrorGenerationId(error)
         const errorData: StoredGenerationError = {
             name: 'ProviderCallTimeoutError',
             message: `${prefix} timed out after ${timeoutMs} ms.`,
             statusCode: 504,
             code: 'PROVIDER_CALL_TIMEOUT',
             retryable: true,
-            details: redactSerializable({timeoutMs, cause: error}),
+            details: {
+                timeoutMs,
+                cause: redactSerializable(error),
+                ...(generationId ? {billing: {gatewayGenerationId: generationId, priceSource: 'unknown'}} : {}),
+            },
         }
         throw createError({
             statusCode: 504,
@@ -744,7 +760,7 @@ export async function useGateway(imageStorage?: Pick<Awaited<ReturnType<typeof u
         })
     }
 
-    function noImageError(model: string, finishReason: unknown, responseText?: string): never {
+    function noImageError(model: string, finishReason: unknown, responseText?: string, billing?: ImageGenerationBilling): never {
         const reason = typeof finishReason === 'string' && finishReason.length > 0
             ? finishReason
             : 'unknown'
@@ -757,6 +773,7 @@ export async function useGateway(imageStorage?: Pick<Awaited<ReturnType<typeof u
             details: {
                 finishReason: reason,
                 ...(responseText ? {responseText: redactString(responseText)} : {}),
+                ...(billing ? {billing} : {}),
             },
         }
         throw createError({
@@ -804,7 +821,7 @@ export async function useGateway(imageStorage?: Pick<Awaited<ReturnType<typeof u
      * Gemini image models are multimodal language models. Their exact profile,
      * not a Gateway catalog heuristic, determines this generateText path.
      */
-    async function generateImageViaLanguageModel(opts: ImageGenerationRequest, requestAbortSignal?: AbortSignal): Promise<GeneratedImage[]> {
+    async function generateImageViaLanguageModel(opts: ImageGenerationRequest, requestAbortSignal?: AbortSignal, onProviderStart?: ProviderCallStarted): Promise<GeneratedImage[]> {
         const request = validateGenerationRequest(opts)
         if (!isGeminiImageSettings(request.settings)) {
             validationError([{
@@ -889,6 +906,7 @@ export async function useGateway(imageStorage?: Pick<Awaited<ReturnType<typeof u
         })
         let response: Awaited<ReturnType<typeof callGateway>>
         try {
+            onProviderStart?.()
             response = await callGateway()
         } catch (error) {
             if (requestAbortSignal?.aborted) throw requestAbortSignal.reason
@@ -899,14 +917,13 @@ export async function useGateway(imageStorage?: Pick<Awaited<ReturnType<typeof u
         }
 
         const images = response.files.filter(file => file.mediaType?.startsWith('image/'))
-        if (images.length === 0) noImageError(request.model, response.finishReason, response.text)
-
         const billing = await buildBilling(
             response.response?.modelId || request.model,
             response.totalUsage,
             response.providerMetadata,
-            images.length,
+            Math.max(1, images.length),
         )
+        if (images.length === 0) noImageError(request.model, response.finishReason, response.text, billing)
         const warnings = mergeWarnings(profile.warnings, formatWarnings(response.warnings))
         const responseText = settings.includeText && response.text.length > 0
             ? response.text
@@ -934,7 +951,7 @@ export async function useGateway(imageStorage?: Pick<Awaited<ReturnType<typeof u
      * Native image models use the Gateway image adapter. Only options validated
      * against the selected model settings schema are forwarded.
      */
-    async function generateImageViaImageModel(opts: ImageGenerationRequest, requestAbortSignal?: AbortSignal): Promise<GeneratedImage[]> {
+    async function generateImageViaImageModel(opts: ImageGenerationRequest, requestAbortSignal?: AbortSignal, onProviderStart?: ProviderCallStarted): Promise<GeneratedImage[]> {
         const request = validateGenerationRequest(opts)
         if (isGeminiImageSettings(request.settings)) {
             validationError([{
@@ -986,10 +1003,26 @@ export async function useGateway(imageStorage?: Pick<Awaited<ReturnType<typeof u
             : AbortSignal.timeout(timeoutMs)
         abortSignal.throwIfAborted()
 
+        const nativeModel = gateway.imageModel(request.model)
+        let observedResponse: Awaited<ReturnType<typeof nativeModel.doGenerate>> | undefined
+        const trackedModel: typeof nativeModel = {
+            specificationVersion: nativeModel.specificationVersion,
+            provider: nativeModel.provider,
+            modelId: nativeModel.modelId,
+            maxImagesPerCall: nativeModel.maxImagesPerCall,
+            doGenerate: async options => {
+                const result = await nativeModel.doGenerate(options)
+                // Retain billing metadata even if AI SDK rejects an empty or
+                // malformed image response after a billable provider call.
+                observedResponse = result
+                return result
+            },
+        }
         let response: Awaited<ReturnType<typeof aiGenerateImage>>
         try {
+            onProviderStart?.()
             response = await aiGenerateImage({
-                model: gateway.imageModel(request.model),
+                model: trackedModel,
                 maxRetries: 0,
                 prompt,
                 n: settings.numberOfImages,
@@ -1001,7 +1034,13 @@ export async function useGateway(imageStorage?: Pick<Awaited<ReturnType<typeof u
             if (abortSignal.aborted || isTimeoutLikeError(error)) {
                 throwGatewayTimeout('Gateway image request', timeoutMs, error)
             }
-            throwGatewayError('Gateway image request failed', error)
+            const billing = observedResponse
+                ? await buildBilling(request.model, observedResponse.usage, observedResponse.providerMetadata, settings.numberOfImages)
+                : undefined
+            if (observedResponse && observedResponse.images.length === 0) {
+                noImageError(request.model, 'no image files', undefined, billing)
+            }
+            throwGatewayError('Gateway image request failed', error, billing)
         }
 
         if (response.images.length === 0) noImageError(request.model, 'no image files')
@@ -1023,13 +1062,13 @@ export async function useGateway(imageStorage?: Pick<Awaited<ReturnType<typeof u
         }))
     }
 
-    async function generateAnyImage(opts: ImageGenerationRequest, requestAbortSignal?: AbortSignal): Promise<GeneratedImage[]> {
+    async function generateAnyImage(opts: ImageGenerationRequest, requestAbortSignal?: AbortSignal, onProviderStart?: ProviderCallStarted): Promise<GeneratedImage[]> {
         requestAbortSignal?.throwIfAborted()
         const request = validateGenerationRequest(opts)
         const profile = IMAGE_MODEL_PROFILES[request.model]
         return profile.adapter === 'gateway-language-image'
-            ? generateImageViaLanguageModel(request, requestAbortSignal)
-            : generateImageViaImageModel(request, requestAbortSignal)
+            ? generateImageViaLanguageModel(request, requestAbortSignal, onProviderStart)
+            : generateImageViaImageModel(request, requestAbortSignal, onProviderStart)
     }
 
     return {

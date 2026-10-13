@@ -5,6 +5,9 @@ import { buildComposerRequest, composerSources, imageName, type GenerationCompos
 import { isNewImageModel, orderImageModels } from '../../schemas/image-model-discovery'
 import { useImageModelFavourites } from '../composables/useImageModelFavourites'
 import { watchImageModelSelection } from '../utils/watchImageModelSelection'
+import {hasConfirmedGenerationPrice} from '~~/schemas/generation-billing'
+import {formatBalanceUsd, formatUsd, generationPriceLabel, type GenerationPrice} from '../utils/generationPrice'
+import {parseUsdUnits} from '~~/schemas/account-billing'
 import {
   IMAGE_MODEL_PROFILES,
   generationOutputCount,
@@ -26,6 +29,7 @@ import CatalogImageSettings from './generation-settings/CatalogImageSettings.vue
 const props = withDefaults(defineProps<{ mode?: GenerationComposerMode }>(), { mode: 'batch' })
 const data = useDataStore()
 const account = useAccount()
+const accountBalance = useAccountBalance()
 function accountSnapshot() { return {epoch: account.epoch.value, identity: account.identity.value} }
 function isCurrentAccount(snapshot: ReturnType<typeof accountSnapshot>) {
   return snapshot.epoch === account.epoch.value && snapshot.identity === account.identity.value
@@ -300,9 +304,8 @@ function formatLogTime(value?: string) {
 }
 
 function formatLogPrice(value?: string | null, source?: string | null) {
-  const price = value ? Number(value) : NaN
-  if (!Number.isFinite(price)) return source === 'unknown' ? 'Unknown' : ''
-  const amount = price < 0.01 ? `$${price.toFixed(6)}` : `$${price.toFixed(4)}`
+  const amount = formatUsd(value)
+  if (!amount) return source === 'unknown' ? 'Unknown' : ''
   return source ? `${amount} (${source})` : amount
 }
 
@@ -349,7 +352,13 @@ const dragging = ref(false)
 const pickerOpen = ref(false)
 const pickerKind = ref<'source' | 'references' | 'mask'>('source')
 const pickerSelection = ref<string[]>([])
-const previewOutput = ref<string | null>(null)
+type GenerationResult = GenerationPrice & {id?: number; outputImage?: string | null; outputImageDeletedAt?: string | null; errors?: string | null; status?: string | null}
+const previewResult = ref<GenerationResult | null>(null)
+const previewOutput = computed(() => previewResult.value && hasConfirmedGenerationPrice(previewResult.value)
+  && !previewResult.value.outputImageDeletedAt ? previewResult.value.outputImage || null : null)
+const previewPricePending = computed(() => previewResult.value && !hasConfirmedGenerationPrice(previewResult.value)
+  && !previewResult.value.errors && previewResult.value.status === 'succeeded')
+const previewPrice = computed(() => previewResult.value ? generationPriceLabel(previewResult.value) : '')
 const sourceUnavailable = ref(false)
 const previewImage = computed(() => previewOutput.value || data.editSource)
 const zoom = ref(1)
@@ -358,11 +367,43 @@ const additionalHistory = ref<NonNullable<typeof pastPrompts.data.value>['items'
 const displayedHistory = computed(() => [...(pastPrompts.data.value?.items || []), ...additionalHistory.value])
 watch(() => pastPrompts.data.value, () => { additionalHistory.value = [] })
 const recentImages = computed(() => displayedHistory.value
-  .filter(item => !!item.outputImage && !item.outputImageDeletedAt)
+  .filter(item => !!item.outputImage && !item.outputImageDeletedAt && hasConfirmedGenerationPrice(item))
   .slice(0, 12))
+watch(displayedHistory, rows => {
+  if (!previewResult.value?.id) return
+  const updated = rows.find(row => row.id === previewResult.value?.id)
+  if (updated) previewResult.value = updated
+})
 const historyOpen = ref(false)
 const loadingHistory = ref(false)
 const showMoreHistory = computed(() => displayedHistory.value.length < (pastPrompts.data.value?.count || 0))
+let billingPollTimer: ReturnType<typeof setTimeout> | undefined
+let billingPollRunning = false
+let billingPollAttempts = 0
+let billingPollingMounted = false
+const awaitingPrices = computed(() => displayedHistory.value.some(row => row.status === 'succeeded' && !row.outputImageDeletedAt && !hasConfirmedGenerationPrice(row)))
+function scheduleBillingPoll() {
+  if (!billingPollingMounted || billingPollTimer || billingPollRunning || !awaitingPrices.value || billingPollAttempts >= 30) return
+  const snapshot = accountSnapshot()
+  billingPollTimer = setTimeout(async () => {
+    billingPollTimer = undefined
+    if (!isCurrentAccount(snapshot) || !billingPollingMounted) return
+    if (document.visibilityState !== 'visible') { scheduleBillingPoll(); return }
+    billingPollRunning = true
+    billingPollAttempts += 1
+    try { await pastPrompts.refresh() }
+    catch { /* The history retry and row price controls remain available. */ }
+    finally { billingPollRunning = false; if (isCurrentAccount(snapshot)) scheduleBillingPoll() }
+  }, 10_000)
+}
+watch(awaitingPrices, awaiting => { scheduleBillingPoll(); if (!awaiting) void accountBalance.refresh() })
+async function refreshHistoryPrices() {
+  const snapshot = accountSnapshot()
+  billingPollAttempts = 0
+  try { await pastPrompts.refresh() }
+  finally { if (isCurrentAccount(snapshot)) { scheduleBillingPoll(); void accountBalance.refresh() } }
+}
+onMounted(() => { billingPollingMounted = true; scheduleBillingPoll() })
 
 watch(account.epoch, () => {
   errorMsg.value = null
@@ -375,11 +416,14 @@ watch(account.epoch, () => {
   dragging.value = false
   pickerOpen.value = false
   pickerSelection.value = []
-  previewOutput.value = null
+  previewResult.value = null
+  billingPollAttempts = 0
+  if (billingPollTimer) clearTimeout(billingPollTimer)
+  billingPollTimer = undefined
 }, {flush: 'sync'})
 
 watch(() => data.editSource, () => {
-  previewOutput.value = null
+  previewResult.value = null
   zoom.value = 1
   imageDimensions.value = ''
   sourceUnavailable.value = false
@@ -497,11 +541,18 @@ async function loadMoreHistory() {
   finally { if (isCurrentAccount(snapshot)) loadingHistory.value = false }
 }
 
+const creditBlockReason = computed(() => {
+  const balance = accountBalance.balance.value
+  if (!balance || balance.unlimited) return ''
+  if (!balance.actualBalanceUsd || balance.actualBalanceUsd.startsWith('-') || parseUsdUnits(balance.actualBalanceUsd) === 0n) return 'Your credit is used up. Ask an organization owner to add credit before generating another image.'
+  if (balance.generationBlockedByOutstanding ?? (balance.outstandingCount > 0)) return 'Your previous generation prices are still being confirmed. They must settle before another generation can use your credit.'
+  return ''
+})
 const canSubmit = computed(() => hasSources.value && !!prompt.value.trim()
   && !referenceOverflow.value && !missingRequiredMask.value && !maskWithoutReference.value
   && !maskFileNotPng.value && !maskSourceNotPng.value && selectedModelAvailable.value
   && estimatedOutputCount.value <= 50 && !sourceUnavailable.value
-  && !activeGenerationCount.value && !uploading.value)
+  && !activeGenerationCount.value && !uploading.value && !creditBlockReason.value)
 
 function elapsedLabel(startedAt: number) {
   const totalSeconds = Math.max(0, Math.floor((pendingTick.value - startedAt) / 1000))
@@ -520,10 +571,13 @@ function clearFailedJobs() {
 
 onBeforeUnmount(() => {
   if (pendingTimerId) clearInterval(pendingTimerId)
+  billingPollingMounted = false
+  if (billingPollTimer) clearTimeout(billingPollTimer)
 })
 
 async function submit() {
   if (activeGenerationCount.value) return
+  if (creditBlockReason.value) { errorMsg.value = creditBlockReason.value; return }
   if (!selectedModelAvailable.value) {
     errorMsg.value = selectedModelInfo.value?.availabilityNote || 'This model is not currently available through AI Gateway.'
     return
@@ -546,6 +600,7 @@ async function submit() {
   }
 
   errorMsg.value = null
+  billingPollAttempts = 0
   const snapshot = accountSnapshot()
   const jobs = requestBody.inputImages.map((source, index): PendingGeneration => ({
     id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${index}`,
@@ -565,17 +620,17 @@ async function submit() {
   }
   let serverCreatedRows = false
   try {
-    const response = await $fetch<{ ok: boolean; obj?: Array<{ outputImage?: string | null; errors?: string | null }> }>('/api/image-generate', {
+    const response = await $fetch<{ ok: boolean; obj?: GenerationResult[] }>('/api/image-generate', {
       method: 'POST', body: requestBody,
     })
     if (!isCurrentAccount(snapshot)) return
     serverCreatedRows = true
     const failures = response.obj?.filter(row => !!row.errors) || []
     if (failures.length) errorMsg.value = `${failures.length} output${failures.length === 1 ? '' : 's'} failed. ${failures[0]?.errors || ''}`
-    const firstOutput = response.obj?.find(row => !!row.outputImage && !row.errors)?.outputImage
+    const firstResult = response.obj?.find(row => !row.errors && (row.status === 'succeeded' || !!row.outputImage))
     // A changed source must not be replaced by an older in-flight request.
-    if (isEdit.value && firstOutput && data.editSource === requestBody.inputImages[0]) {
-      previewOutput.value = firstOutput
+    if (isEdit.value && firstResult && data.editSource === requestBody.inputImages[0]) {
+      previewResult.value = firstResult
       zoom.value = 1
     }
     historyOpen.value = true
@@ -591,6 +646,8 @@ async function submit() {
     if (isCurrentAccount(snapshot)) {
       if (serverCreatedRows) for (const job of jobs) removePendingJob(job.id)
       await pastPrompts.refresh()
+      if (isCurrentAccount(snapshot)) scheduleBillingPoll()
+      if (isCurrentAccount(snapshot)) await accountBalance.refresh()
       if (isCurrentAccount(snapshot) && debugLogsOpen.value) await gatewayLogs.refresh()
     }
   }
@@ -634,13 +691,14 @@ async function submit() {
             <div class="studio-recent-grid">
               <button v-for="item in recentImages" :key="item.id" type="button" :aria-label="`Edit result: ${item.TextPrompt}`" :title="item.TextPrompt" @click="chooseSource(item.outputImage!)">
                 <img :src="sourceUrl(item.outputImage!)" alt="Recent generated image" loading="lazy">
+                <span class="studio-recent-price">{{ generationPriceLabel(item) }}</span>
               </button>
             </div>
           </div>
         </div>
         <template v-else-if="isEdit">
           <div class="studio-canvas-toolbar">
-            <div class="studio-source-title"><UIcon name="i-lucide-image" class="size-4" /><span>{{ imageName(data.editSource!) }}</span><span v-if="previewOutput" class="studio-result-label">Result</span></div>
+            <div class="studio-source-title"><UIcon name="i-lucide-image" class="size-4" /><span>{{ imageName(data.editSource!) }}</span><span v-if="previewOutput" class="studio-result-label">Result · {{ previewPrice }}</span></div>
             <div class="studio-toolbar-actions">
               <UButton v-if="previewOutput" color="neutral" variant="ghost" size="sm" @click="data.editSource = previewOutput">Use as input</UButton>
               <UButton color="neutral" variant="ghost" size="sm" icon="i-lucide-folder" @click="openPicker('source')">Replace</UButton>
@@ -661,7 +719,8 @@ async function submit() {
               <button type="button" aria-label="Zoom in" :disabled="zoom >= 2" @click="adjustZoom(0.25)"><UIcon name="i-lucide-plus" class="size-4" /></button>
               <button type="button" @click="zoom = 1">Fit</button>
             </div>
-            <button v-if="previewOutput" type="button" class="studio-text-button" @click="previewOutput = null">View original</button>
+            <span v-if="previewPricePending" role="status" class="studio-price-status"><UIcon name="i-lucide-receipt-text" class="size-4" />Image ready · confirming price. Your result will appear once its final cost is confirmed.</span>
+            <button v-if="previewResult" type="button" class="studio-text-button" @click="previewResult = null">View original</button>
             <button v-else type="button" class="studio-text-button" @click="clearInputImages">Close image</button>
           </div>
         </template>
@@ -738,6 +797,9 @@ async function submit() {
           <UTextarea id="edit-prompt" v-model="prompt" class="w-full" :rows="4" placeholder="Describe the changes you want to make…" autoresize />
           <p v-if="!isEdit" class="studio-help">One prompt for all {{ sourceImages.length }} input images · {{ estimatedOutputCount }} expected output{{ estimatedOutputCount === 1 ? '' : 's' }}.</p>
           <UButton class="studio-generate-button" icon="i-lucide-sparkles" :loading="!!activeGenerationCount" :disabled="!canSubmit" @click="submit">{{ activeGenerationCount ? 'Generating…' : isEdit ? 'Generate' : 'Run batch' }}</UButton>
+          <p class="studio-generation-price">{{ selectedCostEstimate }}</p>
+          <p v-if="accountBalance.balance.value" class="studio-generation-credit">Available credit: {{ accountBalance.balance.value.unlimited ? 'Unlimited' : formatBalanceUsd(accountBalance.balance.value.actualBalanceUsd) }}</p>
+          <p v-if="creditBlockReason" class="studio-validation" role="status">{{ creditBlockReason }}</p>
           <div class="studio-submit-preferences"><UCheckbox v-model="keepSubmitInputs" label="Keep prompt and images" /></div>
         </div>
       </aside>
@@ -750,6 +812,7 @@ async function submit() {
     <details class="studio-history" :open="historyOpen" @toggle="historyOpen = ($event.target as HTMLDetailsElement).open">
       <summary><span>Generation history <span v-if="pastPrompts.data.value?.count" class="studio-history-count">{{ pastPrompts.data.value.count }}</span></span><UIcon name="i-lucide-chevron-down" class="size-4" /></summary>
       <div v-if="historyOpen" class="studio-history-content">
+        <p v-if="awaitingPrices" class="studio-billing-note" role="status">Some images are ready and awaiting final prices. <button type="button" @click="refreshHistoryPrices">Check prices</button></p>
         <p v-if="pastPrompts.status.value === 'pending'" class="studio-help" role="status">Loading history…</p>
         <p v-else-if="pastPrompts.error.value" class="studio-validation">Could not load generation history. <button type="button" @click="pastPrompts.refresh()">Try again</button></p>
         <div v-else-if="displayedHistory.length" class="studio-history-grid"><system-promp v-for="item in displayedHistory" :key="item.id" :data="item" /></div>
@@ -767,6 +830,8 @@ async function submit() {
 </template>
 
 <style scoped>
+.studio-generation-price{font-size:10px;line-height:1.7;color:#e3c19a;margin-top:12px}.studio-generation-credit{font-size:10px;color:var(--workspace-muted);margin-top:8px}
+.studio-billing-note{font-size:11px;line-height:1.7;color:#edc9a6;margin-bottom:18px}.studio-billing-note button{text-decoration:underline;margin-left:8px}
 .generation-studio { color: var(--workspace-text); }
 .studio-route-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; min-height: 76px; padding: 18px 32px; border-bottom: 1px solid var(--workspace-border); background: var(--workspace-bg); }
 .studio-route-header h1 { display: flex; align-items: center; gap: 9px; font-size: 20px; letter-spacing: -.4px; font-weight: 550; }
@@ -791,7 +856,9 @@ async function submit() {
 .studio-recent { padding: 17px 3px 0; grid-column: 1 / -1; max-width: 640px; }
 .studio-recent > span { display: block; font-size: 12px; color: var(--workspace-muted); margin-bottom: 9px; }
 .studio-recent-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 9px; }
-.studio-recent-grid button { border: 1px solid var(--workspace-border); border-radius: 8px; overflow: hidden; aspect-ratio: 1; background: var(--workspace-surface); cursor: pointer; }
+.studio-recent-grid button { position: relative; border: 1px solid var(--workspace-border); border-radius: 8px; overflow: hidden; aspect-ratio: 1; background: var(--workspace-surface); cursor: pointer; }
+.studio-recent-price { position: absolute; bottom: 0; left: 0; right: 0; font-size: 8px; line-height: 1.4; padding: 4px; color: #f8eddc; background: #211a13de; }
+.studio-price-status { display: flex; align-items: center; gap: 8px; color: #edc9a6; font-size: 11px; max-width: 470px; line-height: 1.6; }
 .studio-recent-grid img { width: 100%; height: 100%; object-fit: cover; }
 .studio-recent-grid button:hover { border-color: var(--workspace-accent); }
 .studio-canvas-toolbar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; padding: 15px 22px; border-bottom: 1px solid var(--workspace-border); min-height: 65px; }

@@ -2,7 +2,8 @@ import {createHash, randomUUID} from 'node:crypto'
 import {createError} from 'h3'
 import {and, asc, eq, gt, inArray, isNull, ne, sql} from 'drizzle-orm'
 import {alias} from 'drizzle-orm/pg-core'
-import {assets, assetShares, users} from '../db/schema'
+import {assets, assetShares, users, systemPrompt} from '../db/schema'
+import {confirmedGenerationPriceCondition} from './generationVisibility'
 import {getDatabase} from './lib/db'
 import {imagePathToUrl, parseImagePath, validateImagePathSegment} from './imageStoragePaths'
 import type {AssetFile, AssetFolder, AssetPermissions, AssetSource} from '../../schemas/image-storage'
@@ -43,6 +44,25 @@ export function encodeAssetCursor(after: string, scope: string) { return Buffer.
 export function createAssetRepository(actor: AssetActor, db: Database = getDatabase()) {
     const parent = alias(assets, 'parent_asset')
     const sourceCache = new Map<string, Promise<AssetSource>>([[actor.userId, Promise.resolve({userId: actor.userId, username: actor.username, displayName: actor.displayName})]])
+    const priceCache = new Map<string, {priceUsd: string | null; priceSource: string | null; billingState: 'pending' | 'awaiting' | 'confirmed' | 'released' | null}>()
+    function outputMatch(row?: AssetRecord) {
+        return and(eq(systemPrompt.organizationId, row?.organizationId ?? assets.organizationId),
+            eq(systemPrompt.userId, row?.ownerUserId ?? assets.ownerUserId), eq(systemPrompt.outputImage, row?.url ?? assets.url))
+    }
+    function visibleOutput(row?: AssetRecord) {
+        return and(outputMatch(row), confirmedGenerationPriceCondition(), isNull(systemPrompt.outputImageDeletedAt),
+            sql`(${systemPrompt.status} = 'succeeded' OR (${systemPrompt.status} IS NULL AND ${systemPrompt.errors} IS NULL))`)
+    }
+    async function confirmedOutput(row: AssetRecord) {
+        if (row.kind !== 'file' || row.category !== 'generated') return undefined
+        const cached = priceCache.get(row.url)
+        if (cached) return cached
+        const [price] = await db.select({priceUsd: systemPrompt.priceUsd, priceSource: systemPrompt.priceSource,
+            billingState: systemPrompt.billingState}).from(systemPrompt).where(visibleOutput(row)).limit(1)
+        if (!price) throw createError({statusCode: 425, statusMessage: 'Image ready; waiting for its final price to be confirmed'})
+        priceCache.set(row.url, price)
+        return price
+    }
     async function byId(id: string) {
         const [row] = await db.select().from(assets).where(and(eq(assets.id, validAssetId(id)), eq(assets.organizationId, actor.organizationId), isNull(assets.deletedAt))).limit(1)
         return row
@@ -99,7 +119,11 @@ export function createAssetRepository(actor: AssetActor, db: Database = getDatab
     async function requireAsset(idOrUrl: string, intent: 'view' | 'edit' | 'share' = 'view') {
         const row = idOrUrl.startsWith('/images/') ? await byUrl(idOrUrl) : await byId(idOrUrl)
         if (!row) assetNotFound()
-        return {row, ...await access(row, intent)}
+        const grant = await access(row, intent)
+        // Authorize before applying the price gate, and before any S3 read.
+        // Exact owner cleanup remains possible for an unlinked output.
+        if (intent !== 'edit') await confirmedOutput(row)
+        return {row, ...grant}
     }
     function logicalPath(row: AssetRecord) {
         const parts = parseImagePath(row.url)
@@ -112,7 +136,9 @@ export function createAssetRepository(actor: AssetActor, db: Database = getDatab
         const owner = await source(row.ownerUserId)
         const path = logicalPath(row)
         const containingFolder = row.parentId ? await byId(row.parentId) : undefined
+        const price = await confirmedOutput(row)
         return {id: row.id, kind: row.kind, name: row.name, url: row.url,
+            category: row.category, ...(price ?? {}),
             folder: row.kind === 'folder' ? path : containingFolder ? logicalPath(containingFolder) : '/',
             ownerUserId: row.ownerUserId, permissions: grant.permissions, source: owner,
             ...(grant.sharedBy ? {sharedBy: grant.sharedBy} : {}),
@@ -155,6 +181,11 @@ export function createAssetRepository(actor: AssetActor, db: Database = getDatab
         const cursorScope = assetCursorScope(actor, [scope, folder?.row.id ?? null, options.sourceUserId ?? null, query, options.direct ?? false])
         const after = decodeAssetCursor(options.cursor, cursorScope)
         const conditions = [eq(assets.organizationId, actor.organizationId), isNull(assets.deletedAt)]
+        // Visibility must filter before LIMIT so held outputs cannot consume
+        // a page or leak through a shared folder or favorites resolution.
+        conditions.push(sql`(${assets.kind} <> 'file' OR ${assets.category} <> 'generated' OR EXISTS (
+            SELECT 1 FROM ${systemPrompt} WHERE ${visibleOutput()}
+        ))`)
         if (after) conditions.push(gt(assets.id, after))
         if (query) {
             const escaped = query.replace(/[\\%_]/g, '\\$&')
@@ -182,6 +213,16 @@ export function createAssetRepository(actor: AssetActor, db: Database = getDatab
         }
         const next = rows.length > limit ? encodeAssetCursor(rows[limit - 1]!.id, cursorScope) : undefined
         rows = rows.slice(0, limit)
+        const outputs = rows.filter(row => row.kind === 'file' && row.category === 'generated')
+        if (outputs.length) {
+            const prices = await db.select({url: systemPrompt.outputImage, ownerUserId: systemPrompt.userId,
+                priceUsd: systemPrompt.priceUsd, priceSource: systemPrompt.priceSource, billingState: systemPrompt.billingState})
+                .from(systemPrompt).where(and(eq(systemPrompt.organizationId, actor.organizationId),
+                    inArray(systemPrompt.outputImage, outputs.map(row => row.url)), confirmedGenerationPriceCondition(),
+                    isNull(systemPrompt.outputImageDeletedAt),
+                    sql`(${systemPrompt.status} = 'succeeded' OR (${systemPrompt.status} IS NULL AND ${systemPrompt.errors} IS NULL))`))
+            for (const price of prices) if (outputs.some(row => row.url === price.url && row.ownerUserId === price.ownerUserId)) priceCache.set(price.url, price)
+        }
         const mapped = await Promise.all(rows.map(row => dto(row)))
         const files = mapped.filter(file => file.kind === 'file')
         const dirs: AssetFolder[] = mapped.filter(file => file.kind === 'folder').map(file => ({...file, path: logicalPath(rows.find(row => row.id === file.id)!)}))

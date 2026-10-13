@@ -1,4 +1,4 @@
-import {pgTable, serial, integer, text, jsonb, timestamp, uuid, index, uniqueIndex, boolean, bigint, check, type AnyPgColumn} from "drizzle-orm/pg-core";
+import {pgTable, serial, integer, text, jsonb, timestamp, uuid, index, uniqueIndex, boolean, bigint, numeric, check, type AnyPgColumn} from "drizzle-orm/pg-core";
 import {sql} from "drizzle-orm";
 import type {
     OutputMetadata,
@@ -24,6 +24,7 @@ export const users = pgTable('app_user', {
     isBootstrapOwner: boolean('is_bootstrap_owner').default(false).notNull(),
     disabledAt: timestamp('disabled_at', {mode: 'string', withTimezone: true}),
     authVersion: integer('auth_version').default(1).notNull(),
+    creditBalanceUnits: numeric('credit_balance_units', {precision: 30, scale: 0}),
     createdAt: timestamp('created_at', {mode: 'string', withTimezone: true}).defaultNow().notNull(),
     updatedAt: timestamp('updated_at', {mode: 'string', withTimezone: true}).defaultNow().notNull(),
 }, table => [
@@ -102,6 +103,7 @@ export const systemPrompt = pgTable("systemPrompt", {
     reasoningTokens: integer("reasoningTokens"),
     priceUsd: text("priceUsd"),
     priceSource: text("priceSource"),
+    billingState: text('billingState').$type<'pending' | 'awaiting' | 'confirmed' | 'released'>(),
     gatewayGenerationId: text("gatewayGenerationId"),
     usageJson: jsonb("usageJson").$type<Record<string, unknown>>(),
     createdAt: timestamp("createdAt", {mode: "string", withTimezone: true}).defaultNow().notNull(),
@@ -158,6 +160,41 @@ export const aiGatewayLog = pgTable("aiGatewayLog", {
 ]);
 
 export type SystemPrompt = typeof systemPrompt.$inferSelect;
+
+// One charge per durable output row, including failed outputs that incurred a
+// provider charge. Repeated Gateway reconciliation cannot post it twice.
+export const accountGenerationCharges = pgTable('account_generation_charge', {
+    generationId: integer('generation_id').primaryKey().references(() => systemPrompt.id),
+    organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+    userId: uuid('user_id').notNull().references(() => users.id),
+    state: text('state').$type<'outstanding' | 'confirmed' | 'released'>().notNull().default('outstanding'),
+    estimatedUnits: numeric('estimated_units', {precision: 30, scale: 0}),
+    confirmedUnits: numeric('confirmed_units', {precision: 30, scale: 0}),
+    gatewayGenerationId: text('gateway_generation_id'),
+    confirmedAt: timestamp('confirmed_at', {mode: 'string', withTimezone: true}),
+    nextCheckAt: timestamp('next_check_at', {mode: 'string', withTimezone: true}).defaultNow().notNull(),
+    checkAttempts: integer('check_attempts').default(0).notNull(),
+    claimToken: uuid('claim_token'),
+    claimExpiresAt: timestamp('claim_expires_at', {mode: 'string', withTimezone: true}),
+    createdAt: timestamp('created_at', {mode: 'string', withTimezone: true}).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', {mode: 'string', withTimezone: true}).defaultNow().notNull(),
+}, table => [
+    index('account_charge_owner_state_idx').on(table.organizationId, table.userId, table.state, table.nextCheckAt),
+    index('account_charge_gateway_idx').on(table.organizationId, table.userId, table.gatewayGenerationId),
+    check('account_charge_state_check', sql`${table.state} IN ('outstanding', 'confirmed', 'released')`),
+    check('account_charge_amount_check', sql`(${table.estimatedUnits} IS NULL OR ${table.estimatedUnits} >= 0) AND (${table.confirmedUnits} IS NULL OR ${table.confirmedUnits} >= 0)`),
+    check('account_charge_confirmation_check', sql`(${table.state} = 'confirmed') = (${table.confirmedUnits} IS NOT NULL AND ${table.confirmedAt} IS NOT NULL)`),
+]);
+
+export const accountBalanceAdjustments = pgTable('account_balance_adjustment', {
+    id: uuid('id').primaryKey(),
+    organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+    userId: uuid('user_id').notNull().references(() => users.id),
+    adjustedByUserId: uuid('adjusted_by_user_id').notNull().references(() => users.id),
+    previousUnits: numeric('previous_units', {precision: 30, scale: 0}),
+    actualUnits: numeric('actual_units', {precision: 30, scale: 0}),
+    createdAt: timestamp('created_at', {mode: 'string', withTimezone: true}).defaultNow().notNull(),
+}, table => [index('account_balance_adjustment_owner_idx').on(table.organizationId, table.userId, table.createdAt)]);
 
 // Shared capacity and credential-attempt accounting must survive warm-worker
 // eviction and coordinate across independently scaled serverless instances.

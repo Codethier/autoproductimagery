@@ -253,9 +253,10 @@ test('organization retention requires matching generated registry ownership, pre
         await db.insert(assetShares).values({id: randomUUID(), assetId: sharedAsset.id, organizationId: org, sharedByUserId: aliceId, recipientUserId: bobId, permission: 'view'})
         const bob: AssetActor = {organizationId: org, userId: bobId, username: 'bob', displayName: 'Bob', role: 'user'}
         const repository = createAssetRepository(bob, db)
-        assert.equal((await repository.requireAsset(sharedAsset.url)).permissions.view, true)
         const history = await db.insert(systemPrompt).values(entries.map(entry => ({TextPrompt: entry.name, outputImage: entry.url,
-            organizationId: org, userId: entry.historyOwner, createdAt: age(200), status: 'succeeded' as const, priceUsd: '0.02'}))).returning()
+            organizationId: org, userId: entry.historyOwner, createdAt: age(200), status: 'succeeded' as const,
+            priceSource: 'gateway', billingState: 'confirmed' as const, priceUsd: '0.02'}))).returning()
+        assert.equal((await repository.requireAsset(sharedAsset.url)).permissions.view, true)
         const deleted: string[] = []
         const result = await runGeneratedImageRetention({pool, storage: {removeGeneratedImage: async url => {deleted.push(url)}}, retentionDays: 180, now: NOW})
         assert.equal(result.failed, 0)

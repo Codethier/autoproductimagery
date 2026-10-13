@@ -29,6 +29,8 @@ import { sanitizeProviderMetadata } from '~~/server/utils/gatewayMetadata'
 import { validateGptImageMaskPair, validateBflFillMaskPair } from '~~/server/utils/gptImageMask'
 import {assertGeneratedSourcesAvailable} from '~~/server/utils/generatedImageSources'
 import {useUserFS} from '~~/server/utils/useUserFS'
+import {extractGatewayErrorBilling} from '~~/server/utils/billingGatewayError'
+import {publicGeneration} from '~~/server/utils/generationVisibility'
 
 type RawBody = Record<string, unknown>
 const MAX_GENERATION_REQUEST_BYTES = 512 * 1024
@@ -289,6 +291,11 @@ export default defineEventHandler(async (event) => {
         const jobs: Array<{
             inputImage: string | null
             rows: Array<NonNullable<Awaited<ReturnType<typeof database.createPendingGeneration>>>>
+            providerStarted?: boolean
+            repairBilling?: GenerationBilling
+            repairOutputCount?: number
+            actualOutputCount?: number
+            outputRowsReady?: boolean
         }> = []
         let initialRows: Awaited<ReturnType<typeof database.createPendingGenerations>>
         try {
@@ -296,6 +303,7 @@ export default defineEventHandler(async (event) => {
                 Array.from({length: expectedOutputs}, () => pendingRowData(inputImage)),
             ))
         } catch (error) {
+            if (error && typeof error === 'object' && 'statusCode' in error && [401, 402, 409].includes(Number(error.statusCode))) throw error
             throw persistenceDiagnostic(error, `Could not create pending rows for batch ${batchId}`)
         }
         let initialRowIndex = 0
@@ -333,6 +341,7 @@ export default defineEventHandler(async (event) => {
             error: unknown,
             startedAt: number,
             billing: GenerationBilling = {model: request.model},
+            releaseCharge = !job.providerStarted,
         ) {
             const normalized = normalizeError(error)
             const row = job.rows[rowIndex]
@@ -340,6 +349,7 @@ export default defineEventHandler(async (event) => {
             return database.failGeneration(row.id, {
                 error: normalized,
                 billing,
+                releaseCharge,
                 log: {
                     ...baseLog(job, startedAt),
                     status: 'error',
@@ -365,6 +375,9 @@ export default defineEventHandler(async (event) => {
             const savedOutputUrls = new Map<number, string>()
             const rows: Array<NonNullable<Awaited<ReturnType<typeof database.getSystemPrompt>>>> = []
             let generated: Array<Awaited<ReturnType<typeof gateway.generateAnyImage>>[number] | undefined> = []
+            let providerBilling: GenerationBilling | undefined
+            let providerOutputCount = 0
+            let outputRowsReady = false
 
             function rememberRow(index: number, row: NonNullable<Awaited<ReturnType<typeof database.getSystemPrompt>>>) {
                 terminalIndexes.add(index)
@@ -377,13 +390,16 @@ export default defineEventHandler(async (event) => {
                 generated = await gateway.generateAnyImage({
                     ...request,
                     inputImages: job.inputImage ? [job.inputImage] : [],
-                }, abortSignal)
+                }, abortSignal, () => {job.providerStarted = true})
                 const generatedCount = generated.length
+                providerOutputCount = generatedCount
+                providerBilling = generated.find(image => image?.billing)?.billing
                 // Gemini may return more than one image even though its API has no
                 // deterministic `n` option. Persist every charged output.
                 while (job.rows.length < generatedCount) {
                     job.rows.push(await createPendingRow(job.inputImage))
                 }
+                outputRowsReady = true
                 for (let outputIndex = 0; outputIndex < job.rows.length; outputIndex += 1) {
                     const image = generated[outputIndex]
                     if (!image) {
@@ -395,6 +411,8 @@ export default defineEventHandler(async (event) => {
                                 statusMessage: `Provider returned ${generatedCount} of ${job.rows.length} requested images.`,
                             }),
                             startedAt,
+                            undefined,
+                            true,
                         )
                         rememberRow(outputIndex, failure.row)
                         continue
@@ -489,9 +507,22 @@ export default defineEventHandler(async (event) => {
                 return rows
             } catch (generationError) {
                 const repairErrors: unknown[] = []
+                const reportedErrorBilling = extractGatewayErrorBilling(generationError)
+                const errorBilling = reportedErrorBilling ?? providerBilling
+                // A row-expansion failure occurs before any output transition.
+                // Preserve that full paid call on the tracked rows. Otherwise
+                // use the original actual-output allocation, including siblings
+                // already committed before a later persistence interruption.
+                const chargedOutputs = reportedErrorBilling || !outputRowsReady ? job.rows.length : providerOutputCount
+                job.repairBilling = errorBilling
+                job.repairOutputCount = chargedOutputs
+                job.actualOutputCount = providerOutputCount
+                job.outputRowsReady = outputRowsReady
                 for (const outputIndex of unresolvedGenerationIndexes(job.rows.length, terminalIndexes)) {
                     try {
-                        const failure = await persistFailure(job, outputIndex, generationError, startedAt)
+                        const unproduced = outputRowsReady && outputIndex >= providerOutputCount
+                        const billing = errorBilling && !unproduced ? allocateGenerationBilling(errorBilling, outputIndex, chargedOutputs) : undefined
+                        const failure = await persistFailure(job, outputIndex, generationError, startedAt, billing, unproduced || !job.providerStarted)
                         const savedUrl = savedOutputUrls.get(outputIndex)
                         if (failure.row.status !== 'succeeded' && savedUrl) {
                             await imageFs.removeGeneratedImage(savedUrl).catch(() => undefined)
@@ -544,7 +575,11 @@ export default defineEventHandler(async (event) => {
             console.error('[image-generation] Generation job rejected; attempting terminal repair', result.reason)
             for (let outputIndex = 0; outputIndex < job.rows.length; outputIndex += 1) {
                 try {
-                    const repaired = await persistFailure(job, outputIndex, result.reason, Date.now())
+                    const unproduced = job.outputRowsReady && outputIndex >= (job.actualOutputCount ?? 0)
+                    const fullBilling = job.repairBilling ?? extractGatewayErrorBilling(result.reason)
+                    const billing = fullBilling && !unproduced
+                        ? allocateGenerationBilling(fullBilling, outputIndex, job.repairOutputCount ?? job.rows.length) : undefined
+                    const repaired = await persistFailure(job, outputIndex, result.reason, Date.now(), billing, !!unproduced || !job.providerStarted)
                     if (!objects.some(row => row.id === repaired.row.id)) objects.push(repaired.row)
                 } catch (repairError) {
                     console.error('[image-generation] Failed to repair a pending generation row', repairError)
@@ -561,7 +596,7 @@ export default defineEventHandler(async (event) => {
         const pending = objects.filter(row => row?.status === 'pending').length
         return {
             ok: failed === 0 && pending === 0,
-            obj: objects,
+            obj: objects.map(publicGeneration),
             batchId,
             summary: {
                 requested: sourceImages.length * expectedOutputs,

@@ -226,7 +226,7 @@ test('billing refresh can preserve a multi-output row allocation', () => {
   assert.equal(allocated.inputTokens, 2)
   assert.equal(allocated.outputTokens, 4)
   assert.equal(allocated.totalTokens, 6)
-  assert.equal(allocated.priceUsd, '0.03333333')
+  assert.equal(allocated.priceUsd, '0.033333333333')
   assert.deepEqual(readGenerationAllocation(allocated.usageJson), {
     outputIndex: 1,
     outputCount: 3,
@@ -297,15 +297,23 @@ test('multi-output price allocation preserves exact fixed-unit total', () => {
     priceUsd: '0.10000000',
   }, index, 3))
   assert.deepEqual(rows.map(row => row.priceUsd), [
-    '0.03333334',
-    '0.03333333',
-    '0.03333333',
+    '0.033333333334',
+    '0.033333333333',
+    '0.033333333333',
   ])
   const totalUnits = rows.reduce(
-    (sum, row) => sum + Math.round(Number(row.priceUsd) * 100_000_000),
-    0,
+    (sum, row) => sum + BigInt(row.priceUsd!.replace('.', '')),
+    0n,
   )
-  assert.equal(totalUnits, 10_000_000)
+  assert.equal(totalUnits, 100_000_000_000n)
+})
+
+test('large and tiny output charges preserve every exact accounting unit', () => {
+  for (const priceUsd of ['999999999999.999999999999', '0.000000000001']) {
+    const rows = Array.from({length: 3}, (_, index) => allocateGenerationBilling({priceUsd}, index, 3))
+    const units = rows.reduce((sum, row) => sum + BigInt(row.priceUsd!.replace('.', '')), 0n)
+    assert.equal(units, BigInt(priceUsd.replace('.', '')))
+  }
 })
 
 test('GPT mask validation applies the same PNG dimensions to every source', () => {
