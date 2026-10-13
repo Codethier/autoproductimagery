@@ -65,14 +65,15 @@ class MemoryS3 {
     }
 }
 
-async function fixture(work: (f: {db: ReturnType<typeof drizzle>; storage: ReturnType<typeof createS3ImageStorage>; s3: MemoryS3; alice: AssetActor; bob: AssetActor; owner: AssetActor; outsider: AssetActor; bytes: Buffer}) => Promise<void>) {
+async function fixture(work: (f: {db: ReturnType<typeof drizzle>; storage: ReturnType<typeof createS3ImageStorage>; s3: MemoryS3; alice: AssetActor; bob: AssetActor; owner: AssetActor; outsider: AssetActor; bytes: Buffer; queries: string[]}) => Promise<void>) {
     const connectionString = process.env.TEST_DATABASE_URL!
     const schema = `imagery_acl_${randomUUID().replaceAll('-', '')}`
     const administrator = new Pool({connectionString, max: 1})
     const pool = new Pool({...getDatabasePoolConfig({DATABASE_URL: connectionString}), options: `-c search_path=${schema} -c timezone=UTC`})
     try {
         await administrator.query(`CREATE SCHEMA "${schema}"`)
-        const db = drizzle({client: pool})
+        const queries: string[] = []
+        const db = drizzle({client: pool, logger: {logQuery(query) {queries.push(query)}}})
         await migrate(db, {migrationsFolder: fileURLToPath(new URL('../drizzle/postgres', import.meta.url)), migrationsSchema: schema})
         const org = randomUUID(), other = randomUUID()
         await db.insert(organizations).values([{id: org, name: 'Studio'}, {id: other, name: 'Other studio'}])
@@ -82,7 +83,7 @@ async function fixture(work: (f: {db: ReturnType<typeof drizzle>; storage: Retur
         const s3 = new MemoryS3()
         const storage = createS3ImageStorage({client: s3, bucket: 'local-test', prefix: 'images'})
         const bytes = await sharp({create: {width: 4, height: 3, channels: 4, background: '#246d6c'}}).png().toBuffer()
-        await work({db, storage, s3, alice, bob, owner, outsider, bytes})
+        await work({db, storage, s3, alice, bob, owner, outsider, bytes, queries})
     } finally {
         await pool.end()
         await administrator.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`)
@@ -168,6 +169,105 @@ test('folder sharing inherits to descendants and new uploads, is source grouped,
     for (const url of [nested.url, added.url]) await assert.rejects(bobFS.assertReadableImages([url]), status(404))
     assert.deepEqual((await bobFS.listAssets({scope: 'shared'})).dirs, [])
     assert.deepEqual(await bobFS.resolveAssets([nested.url, added.url]), [])
+}))
+
+test('folder counts include immediate visible children, remain independent of search and pagination, and require no storage reads', integration, async () => fixture(async f => {
+    const aliceFS = await useUserFS(f.alice, f.storage, f.db)
+    const catalog = await aliceFS.createFolder('/', 'Catalog')
+    const empty = await aliceFS.createFolder('/', 'Empty')
+    const summer = await aliceFS.createFolder('/Catalog', 'Summer')
+    const first = await aliceFS.saveUpload('/Catalog', upload(f.bytes, 'one.png'))
+    await aliceFS.saveUpload('/Catalog', upload(f.bytes, 'two.png'))
+    await aliceFS.saveUpload('/Catalog/Summer', upload(f.bytes, 'nested.png'))
+    await aliceFS.saveUpload('/', upload(f.bytes, 'outside.png'))
+    assert.equal(empty.itemCount, 0, 'newly created empty folders return a zero count')
+    const before = f.s3.commands.length
+    f.queries.length = 0
+    const root = await aliceFS.readDir('/')
+    assert.equal(root.dirs.find(folder => folder.id === catalog.id)?.itemCount, 3, 'two images plus one folder, without counting grandchildren')
+    assert.equal(root.dirs.find(folder => folder.id === empty.id)?.itemCount, 0)
+    assert.equal(f.queries.filter(query => query.includes('count(') && query.includes('group by')).length, 1, 'one grouped count query covers all returned folders')
+    const filtered = await aliceFS.listAssets({direct: true, query: 'Catalog', limit: 1})
+    assert.equal(filtered.dirs[0]?.itemCount, 3)
+    assert.equal(filtered.files.length, 0)
+    const expected = new Map([[catalog.id, 3], [empty.id, 0]])
+    let cursor: string | undefined
+    const seen = new Set<string>()
+    do {
+        const page = await aliceFS.readDir('/', {limit: 1, cursor})
+        for (const folder of page.dirs) {
+            assert.equal(folder.itemCount, expected.get(folder.id))
+            seen.add(folder.id!)
+        }
+        cursor = page.nextCursor
+    } while (cursor)
+    assert.equal(seen.size, 2)
+    const contents = await aliceFS.readDir('/Catalog', {limit: 1})
+    assert.equal(contents.folder?.itemCount, 3, 'current-folder metadata reports the whole immediate folder even on a short page')
+    assert.equal((await aliceFS.listAssets({folderId: catalog.id, query: 'not present'})).folder?.itemCount, 3)
+    const summerContents = await aliceFS.readDir('/Catalog/Summer')
+    assert.equal(summerContents.folder?.id, summer.id)
+    assert.equal(summerContents.folder?.itemCount, 1)
+    assert.equal(f.s3.commands.length, before, 'counts, search and paginated listings only query PostgreSQL')
+    await aliceFS.deleteFileOrFolder(first.url, 'file')
+    assert.equal((await aliceFS.readDir('/Catalog')).folder?.itemCount, 2)
+    await aliceFS.deleteFileOrFolder(summer.url!, 'directory')
+    assert.equal((await aliceFS.readDir('/Catalog')).folder?.itemCount, 1)
+}))
+
+test('shared folder counts follow exact-price, retention and tenant visibility without exposing private or held outputs', integration, async () => fixture(async f => {
+    const aliceFS = await useUserFS(f.alice, f.storage, f.db), bobFS = await useUserFS(f.bob, f.storage, f.db)
+    const outputs = await Promise.all(Array.from({length: 9}, () => aliceFS.saveGeneratedImage(f.bytes)))
+    const repo = createAssetRepository(f.alice, f.db)
+    const firstAsset = await repo.byUrl(outputs[0]!.url)
+    const folderId = firstAsset!.parentId!
+    const histories = await Promise.all([
+        pricedGeneration(f.db, f.alice, outputs[0]!.url, {billingState: 'awaiting', priceSource: 'estimate'}),
+        pricedGeneration(f.db, f.alice, outputs[1]!.url, {priceUsd: '0.000000000000'}),
+        pricedGeneration(f.db, f.alice, outputs[2]!.url),
+        pricedGeneration(f.db, f.alice, outputs[3]!.url),
+        pricedGeneration(f.db, f.alice, outputs[4]!.url, {outputImageDeletedAt: new Date().toISOString()}),
+        pricedGeneration(f.db, f.alice, outputs[5]!.url, {usageJson: {gatewayBilling: {isByok: true}}}),
+        pricedGeneration(f.db, f.alice, outputs[6]!.url, {status: 'failed', errors: 'Local failed fixture'}),
+        pricedGeneration(f.db, f.bob, outputs[7]!.url),
+    ])
+    // A valid sibling cannot settle another URL, owner or organization, and duplicate
+    // provider rows do not multiply the number of visible assets.
+    await pricedGeneration(f.db, f.alice, outputs[2]!.url)
+    await pricedGeneration(f.db, f.outsider, outputs[8]!.url)
+    await f.db.update(assets).set({deletedAt: new Date().toISOString()}).where(eq(assets.url, outputs[3]!.url))
+    await f.db.insert(assets).values([
+        {id: randomUUID(), organizationId: f.alice.organizationId, ownerUserId: f.bob.userId, createdByUserId: f.bob.userId,
+            parentId: folderId, url: '/images/local-test-other-owner.png', name: 'Other owner', kind: 'file', category: 'uploaded'},
+        {id: randomUUID(), organizationId: f.outsider.organizationId, ownerUserId: f.outsider.userId, createdByUserId: f.outsider.userId,
+            parentId: folderId, url: '/images/local-test-other-organization.png', name: 'Other organization', kind: 'folder', category: 'uploaded'},
+    ])
+    const beforePrivate = f.s3.commands.length
+    assert.deepEqual((await bobFS.readDir('/')).dirs, [])
+    assert.deepEqual((await bobFS.listAssets({scope: 'shared'})).dirs, [])
+    await assert.rejects(bobFS.readDir('/', {folderId}), status(404))
+    assert.deepEqual((await (await useUserFS(f.owner, f.storage, f.db)).readDir('/')).dirs, [], 'organization owners do not see another user’s private folder count')
+    assert.equal(f.s3.commands.length, beforePrivate)
+    await aliceFS.share(folderId, f.bob.userId, 'view')
+    const before = f.s3.commands.length
+    const shared = await bobFS.listAssets({scope: 'shared', sourceUserId: f.alice.userId, limit: 1})
+    assert.equal(shared.dirs[0]?.itemCount, 2)
+    assert.equal(shared.dirs[0]?.sharedBy?.userId, f.alice.userId)
+    const first = await bobFS.readDir('/', {folderId, limit: 1})
+    assert.equal(first.folder?.itemCount, 2)
+    assert.ok(first.nextCursor)
+    assert.equal((await bobFS.readDir('/', {folderId, limit: 1, cursor: first.nextCursor})).folder?.itemCount, 2)
+    assert.equal((await bobFS.listAssets({folderId, query: 'absent', limit: 1})).folder?.itemCount, 2)
+    await f.db.update(systemPrompt).set({billingState: 'confirmed', priceSource: 'gateway', priceUsd: '0.000000000000'}).where(eq(systemPrompt.id, histories[0]!.id))
+    assert.equal((await bobFS.listAssets({scope: 'shared'})).dirs[0]?.itemCount, 3, 'settling a zero charge makes the output count visible')
+    await f.db.update(systemPrompt).set({outputImageDeletedAt: new Date().toISOString()}).where(eq(systemPrompt.id, histories[1]!.id))
+    assert.equal((await bobFS.readDir('/', {folderId})).folder?.itemCount, 2, 'retention removes expired outputs from counts immediately')
+    await f.db.update(assets).set({deletedAt: new Date().toISOString()}).where(eq(assets.url, outputs[2]!.url))
+    assert.equal((await bobFS.readDir('/', {folderId})).folder?.itemCount, 1)
+    await aliceFS.revoke(folderId, f.bob.userId)
+    assert.deepEqual((await bobFS.listAssets({scope: 'shared'})).dirs, [])
+    await assert.rejects(bobFS.readDir('/', {folderId}), status(404))
+    assert.equal(f.s3.commands.length, before, 'count changes and revocation must not fetch or enumerate any S3 objects')
 }))
 
 test('historical edit grants remain readable generation sources but cannot authorize any shared mutations', integration, async () => fixture(async f => {

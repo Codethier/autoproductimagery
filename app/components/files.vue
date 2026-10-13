@@ -82,7 +82,7 @@ let items = await useFetch('/api/files', {
 })
 
 const additionalFiles = ref<SelectableFile[]>([])
-const additionalDirs = ref<Array<{name: string}>>([])
+const additionalDirs = ref<Array<{name: string; itemCount?: number}>>([])
 const nextCursor = ref<string | undefined>()
 const loadingMore = ref(false)
 const displayedFiles = computed(() => [...(items.data.value?.files ?? []), ...additionalFiles.value])
@@ -335,7 +335,7 @@ onBeforeUnmount(() => window.removeEventListener('paste', handlePaste))
       <div v-for="dir of displayedDirs" :key="dir.name"
            class="flex justify-center items-center gap-2 flex-col  cursor-pointer hover:text-primary-500 w-full h-full">
         <UIcon @click="enterFolder(dir.name)" name="material-symbols-create-new-folder" class="size-16"></UIcon>
-        <p class="w-full truncate text-center">{{ dir.name }}</p>
+        <div class="files-folder-caption"><span class="files-folder-name" :title="dir.name">{{ dir.name }}</span><span v-if="dir.itemCount !== undefined" class="files-folder-count" :aria-label="`${dir.itemCount} ${dir.itemCount === 1 ? 'item' : 'items'}`" :title="`${dir.itemCount} ${dir.itemCount === 1 ? 'item' : 'items'}`">{{ dir.itemCount }}</span></div>
         <UIcon name="i-heroicons-trash" class="size-6 text-red-500 cursor-pointer"
                @click="deleteFileOrFolder(dir.name)"></UIcon>
       </div>
@@ -380,5 +380,5 @@ onBeforeUnmount(() => window.removeEventListener('paste', handlePaste))
 </template>
 
 <style scoped>
-
+.files-folder-caption{display:flex;align-items:center;gap:8px;max-width:100%;min-width:0}.files-folder-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.files-folder-count{flex-shrink:0;border-radius:999px;padding:2px 6px;font-size:10px;line-height:1.35;font-variant-numeric:tabular-nums;background:var(--workspace-surface-raised,#39352f);color:var(--workspace-muted,#b8ac99)}
 </style>

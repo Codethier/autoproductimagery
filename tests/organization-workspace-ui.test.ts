@@ -13,6 +13,7 @@ import type {AssetFile, AssetFolder} from '../schemas/image-storage.ts'
 
 const root = new URL('../', import.meta.url)
 const browserUrl = new URL('app/components/AssetBrowser.vue', root).href
+const legacyFilesUrl = new URL('app/components/files.vue', root).href
 const layoutUrl = new URL('app/layouts/workspace.vue', root).href
 const balanceUrl = new URL('app/components/AccountBalanceSummary.vue', root).href
 const teamUrl = new URL('app/pages/team.vue', root).href
@@ -24,21 +25,23 @@ registerHooks({
     return nextResolve(specifier, context)
   },
   load(url, context, nextLoad) {
-    if (url !== browserUrl && url !== layoutUrl && url !== balanceUrl && url !== teamUrl) return nextLoad(url, context)
+    if (url !== browserUrl && url !== legacyFilesUrl && url !== layoutUrl && url !== balanceUrl && url !== teamUrl) return nextLoad(url, context)
     const filename = fileURLToPath(url)
     let source = readFileSync(filename, 'utf8')
-    if (url === browserUrl) source = source.replace('</script>', 'defineExpose({files, directories, loading, openSharing, shareTarget, shareRecipient, saveShare, revokeShare, grants, currentFolder, preview, selection, selectedMetadata, confirmSelection, fetchPage, view})\n</script>')
+    if (url === browserUrl) source = source.replace('</script>', 'defineExpose({files, directories, rootFolders, loading, openSharing, shareTarget, shareRecipient, saveShare, revokeShare, grants, currentFolder, preview, selection, selectedMetadata, confirmSelection, fetchPage, view})\n</script>')
+    if (url === legacyFilesUrl) source = source.replace('import {useDataStore} from "~/stores/data.store";', '')
     if (url === teamUrl) source = source.replace('</script>', 'defineExpose({openBalance, saveBalance, balanceForm, balanceDetails, balanceError})\n</script>')
     const {descriptor} = parse(source, {filename})
     const compiled = compileScript(descriptor, {id: filename, inlineTemplate: true})
     const services = `
-      const useRoute = () => ({path: '/assets'});
+      const useRoute = () => ({path: '/assets', query: {}});
+      const useRouter = () => ({currentRoute: ref({query: {}}), push: () => undefined});
       const useAccount = () => globalThis.${environmentKey}.session;
-      const useDataStore = () => ({pendingGenerations: []});
+      const useDataStore = () => ({pendingGenerations: [], inputImages: [], models: [], maskImage: null});
       const useAccountBalance = () => ({balance: ref(null), pending: ref(false), error: ref(''), refresh: async () => {}});
       const definePageMeta = () => {};
       const useHead = () => {};
-      const useFetch = () => ({data: ref({users: [], total: 0}), status: ref('success'), error: ref(null), refresh: async () => {}});
+      const useFetch = () => ({data: ref(globalThis.${environmentKey}.listing ?? {users: [], total: 0}), status: ref('success'), error: ref(null), refresh: async () => {}});
       const useToast = () => ({add: () => undefined});
       const useRequestFetch = () => (...args) => globalThis.${environmentKey}.fetch(...args);
       const $fetch = (...args) => globalThis.${environmentKey}.fetch(...args);
@@ -53,7 +56,7 @@ function fixtureFile(name: string, sourceId: string, permission: 'owner' | 'edit
     permissions: {view: true, edit: permission !== 'view', share: permission === 'owner'}, kind: 'file', source: {userId: sourceId, username: sourceId, displayName: sourceId === 'alice' ? 'Alice' : 'Bea'},
     ...(permission !== 'owner' ? {sharedBy: {userId: sourceId, username: sourceId, displayName: sourceId === 'alice' ? 'Alice' : 'Bea'}} : {})}
 }
-async function renderBrowser(options: {shared?: boolean; files?: AssetFile[]; dirs?: AssetFolder[]; actorId?: string; currentFolder?: AssetFolder; selected?: boolean; preview?: boolean; sharing?: boolean} = {}) {
+async function renderBrowser(options: {shared?: boolean; files?: AssetFile[]; dirs?: AssetFolder[]; rootFolders?: AssetFolder[]; actorId?: string; currentFolder?: AssetFolder; selected?: boolean; preview?: boolean; sharing?: boolean} = {}) {
   const calls: Array<{url: string; options: any}> = []
   const session = {account: ref({userId: options.actorId ?? 'member', organizationId: 'org', displayName: 'Member', username: 'member', role: 'user', organizationName: 'Studio'}), epoch: ref(0), identity: ref('org.member'), isOwner: ref(false)}
   const environment: any = {session, exposed: undefined, fetch: async (url: string, options: any) => {
@@ -66,7 +69,7 @@ async function renderBrowser(options: {shared?: boolean; files?: AssetFile[]; di
   const originalSetup = Browser.setup
   const component = {...Browser, setup(props: unknown, context: any) {
     return originalSetup(props, {...context, expose(value: any) {
-      environment.exposed = value; value.files.value = options.files ?? []; value.directories.value = options.dirs ?? []; value.loading.value = false; if (options.currentFolder) value.currentFolder.value = options.currentFolder; if (options.selected) {value.selection.value = options.files?.map(file => file.url) ?? []; for (const file of options.files ?? []) value.selectedMetadata.value.set(file.url, file)}; if (options.preview) value.preview.value = options.files?.[0]; if (options.sharing) {value.shareTarget.value = options.files?.[0]; value.grants.value = [{id: 'legacy-grant', recipientUserId: 'recipient', permission: 'edit', username: 'cora', displayName: 'Cora', createdAt: '2026-10-12T00:00:00.000Z'}]}; context.expose(value)
+      environment.exposed = value; value.files.value = options.files ?? []; value.directories.value = options.dirs ?? []; value.rootFolders.value = options.rootFolders ?? []; value.loading.value = false; if (options.currentFolder) value.currentFolder.value = options.currentFolder; if (options.selected) {value.selection.value = options.files?.map(file => file.url) ?? []; for (const file of options.files ?? []) value.selectedMetadata.value.set(file.url, file)}; if (options.preview) value.preview.value = options.files?.[0]; if (options.sharing) {value.shareTarget.value = options.files?.[0]; value.grants.value = [{id: 'legacy-grant', recipientUserId: 'recipient', permission: 'edit', username: 'cora', displayName: 'Cora', createdAt: '2026-10-12T00:00:00.000Z'}]}; context.expose(value)
     }})
   }}
   const app = createSSRApp({render: () => h(component, {initialScope: options.shared ? 'shared' : 'all', sharedOnly: options.shared})})
@@ -77,6 +80,45 @@ async function renderBrowser(options: {shared?: boolean; files?: AssetFile[]; di
   assert.deepEqual(warnings, [])
   return {html, exposed: environment.exposed, calls, environment, session}
 }
+
+function fixtureFolder(name: string, itemCount?: number, shared = false): AssetFolder {
+  return {id: `folder-${name}`, ownerUserId: 'alice', name, url: `/images/organizations/org/users/alice/${name}`, path: `/${name}`, kind: 'folder',
+    permissions: {view: true, edit: !shared, share: !shared}, ...(itemCount === undefined ? {} : {itemCount}),
+    ...(shared ? {sharedBy: {userId: 'alice', username: 'alice', displayName: 'Alice'}} : {})}
+}
+
+test('folder chips and cards show known item counts including zero without inventing a count for unknown folders', async () => {
+  const folders = [fixtureFolder('Spring collection', 12), fixtureFolder('Empty collection', 0), fixtureFolder('Older collection')]
+  const browser = await renderBrowser({dirs: folders, rootFolders: folders, actorId: 'alice'})
+  const badges = [...browser.html.matchAll(/class="asset-folder-count"[^>]*>(\d+)</g)].map(match => match[1])
+  assert.deepEqual(badges, ['12', '0', '12', '0'])
+  assert.equal([...browser.html.matchAll(/aria-label="12 items"/g)].length, 2)
+  assert.equal([...browser.html.matchAll(/aria-label="0 items"/g)].length, 2)
+  assert.match(browser.html, /title="Older collection"/)
+  assert.doesNotMatch(browser.html, /undefined items|NaN items/)
+})
+
+test('shared folder cards retain their source and view access alongside an accessible singular item count', async () => {
+  const browser = await renderBrowser({shared: true, dirs: [fixtureFolder('Shared references', 1, true)]})
+  assert.match(browser.html, /From Alice/)
+  assert.match(browser.html, /class="asset-folder-count" aria-label="1 item" title="1 item">1</)
+  assert.match(browser.html, /Can view/)
+  assert.doesNotMatch(browser.html, /aria-label="Delete folder|aria-label="Share folder/)
+})
+
+test('legacy folder picker displays known counts and preserves missing count metadata', async () => {
+  ;(globalThis as any)[environmentKey] = {listing: {files: [], dirs: [fixtureFolder('Products', 8), fixtureFolder('Empty', 0), fixtureFolder('Unknown')]}}
+  const {default: Files} = await import(legacyFilesUrl)
+  const app = createSSRApp({render: () => h(Files)})
+  for (const name of ['UIcon', 'UBreadcrumb', 'UFileUpload', 'UPopover', 'UButton', 'UInput', 'UCheckbox']) app.component(name, {render() {return h('div', this.$slots.default?.())}})
+  const warnings: string[] = []; app.config.warnHandler = message => warnings.push(message)
+  const html = await renderToString(app)
+  assert.deepEqual(warnings, [])
+  assert.deepEqual([...html.matchAll(/class="files-folder-count"[^>]*>(\d+)</g)].map(match => match[1]), ['8', '0'])
+  assert.match(html, /aria-label="8 items"/)
+  assert.match(html, /aria-label="0 items"/)
+  assert.match(html, /title="Unknown"/)
+})
 
 test('shared library groups images by the sharing person and hides destructive controls for view grants', async () => {
   const browser = await renderBrowser({shared: true, files: [fixtureFile('serum.png', 'alice', 'view'), fixtureFile('oil.png', 'bea', 'view')]})

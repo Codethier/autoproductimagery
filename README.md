@@ -14,6 +14,8 @@ The app opens at **Edit** (`/edit`), in a warm studio layout with top navigation
 
 **Shared with me** (`/shared`) groups shared files and folders by the person who shared them. A source is a member of the same organization. Shares provide view-only access: previews, downloads and using an image in a new generation; the resulting output belongs to the generating user. The original owner manages the contents and grants or revokes access. Folder grants apply to their logical descendants, including later uploads; revocation applies on the next server operation. Sharing is confined to the same organization. Shared generated images still expire under the retention policy.
 
+Folder badges show the number of visible items directly inside each folder, including child folders. Counts are independent of search and pagination; deleted, expired or unpriced generated images are excluded. Empty folders show `0`. Counts come from one grouped PostgreSQL query for each listing page, with the same organization and sharing checks as the library.
+
 ## Organizations and accounts
 
 There are two roles: **organization owner** and **user**. Owners manage accounts in **Team** (`/team`): create usernames and initial passwords, choose roles, update display names, reset passwords, and disable or re-enable accounts. Users manage their own images and sharing, and can change their password in **Account** (`/account`). There is no public signup or email invitation service. The last enabled owner cannot be demoted or disabled.

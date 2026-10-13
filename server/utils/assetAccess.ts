@@ -1,6 +1,6 @@
 import {createHash, randomUUID} from 'node:crypto'
 import {createError} from 'h3'
-import {and, asc, eq, gt, inArray, isNull, ne, sql} from 'drizzle-orm'
+import {and, asc, eq, gt, inArray, isNull, ne, sql, type SQLWrapper} from 'drizzle-orm'
 import {alias} from 'drizzle-orm/pg-core'
 import {assets, assetShares, users, systemPrompt} from '../db/schema'
 import {confirmedGenerationPriceCondition} from './generationVisibility'
@@ -45,13 +45,30 @@ export function createAssetRepository(actor: AssetActor, db: Database = getDatab
     const parent = alias(assets, 'parent_asset')
     const sourceCache = new Map<string, Promise<AssetSource>>([[actor.userId, Promise.resolve({userId: actor.userId, username: actor.username, displayName: actor.displayName})]])
     const priceCache = new Map<string, {priceUsd: string | null; priceSource: string | null; billingState: 'pending' | 'awaiting' | 'confirmed' | 'released' | null}>()
-    function outputMatch(row?: AssetRecord) {
-        return and(eq(systemPrompt.organizationId, row?.organizationId ?? assets.organizationId),
-            eq(systemPrompt.userId, row?.ownerUserId ?? assets.ownerUserId), eq(systemPrompt.outputImage, row?.url ?? assets.url))
+    type OutputIdentity = {organizationId: SQLWrapper; ownerUserId: SQLWrapper; url: SQLWrapper}
+    function outputMatch(row?: AssetRecord, reference: OutputIdentity = assets) {
+        return and(eq(systemPrompt.organizationId, row?.organizationId ?? reference.organizationId),
+            eq(systemPrompt.userId, row?.ownerUserId ?? reference.ownerUserId), eq(systemPrompt.outputImage, row?.url ?? reference.url))
     }
-    function visibleOutput(row?: AssetRecord) {
-        return and(outputMatch(row), confirmedGenerationPriceCondition(), isNull(systemPrompt.outputImageDeletedAt),
+    function visibleOutput(row?: AssetRecord, reference: OutputIdentity = assets) {
+        return and(outputMatch(row, reference), confirmedGenerationPriceCondition(), isNull(systemPrompt.outputImageDeletedAt),
             sql`(${systemPrompt.status} = 'succeeded' OR (${systemPrompt.status} IS NULL AND ${systemPrompt.errors} IS NULL))`)
+    }
+    /** Call only for authorized folders. Count immediate visible entries independently of listing filters. */
+    async function folderItemCounts(folders: AssetRecord[]) {
+        if (!folders.length) return new Map<string, number>()
+        const countedFolder = alias(assets, 'counted_folder')
+        const child = alias(assets, 'counted_child')
+        const counts = await db.select({folderId: countedFolder.id, itemCount: sql<number>`count(${child.id})::integer`})
+            .from(countedFolder).leftJoin(child, and(eq(child.parentId, countedFolder.id),
+                eq(child.organizationId, countedFolder.organizationId), eq(child.ownerUserId, countedFolder.ownerUserId),
+                isNull(child.deletedAt), sql`(${child.kind} <> 'file' OR ${child.category} <> 'generated' OR EXISTS (
+                    SELECT 1 FROM ${systemPrompt} WHERE ${visibleOutput(undefined, child)}
+                ))`))
+            .where(and(inArray(countedFolder.id, [...new Set(folders.map(row => row.id))]),
+                eq(countedFolder.organizationId, actor.organizationId), eq(countedFolder.kind, 'folder'), isNull(countedFolder.deletedAt)))
+            .groupBy(countedFolder.id)
+        return new Map(counts.map(row => [row.folderId, row.itemCount]))
     }
     async function confirmedOutput(row: AssetRecord) {
         if (row.kind !== 'file' || row.category !== 'generated') return undefined
@@ -131,22 +148,24 @@ export function createAssetRepository(actor: AssetActor, db: Database = getDatab
         const personal = prefix.every((segment, index) => parts[index] === segment)
         return '/' + (personal ? parts.slice(prefix.length) : parts).join('/')
     }
-    async function dto(row: AssetRecord, inherited?: {permissions: AssetPermissions; sharedBy?: AssetSource}): Promise<AssetFile> {
+    async function dto(row: AssetRecord, inherited?: {permissions: AssetPermissions; sharedBy?: AssetSource}, itemCount?: number): Promise<AssetFile> {
         const grant = inherited ?? await access(row)
         const owner = await source(row.ownerUserId)
         const path = logicalPath(row)
         const containingFolder = row.parentId ? await byId(row.parentId) : undefined
         const price = await confirmedOutput(row)
+        const count = row.kind === 'folder' ? itemCount ?? (await folderItemCounts([row])).get(row.id) ?? 0 : undefined
         return {id: row.id, kind: row.kind, name: row.name, url: row.url,
             category: row.category, ...(price ?? {}),
+            ...(count !== undefined ? {itemCount: count} : {}),
             folder: row.kind === 'folder' ? path : containingFolder ? logicalPath(containingFolder) : '/',
             ownerUserId: row.ownerUserId, permissions: grant.permissions, source: owner,
             ...(grant.sharedBy ? {sharedBy: grant.sharedBy} : {}),
             selectedImage: false, selectedModel: false, selectedMask: false,
             ...(row.byteSize !== null ? {bytes: row.byteSize} : {}), modifiedAt: new Date(row.updatedAt).toISOString()}
     }
-    async function folderDto(row: AssetRecord, inherited?: {permissions: AssetPermissions; sharedBy?: AssetSource}): Promise<AssetFolder> {
-        const file = await dto(row, inherited)
+    async function folderDto(row: AssetRecord, inherited?: {permissions: AssetPermissions; sharedBy?: AssetSource}, itemCount?: number): Promise<AssetFolder> {
+        const file = await dto(row, inherited, itemCount)
         return {...file, path: logicalPath(row)}
     }
     async function resolveFolder(path = '/', folderId?: string, intent: 'view' | 'edit' = 'view') {
@@ -223,11 +242,16 @@ export function createAssetRepository(actor: AssetActor, db: Database = getDatab
                     sql`(${systemPrompt.status} = 'succeeded' OR (${systemPrompt.status} IS NULL AND ${systemPrompt.errors} IS NULL))`))
             for (const price of prices) if (outputs.some(row => row.url === price.url && row.ownerUserId === price.ownerUserId)) priceCache.set(price.url, price)
         }
-        const mapped = await Promise.all(rows.map(row => dto(row)))
+        const folders = rows.filter(row => row.kind === 'folder')
+        // Sharing is inherited through folder ancestry; verify each returned folder before
+        // the single count query can inspect any of its children.
+        const folderGrants = new Map(await Promise.all(folders.map(async row => [row.id, await access(row)] as const)))
+        const counts = await folderItemCounts([...folders, ...(folder ? [folder.row] : [])])
+        const mapped = await Promise.all(rows.map(row => dto(row, folderGrants.get(row.id), counts.get(row.id))))
         const files = mapped.filter(file => file.kind === 'file')
         const dirs: AssetFolder[] = mapped.filter(file => file.kind === 'folder').map(file => ({...file, path: logicalPath(rows.find(row => row.id === file.id)!)}))
         return {files, dirs, sources: [...new Map(mapped.filter(file => file.sharedBy).map(file => [file.sharedBy!.userId, file.sharedBy!])).values()],
-            ...(folder ? {folder: await folderDto(folder.row, folder)} : {}), nextCursor: next}
+            ...(folder ? {folder: await folderDto(folder.row, folder, counts.get(folder.row.id))} : {}), nextCursor: next}
     }
     async function descendants(row: AssetRecord) {
         const child = alias(assets, 'child_asset')
