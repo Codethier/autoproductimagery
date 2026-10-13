@@ -39,6 +39,7 @@ registerHooks({
       const useAccount = () => globalThis.${environmentKey}.session;
       const useDataStore = () => ({pendingGenerations: [], inputImages: [], models: [], maskImage: null});
       const useAccountBalance = () => ({balance: ref(null), pending: ref(false), error: ref(''), refresh: async () => {}});
+      const usePeopleGenerationProgress = () => ({count: ref(0)});
       const definePageMeta = () => {};
       const useHead = () => {};
       const useFetch = () => ({data: ref(globalThis.${environmentKey}.listing ?? {users: [], total: 0}), status: ref('success'), error: ref(null), refresh: async () => {}});
@@ -192,6 +193,7 @@ test('organization owner sees Team navigation while a member does not', async ()
     const html = await renderToString(app)
     assert.equal(html.includes('href="/team"'), isOwner)
     assert.match(html, /href="\/shared"/)
+    assert.match(html, /href="\/people"/)
     assert.match(html, /Studio/)
   }
 })

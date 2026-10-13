@@ -8,6 +8,8 @@ import {
 import { and, desc, eq, inArray, isNotNull, lt, sql as drizzleSql } from "drizzle-orm"
 import {assertGenerationCredit, recordGenerationCharge} from './accountBilling'
 import {hasConfirmedGenerationPrice} from '../../schemas/generation-billing'
+import {assertPersonPhotoCapacity, lockOwnedPerson} from './peopleRepository'
+import {createError} from 'h3'
 import type {
     OutputMetadata,
     StoredGenerationConfig,
@@ -27,7 +29,7 @@ export type GenerationBilling = {
     usageJson?: Record<string, unknown>
 }
 
-export type GenerationOwner = { organizationId: string; userId: string }
+export type GenerationOwner = { organizationId: string; userId: string; authVersion?: number }
 
 type PendingGeneration = {
     prompt: string
@@ -37,6 +39,7 @@ type PendingGeneration = {
     effectiveModel: string
     batchId: string
     parentSystemPromptId?: number
+    personId?: string
     generationConfig: StoredGenerationConfig
 }
 
@@ -103,6 +106,7 @@ export async function useDB(db = getDatabase(), owner?: GenerationOwner) {
             billingState: 'pending' as const,
             batchId: data.batchId,
             parentSystemPromptId: data.parentSystemPromptId ?? null,
+            personId: data.personId ?? null,
             generationConfig: data.generationConfig,
             errors: null,
             errorJson: null,
@@ -123,7 +127,24 @@ export async function useDB(db = getDatabase(), owner?: GenerationOwner) {
                 if (new Set(items.map(item => item.batchId)).size !== 1) throw new Error('Pending generations must share one batch')
                 await assertGenerationCredit(tx, owner, items[0]!.batchId)
             }
-            const inserted = await tx.insert(systemPrompt).values(items.map(pendingValues)).returning()
+            const personIds = [...new Set(items.map(item => item.personId).filter((id): id is string => id !== undefined))].sort()
+            if (personIds.length && !owner) throw createError({statusCode: 400, statusMessage: 'People generations require an authenticated account'})
+            const removedPeople = new Set<string>()
+            for (const personId of personIds) {
+                const [existingBatch] = await tx.select({id: systemPrompt.id}).from(systemPrompt)
+                    .where(and(eq(systemPrompt.batchId, items[0]!.batchId), eq(systemPrompt.organizationId, owner!.organizationId), eq(systemPrompt.userId, owner!.userId))).limit(1)
+                try {await lockOwnedPerson(tx, owner!, personId)} catch (error) {
+                    // The profile may have been removed after a paid call
+                    // began. Preserve extra paid outputs without that link.
+                    if (existingBatch && (error as {statusCode?: number})?.statusCode === 404) {removedPeople.add(personId); continue}
+                    throw error
+                }
+                // Persist extra paid provider outputs even if they exceed the
+                // initial reservation. New batches still enforce the cap.
+                if (!existingBatch) await assertPersonPhotoCapacity(tx, owner!, personId, items.filter(item => item.personId === personId).length)
+            }
+            const inserted = await tx.insert(systemPrompt).values(items.map(item => pendingValues(item.personId && removedPeople.has(item.personId)
+                ? {...item, personId: undefined} : item))).returning()
             for (const row of inserted) await recordGenerationCharge(tx, row)
             return inserted
         })

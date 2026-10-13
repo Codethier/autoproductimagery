@@ -353,6 +353,43 @@ const dragging = ref(false)
 const pickerOpen = ref(false)
 const pickerKind = ref<'source' | 'references' | 'mask'>('source')
 const pickerSelection = ref<string[]>([])
+const peoplePickerOpen = ref(false)
+const peoplePickerSelection = ref<string[]>([])
+const peoplePickerAccount = ref<ReturnType<typeof accountSnapshot> | null>(null)
+const sharedReferenceAllowance = computed(() => Math.max(0, selectedProfile.value.maxReferenceImages - 1))
+// Capture the account in the callback given to this particular modal instance.
+// A late confirmation from an unmounted picker must not affect a new account.
+const confirmPeople = computed(() => {
+  const snapshot = peoplePickerAccount.value
+  return (urls: string[]) => {
+    if (!snapshot || snapshot !== peoplePickerAccount.value || !peoplePickerOpen.value || !isCurrentAccount(snapshot)) return
+    const selections = Array.from(new Set(urls))
+    if (selections.some(url => !ImagePathSchema.safeParse(url).success)) {
+      errorMsg.value = 'Choose valid images from People.'
+      return
+    }
+    if (selections.length > sharedReferenceAllowance.value) {
+      errorMsg.value = `This model supports ${sharedReferenceAllowance.value} shared reference image${sharedReferenceAllowance.value === 1 ? '' : 's'}. Remove a selection to continue.`
+      return
+    }
+    data.models = selections
+    errorMsg.value = null
+    peoplePickerOpen.value = false
+    peoplePickerSelection.value = []
+    peoplePickerAccount.value = null
+  }
+})
+function openPeoplePicker() {
+  if (!sharedReferenceAllowance.value) return
+  peoplePickerAccount.value = accountSnapshot()
+  peoplePickerSelection.value = [...data.models]
+  peoplePickerOpen.value = true
+}
+watch(peoplePickerOpen, open => {
+  if (open) return
+  peoplePickerSelection.value = []
+  peoplePickerAccount.value = null
+}, {flush: 'sync'})
 const backgroundRemovalSources = ref<string[]>([])
 function openBackgroundRemoval(urls: string[]) { backgroundRemovalSources.value = [...urls] }
 async function useCutout(url: string) {
@@ -417,6 +454,9 @@ watch(account.epoch, () => {
   dragging.value = false
   pickerOpen.value = false
   pickerSelection.value = []
+  peoplePickerOpen.value = false
+  peoplePickerSelection.value = []
+  peoplePickerAccount.value = null
   backgroundRemovalSources.value = []
   previewResult.value = null
   billingPollAttempts = 0
@@ -673,6 +713,14 @@ async function submit() {
                       @confirm="confirmPicker" />
       </template>
     </UModal>
+    <UModal v-model:open="peoplePickerOpen" title="Choose people references" description="Select portraits to attach as shared reference images."
+            :ui="{ content: 'max-w-6xl max-h-[90vh]' }">
+      <template #body>
+        <PeopleBrowser v-if="peoplePickerOpen" :key="`${account.identity.value}:${account.epoch.value}`"
+                       v-model:selected-urls="peoplePickerSelection" selection-mode="multiple"
+                       :max-selection="sharedReferenceAllowance" @confirm="confirmPeople" />
+      </template>
+    </UModal>
     <div v-if="backgroundRemovalSources.length" class="studio-cutout-backdrop" @click.self="backgroundRemovalSources = []">
       <BackgroundRemovalPanel :source-urls="backgroundRemovalSources" @close="backgroundRemovalSources = []" @use-output="useCutout" />
     </div>
@@ -779,6 +827,7 @@ async function submit() {
               <div v-for="image in data.models" :key="image" class="studio-reference-thumb"><img :src="sourceUrl(image)" :alt="`Shared reference: ${imageName(image)}`" loading="lazy" decoding="async"><button type="button" :aria-label="`Remove shared reference ${imageName(image)}`" @click="data.models = data.models.filter(source => source !== image)"><UIcon name="i-lucide-x" class="size-3" /></button></div>
               <button type="button" class="studio-reference-add" aria-label="Choose shared reference images" @click="openPicker('references')"><UIcon name="i-lucide-plus" class="size-5" /></button>
             </div>
+            <div class="studio-reference-actions"><button type="button" class="studio-people-picker" :disabled="!sharedReferenceAllowance" @click="openPeoplePicker"><UIcon name="i-lucide-contact-round" class="size-4" />People</button></div>
             <p class="studio-help">{{ referenceSummary }}</p>
             <p v-if="!isEdit" class="studio-help">The same references are attached to every input job.</p>
           </div>
@@ -925,6 +974,11 @@ async function submit() {
 .studio-reference-thumb button { position: absolute; top: 3px; right: 3px; border-radius: 50%; background: #000a; padding: 2px; display: grid; place-items: center; cursor: pointer; }
 .studio-reference-add { border-style: dashed; display: grid; place-items: center; color: #aea18e; cursor: pointer; }
 .studio-reference-add:hover { border-color: var(--workspace-accent); color: var(--workspace-accent); }
+.studio-reference-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.studio-people-picker { display: inline-flex; align-items: center; gap: 7px; min-height: 34px; border: 1px solid var(--workspace-border); border-radius: 8px; padding: 6px 11px; color: #d9c5ac; font-size: 11px; cursor: pointer; }
+.studio-people-picker:hover:not(:disabled) { border-color: var(--workspace-accent); color: var(--workspace-accent); }
+.studio-people-picker:focus-visible { outline: 2px solid var(--workspace-accent); outline-offset: 3px; }
+.studio-people-picker:disabled { opacity: .4; cursor: default; }
 .studio-help, .studio-notice { font-size: 11px; line-height: 1.6; color: var(--workspace-muted); margin-top: 8px; }
 .studio-notice { color: #b6a270; }
 .studio-mask-picker { width: 100%; display: flex; align-items: center; gap: 10px; padding: 9px; border: 1px solid var(--workspace-border); border-radius: 8px; color: var(--workspace-muted); font-size: 11px; text-align: left; cursor: pointer; }

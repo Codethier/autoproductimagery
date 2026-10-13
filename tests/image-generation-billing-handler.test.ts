@@ -15,6 +15,7 @@ const key = '__imageGenerationBillingHandlerTest'
 const actor = {organizationId: 'organization-alice', userId: 'alice'}
 const dependency = (path: string) => new URL(path, root).href
 const mocks = new Map([
+  [dependency('server/utils/peopleRepository.ts'), `export const createPeopleRepository = actor => ({requirePerson: async id => {globalThis.${key}.peopleChecks.push({actor,id}); if(globalThis.${key}.personError)throw globalThis.${key}.personError; return {id};}});`],
   [dependency('server/utils/useDB.ts'), `export const useDB = async (_db, actor) => {globalThis.${key}.dbScopes.push(actor); return globalThis.${key}.database};`],
   [dependency('server/utils/useGateway.ts'), `export const useGateway = async storage => {globalThis.${key}.gatewayInitializations.push(storage); return globalThis.${key}.gateway};`],
   [dependency('server/utils/useUserFS.ts'), `export const useUserFS = async actor => {globalThis.${key}.storageScopes.push(actor); return globalThis.${key}.storage};`],
@@ -54,11 +55,12 @@ function setup(expectedOutputs = 1) {
   const settings = createDefaultSettings('openai/gpt-image-2')
   const env: any = {body: {prompt: 'Edit this product', model: 'openai/gpt-image-2', settings: {...settings, numberOfImages: expectedOutputs}, inputImages: ['/images/input/product.png'], modelImages: []},
     dbScopes: [], storageScopes: [], gatewayInitializations: [], rows: new Map<number, any>(), failures: [], completions: [],
-    sourceChecks: [], saves: [], removals: [], gatewayRequests: [], providerCalls: 0, extraPendingCalls: 0, closeCount: 0, outputs: [image()], generatedReferences: [], postedCharges: [],
+    sourceChecks: [], saves: [], removals: [], gatewayRequests: [], providerCalls: 0, extraPendingCalls: 0, closeCount: 0, outputs: [image()], generatedReferences: [], postedCharges: [], peopleChecks: [], pendingData: [],
   }
   let nextId = 1
   function pending(data: any) {
-    const value = {id: nextId++, TextPrompt: data.prompt, status: 'pending', outputImage: '', priceUsd: null, priceSource: null, billingState: 'awaiting', generationModel: data.effectiveModel, ...actor}
+    env.pendingData.push(data)
+    const value = {id: nextId++, TextPrompt: data.prompt, status: 'pending', outputImage: '', priceUsd: null, priceSource: null, billingState: 'awaiting', generationModel: data.effectiveModel, personId: data.personId ?? null, ...actor}
     env.rows.set(value.id, value)
     return value
   }
@@ -130,6 +132,57 @@ test('credit admission preserves 402 and 409 before any paid provider call or ou
     assert.equal(env.rows.size, 0)
     assert.equal(env.closeCount, 1)
   }
+})
+
+test('people factory creates independent jobs with durable profile links and normal exact billing', async () => {
+  const env = setup()
+  const personId = '8687c1db-3ca9-411c-a89b-e4c70c67f632'
+  env.body = {...env.body, inputImages: [], modelImages: ['/images/input/person-reference.png'], personId, personPictureCount: 3}
+  const response = await handler(event())
+  assert.equal(env.providerCalls, 3)
+  assert.equal(env.reservationArguments[1], 3)
+  assert.deepEqual(env.peopleChecks, [{actor, id: personId}])
+  assert.deepEqual(env.sourceChecks, [['/images/input/person-reference.png']])
+  assert.equal(env.pendingData.length, 3)
+  assert.ok(env.pendingData.every((value: any) => value.personId === personId && value.inputImages.length === 0
+    && value.modelImages[0] === '/images/input/person-reference.png'))
+  assert.ok(env.gatewayRequests.every((value: any) => value.inputImages.length === 0 && value.modelImages[0] === '/images/input/person-reference.png'))
+  assert.equal(response.summary.succeeded, 3)
+  assert.ok(response.obj.every((value: any) => value.personId === personId && value.outputImage))
+  assert.equal(env.postedCharges.reduce((sum: bigint, charge: any) => sum + charge.units, 0n), parseUsdUnits('0.090000000001')! * 3n)
+})
+
+test('people ownership and picture bounds reject before pending rows and paid provider calls', async () => {
+  const personId = '8687c1db-3ca9-411c-a89b-e4c70c67f632'
+  for (const changed of [
+    {personId, personPictureCount: 0, inputImages: []}, {personId, personPictureCount: 5, inputImages: []},
+    {personPictureCount: 2, inputImages: []}, {personId, personPictureCount: 2},
+    {personId, personPictureCount: 3, inputImages: [], settings: {...createDefaultSettings('openai/gpt-image-2'), numberOfImages: 2}},
+  ]) {
+    const env = setup()
+    Object.assign(env.body, changed)
+    await assert.rejects(() => handler(event()), (error: any) => error.statusCode === 400)
+    assert.equal(env.providerCalls, 0)
+    assert.equal(env.rows.size, 0)
+  }
+  const env = setup()
+  env.body = {...env.body, inputImages: [], personId, personPictureCount: 2}
+  env.personError = createError({statusCode: 404, statusMessage: 'Person not found'})
+  await assert.rejects(() => handler(event()), (error: any) => error.statusCode === 404)
+  assert.equal(env.providerCalls, 0)
+  assert.equal(env.rows.size, 0)
+  assert.equal(env.gatewayInitializations.length, 0)
+})
+
+test('people factory retains pending unpriced images without exposing their URLs', async () => {
+  const env = setup()
+  env.body = {...env.body, inputImages: [], personId: '8687c1db-3ca9-411c-a89b-e4c70c67f632', personPictureCount: 2}
+  env.outputs = [image(billed('estimate', '0.030000000000'))]
+  const response = await handler(event())
+  assert.equal(env.providerCalls, 2)
+  assert.ok(response.obj.every((value: any) => value.outputImage === null))
+  assert.ok([...env.rows.values()].every((value: any) => value.personId === env.body.personId && value.outputImage))
+  assert.equal(env.postedCharges.length, 0)
 })
 
 test('an error before the provider-start callback releases every pending charge without inventing a billed call', async () => {

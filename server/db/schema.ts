@@ -124,10 +124,35 @@ export const assetShares = pgTable('asset_share', {
     check('asset_share_permission_check', sql`${table.permission} IN ('view', 'edit')`),
 ]);
 
+// People are private reference collections owned by one account. The images
+// remain ordinary managed assets; deleting a profile never deletes media.
+export const people = pgTable('person', {
+    id: uuid('id').primaryKey(),
+    organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+    userId: uuid('user_id').notNull().references(() => users.id),
+    name: text('name').notNull(),
+    description: text('description').default('').notNull(),
+    deletedAt: timestamp('deleted_at', {mode: 'string', withTimezone: true}),
+    createdAt: timestamp('created_at', {mode: 'string', withTimezone: true}).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', {mode: 'string', withTimezone: true}).defaultNow().notNull(),
+}, table => [
+    index('person_owner_idx').on(table.organizationId, table.userId, table.id),
+    check('person_name_check', sql`length(trim(${table.name})) BETWEEN 1 AND 80`),
+    check('person_description_check', sql`length(${table.description}) <= 4000`),
+]);
+export const personPhotos = pgTable('person_photo', {
+    id: uuid('id').primaryKey(),
+    personId: uuid('person_id').notNull().references(() => people.id, {onDelete: 'cascade'}),
+    assetId: uuid('asset_id').notNull().references(() => assets.id, {onDelete: 'cascade'}),
+    excluded: boolean('excluded').default(false).notNull(),
+    createdAt: timestamp('created_at', {mode: 'string', withTimezone: true}).defaultNow().notNull(),
+}, table => [uniqueIndex('person_photo_asset_unique').on(table.personId, table.assetId), index('person_photo_asset_idx').on(table.assetId)]);
+
 export const systemPrompt = pgTable("systemPrompt", {
     id: serial("id").primaryKey(),
     organizationId: uuid('organizationId').references(() => organizations.id),
     userId: uuid('userId').references(() => users.id),
+    personId: uuid('personId').references(() => people.id, {onDelete: 'set null'}),
     TextPrompt: text("TextPrompt").notNull(),
     serverImages: jsonb("serverImages").$type<string[]>(),
     modelImages: jsonb("modelImages").$type<string[]>(),
@@ -155,6 +180,7 @@ export const systemPrompt = pgTable("systemPrompt", {
     errorJson: jsonb("errorJson").$type<StoredGenerationError>(),
 }, (table) => [
     index('systemPrompt_user_history_idx').on(table.organizationId, table.userId, table.createdAt, table.id),
+    index('systemPrompt_person_idx').on(table.personId, table.organizationId, table.userId, table.id),
     index("systemPrompt_batchId_idx").on(table.batchId),
     index("systemPrompt_parentSystemPromptId_idx").on(table.parentSystemPromptId),
     index("systemPrompt_status_updatedAt_idx").on(table.status, table.updatedAt),

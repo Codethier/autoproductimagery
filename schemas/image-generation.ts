@@ -324,8 +324,16 @@ export const ImageGenerationRequestSchema = z.object({
   maskImage: ImagePathSchema.optional(),
   storeInputImages: z.boolean().default(true),
   parentSystemPromptId: z.number().int().positive().optional(),
+  personId: z.string().uuid().optional(),
+  personPictureCount: z.number().int().min(1).max(4).optional(),
   settings: ImageGenerationSettingsSchema,
 }).strict().superRefine((value, context) => {
+  if (value.personPictureCount !== undefined && !value.personId) {
+    context.addIssue({code: 'custom', path: ['personPictureCount'], message: 'A people profile is required for a picture count.'})
+  }
+  if (value.personPictureCount !== undefined && value.inputImages.length) {
+    context.addIssue({code: 'custom', path: ['inputImages'], message: 'People factory picture requests use reference images, without product inputs.'})
+  }
   const profile = IMAGE_MODEL_PROFILES[value.model]
   const expectedKind = profile.settingsKind
   if (value.settings.kind !== expectedKind) {
@@ -366,7 +374,10 @@ export const ImageGenerationRequestSchema = z.object({
   }
 
   const outputsPerJob = generationOutputCount(value.settings)
-  const providerJobs = Math.max(1, value.inputImages.length)
+  const providerJobs = value.personPictureCount ?? Math.max(1, value.inputImages.length)
+  if (value.personId && providerJobs * outputsPerJob > 4) {
+    context.addIssue({code: 'custom', path: ['personPictureCount'], message: 'A people factory request may create at most 4 pictures.'})
+  }
   if (providerJobs * outputsPerJob > 50) {
     context.addIssue({
       code: 'custom',

@@ -4,6 +4,7 @@ const route = useRoute()
 const session = useAccount()
 const accountBalance = useAccountBalance()
 const data = useDataStore()
+const peopleGenerationProgress = usePeopleGenerationProgress()
 const navigationOpen = ref(false)
 const accountOpen = ref(false)
 const signingOut = ref(false)
@@ -11,6 +12,7 @@ provide('workspace-account-identity', session.identity)
 const nav = computed(() => [
   {to: '/edit', label: 'Edit', icon: 'i-lucide-pencil-ruler'},
   {to: '/same-origin-batch', label: 'Same-origin batch', icon: 'i-lucide-copy-plus'},
+  {to: '/people', label: 'People', icon: 'i-lucide-contact-round'},
   {to: '/assets', label: 'Library', icon: 'i-lucide-images'},
   {to: '/shared', label: 'Shared with me', icon: 'i-lucide-users-round'},
   ...(session.isOwner.value ? [{to: '/team', label: 'Team', icon: 'i-lucide-user-round-cog'}] : []),
@@ -18,14 +20,14 @@ const nav = computed(() => [
 const initials = computed(() => (session.account.value?.displayName || session.account.value?.username || '?').split(/\s+/).map(word => word[0]).slice(0, 2).join('').toUpperCase())
 watch(() => route.path, () => { navigationOpen.value = false; accountOpen.value = false })
 let balancePollAttempts = 0
-watch(() => data.pendingGenerations.length, () => { balancePollAttempts = 0; void accountBalance.refresh() })
+watch(() => data.pendingGenerations.length + peopleGenerationProgress.count.value, () => { balancePollAttempts = 0; void accountBalance.refresh() })
 watch(session.epoch, () => { accountOpen.value = false; balancePollAttempts = 0; void accountBalance.refresh() })
 let balanceTimer: ReturnType<typeof setInterval> | undefined
 onServerPrefetch(() => accountBalance.refresh())
 onMounted(() => {
   void accountBalance.refresh()
   balanceTimer = setInterval(() => {
-    if (document.visibilityState === 'visible' && balancePollAttempts < 30 && (data.pendingGenerations.length || accountBalance.balance.value?.outstandingCount)) { balancePollAttempts += 1; void accountBalance.refresh() }
+    if (document.visibilityState === 'visible' && balancePollAttempts < 30 && (data.pendingGenerations.length || peopleGenerationProgress.count.value || accountBalance.balance.value?.outstandingCount)) { balancePollAttempts += 1; void accountBalance.refresh() }
   }, 10_000)
 })
 onBeforeUnmount(() => { if (balanceTimer) clearInterval(balanceTimer) })

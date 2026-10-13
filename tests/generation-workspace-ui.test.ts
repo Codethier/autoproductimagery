@@ -25,7 +25,7 @@ registerHooks({
     if (url === formUrl || (url.startsWith(settingsDirectory) && url.endsWith('.vue'))) {
       const filename = fileURLToPath(url)
       let source = readFileSync(filename, 'utf8')
-      if (url === formUrl) source = source.replace('</script>', 'defineExpose({ submit, uploadFiles, loadMoreHistory, sourceImages, data, pickerKind, confirmPicker, previewOutput, previewResult, recentImages, canSubmit, prompt, pendingGenerations, activeGenerationCount, errorMsg, uploading, displayedHistory, historyOpen, confirmedHistory, backgroundRemovalSources, openBackgroundRemoval, useCutout })\n</script>')
+      if (url === formUrl) source = source.replace('</script>', 'defineExpose({ submit, uploadFiles, loadMoreHistory, sourceImages, data, pickerKind, confirmPicker, previewOutput, previewResult, recentImages, canSubmit, prompt, pendingGenerations, activeGenerationCount, errorMsg, uploading, displayedHistory, historyOpen, confirmedHistory, backgroundRemovalSources, openBackgroundRemoval, useCutout, openPeoplePicker, peoplePickerOpen, peoplePickerSelection, confirmPeople, sharedReferenceAllowance })\n</script>')
       const { descriptor } = parse(source, { filename })
       const compiled = compileScript(descriptor, { id: filename, inlineTemplate: true })
       const nuxtServices = url === formUrl ? `
@@ -102,6 +102,7 @@ function registerUiPrimitives(app: ReturnType<typeof createSSRApp>) {
   app.component('UIcon', { render: () => h('span', { 'aria-hidden': 'true' }) })
   app.component('UModal', { render: () => null })
   app.component('AssetBrowser', { render: () => null })
+  app.component('PeopleBrowser', { render: () => null })
   app.component('BackgroundRemovalPanel', { render: () => null })
   // The parent must not mount result components until their exact prices exist.
   // A marked stub makes that boundary observable independently of the child's
@@ -230,6 +231,102 @@ test('the editor and batch expose local background removal without changing Gate
   assert.match(batch.html, /Remove backgrounds/)
   batch.exposed.openBackgroundRemoval(batch.exposed.sourceImages.value)
   assert.deepEqual(batch.exposed.backgroundRemovalSources.value, ['/images/first.png', '/images/second.png'])
+})
+
+for (const mode of ['edit', 'batch'] as const) {
+  test(`${mode} chooses people portraits as shared references and preserves the source, prompt, settings, and existing references`, async () => {
+    const workspace = await renderWorkspace(mode, {editSource: '/images/product-edit.png', inputImages: ['/images/product-a.png', '/images/product-b.png'], models: ['/images/light-reference.png']})
+    assert.match(workspace.html, /class="studio-people-picker"/)
+    const settings = JSON.stringify(workspace.store.generationSettings)
+    const prompt = workspace.store.composerPrompt
+    workspace.exposed.openPeoplePicker()
+    assert.equal(workspace.exposed.peoplePickerOpen.value, true)
+    assert.deepEqual(workspace.exposed.peoplePickerSelection.value, ['/images/light-reference.png'])
+    assert.notEqual(workspace.exposed.peoplePickerSelection.value, workspace.store.models, 'cancelling a picker must not mutate the composer selection')
+    workspace.exposed.confirmPeople.value(['/images/light-reference.png', '/images/people/nora-front.png', '/images/people/nora-side.png', '/images/people/nora-front.png'])
+    assert.deepEqual(workspace.store.models, ['/images/light-reference.png', '/images/people/nora-front.png', '/images/people/nora-side.png'])
+    assert.equal(workspace.exposed.peoplePickerOpen.value, false)
+    assert.equal(workspace.store.editSource, '/images/product-edit.png')
+    assert.deepEqual(workspace.store.inputImages, ['/images/product-a.png', '/images/product-b.png'])
+    assert.equal(workspace.store.composerPrompt, prompt)
+    assert.equal(JSON.stringify(workspace.store.generationSettings), settings)
+    await workspace.exposed.submit()
+    const body = workspace.requests[0]!.options.body as any
+    assert.deepEqual(body.modelImages, workspace.store.models, 'people photos use the existing validated Gateway reference-image path')
+    assert.deepEqual(body.inputImages, mode === 'edit' ? ['/images/product-edit.png'] : ['/images/product-a.png', '/images/product-b.png'])
+  })
+}
+
+test('people references obey the current model limit including the per-job product source, reject public URLs, and disable models with no allowance', async () => {
+  const limited = Object.values(IMAGE_MODEL_PROFILES).find(profile => profile.maxReferenceImages > 1 && profile.maxReferenceImages < 14)!
+  const workspace = await renderWorkspace('edit', {editSource: '/images/product.png', selectedModel: limited.id, generationSettings: createDefaultSettings(limited.id), models: ['/images/existing.png']})
+  assert.equal(workspace.exposed.sharedReferenceAllowance.value, limited.maxReferenceImages - 1)
+  workspace.exposed.openPeoplePicker()
+  workspace.exposed.confirmPeople.value(Array.from({length: limited.maxReferenceImages}, (_, index) => `/images/people/portrait-${index}.png`))
+  assert.deepEqual(workspace.store.models, ['/images/existing.png'])
+  assert.equal(workspace.exposed.peoplePickerOpen.value, true)
+  assert.match(workspace.exposed.errorMsg.value, /shared reference images/)
+  workspace.exposed.confirmPeople.value(['https://example.com/portrait.png'])
+  assert.deepEqual(workspace.store.models, ['/images/existing.png'])
+  assert.match(workspace.exposed.errorMsg.value, /valid images from People/)
+  workspace.exposed.confirmPeople.value(['/images/people/portrait.png'])
+  assert.deepEqual(workspace.store.models, ['/images/people/portrait.png'])
+
+  const noReferences = Object.values(IMAGE_MODEL_PROFILES).find(profile => profile.maxReferenceImages === 1)!
+  const single = await renderWorkspace('batch', {inputImages: ['/images/product.png'], selectedModel: noReferences.id, generationSettings: createDefaultSettings(noReferences.id)})
+  assert.match(single.html, /class="studio-people-picker" disabled/)
+  single.exposed.openPeoplePicker()
+  assert.equal(single.exposed.peoplePickerOpen.value, false)
+})
+
+test('an old people picker cannot assign portraits after an account switch, including when the new account opens its own picker', async () => {
+  const workspace = await renderWorkspace('edit', {editSource: '/images/alice-product.png', models: ['/images/alice-reference.png']})
+  const previousWindow = (globalThis as any).window
+  const mounted = await mountWorkspace('edit', workspace.environment)
+  try {
+    mounted.exposed.openPeoplePicker()
+    const aliceConfirmation = mounted.exposed.confirmPeople.value
+    workspace.environment.account.epoch.value += 1
+    workspace.environment.account.identity.value = 'org.bob'
+    workspace.store.models = ['/images/bob-reference.png']
+    await nextTick()
+    assert.equal(mounted.exposed.peoplePickerOpen.value, false)
+    assert.deepEqual(mounted.exposed.peoplePickerSelection.value, [])
+    aliceConfirmation(['/images/alice-portrait.png'])
+    assert.deepEqual(workspace.store.models, ['/images/bob-reference.png'])
+    mounted.exposed.openPeoplePicker()
+    aliceConfirmation(['/images/alice-portrait.png'])
+    assert.deepEqual(workspace.store.models, ['/images/bob-reference.png'])
+    assert.equal(mounted.exposed.peoplePickerOpen.value, true)
+    mounted.exposed.confirmPeople.value(['/images/bob-reference.png', '/images/bob-portrait.png'])
+    assert.deepEqual(workspace.store.models, ['/images/bob-reference.png', '/images/bob-portrait.png'])
+  } finally {
+    mounted.app.unmount()
+    ;(globalThis as any).window = previousWindow
+  }
+})
+
+test('cancelling people selection preserves existing references and invalidates the old modal confirmation', async () => {
+  const workspace = await renderWorkspace('edit', {editSource: '/images/product.png', models: ['/images/existing.png']})
+  const previousWindow = (globalThis as any).window
+  const mounted = await mountWorkspace('edit', workspace.environment)
+  try {
+    mounted.exposed.openPeoplePicker()
+    const cancelledConfirmation = mounted.exposed.confirmPeople.value
+    mounted.exposed.peoplePickerSelection.value.push('/images/cancelled-portrait.png')
+    assert.deepEqual(workspace.store.models, ['/images/existing.png'])
+    mounted.exposed.peoplePickerOpen.value = false
+    await nextTick()
+    assert.deepEqual(mounted.exposed.peoplePickerSelection.value, [])
+    mounted.exposed.openPeoplePicker()
+    cancelledConfirmation(['/images/cancelled-portrait.png'])
+    assert.deepEqual(workspace.store.models, ['/images/existing.png'])
+    assert.deepEqual(mounted.exposed.peoplePickerSelection.value, ['/images/existing.png'])
+    assert.equal(mounted.exposed.peoplePickerOpen.value, true)
+  } finally {
+    mounted.app.unmount()
+    ;(globalThis as any).window = previousWindow
+  }
 })
 
 test('the editor withholds generated previews until confirmed billing arrives in account history', async () => {

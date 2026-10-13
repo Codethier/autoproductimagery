@@ -31,6 +31,7 @@ import {assertGeneratedSourcesAvailable} from '~~/server/utils/generatedImageSou
 import {useUserFS} from '~~/server/utils/useUserFS'
 import {extractGatewayErrorBilling} from '~~/server/utils/billingGatewayError'
 import {publicGeneration} from '~~/server/utils/generationVisibility'
+import {createPeopleRepository} from '~~/server/utils/peopleRepository'
 
 type RawBody = Record<string, unknown>
 const MAX_GENERATION_REQUEST_BYTES = 512 * 1024
@@ -79,6 +80,8 @@ function parseRequest(raw: RawBody) {
         maskImage: raw.maskImage,
         storeInputImages: raw.storeInputImages ?? true,
         parentSystemPromptId: raw.parentSystemPromptId,
+        personId: raw.personId,
+        personPictureCount: raw.personPictureCount,
         settings: translateLegacySettings(parsedModel.data, raw),
     }
     const parsed = ImageGenerationRequestSchema.safeParse(candidate)
@@ -183,6 +186,7 @@ export default defineEventHandler(async (event) => {
     )
     const database = await useDB(undefined, account)
     const imageFs = await useUserFS(account)
+    if (request.personId) await createPeopleRepository(account).requirePerson(request.personId)
     // Check every source before reserving capacity, creating pending records,
     // or starting paid provider work. The Gateway also checks each actual read.
     await imageFs.assertReadableImages([
@@ -202,7 +206,7 @@ export default defineEventHandler(async (event) => {
     const expectedOutputs = generationOutputCount(request.settings)
     const sourceImages: Array<string | null> = request.inputImages.length
         ? request.inputImages
-        : [null]
+        : Array.from({length: request.personPictureCount ?? 1}, () => null)
     const generationConfig: StoredGenerationConfig = {
         schemaVersion: 1,
         profileVersion: profile.profileVersion,
@@ -223,6 +227,7 @@ export default defineEventHandler(async (event) => {
             effectiveModel: request.model,
             batchId,
             parentSystemPromptId: request.parentSystemPromptId,
+            personId: request.personId,
             generationConfig,
         }
     }
@@ -303,7 +308,7 @@ export default defineEventHandler(async (event) => {
                 Array.from({length: expectedOutputs}, () => pendingRowData(inputImage)),
             ))
         } catch (error) {
-            if (error && typeof error === 'object' && 'statusCode' in error && [401, 402, 409].includes(Number(error.statusCode))) throw error
+            if (error && typeof error === 'object' && 'statusCode' in error && [400, 401, 402, 404, 409].includes(Number(error.statusCode))) throw error
             throw persistenceDiagnostic(error, `Could not create pending rows for batch ${batchId}`)
         }
         let initialRowIndex = 0
