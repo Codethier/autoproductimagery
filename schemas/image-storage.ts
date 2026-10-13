@@ -36,6 +36,7 @@ export type AssetFile = SelectableFile & {
     folder: string; bytes?: number; modifiedAt?: string; id?: string; kind?: 'file' | 'folder'; itemCount?: number;
     ownerUserId?: string; permissions?: AssetPermissions; source?: AssetSource; sharedBy?: AssetSource;
     category?: 'uploaded' | 'generated' | 'processed'; priceUsd?: string | null; priceSource?: string | null;
+    processingPurpose?: 'pipeline' | 'background-removal' | 'local';
     billingState?: 'pending' | 'awaiting' | 'confirmed' | 'released' | null;
 }
 export type AssetFolder = Pick<AssetFile, 'name' | 'url' | 'id' | 'kind' | 'ownerUserId' | 'permissions' | 'source' | 'sharedBy' | 'itemCount'> & {path: string}

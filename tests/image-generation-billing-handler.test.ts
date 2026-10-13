@@ -40,6 +40,7 @@ registerHooks({
 Object.assign(globalThis, {defineEventHandler, createError, useRuntimeConfig: () => ({}), useAuth: async () => actor,
   readBody: async () => (globalThis as any)[key].body})
 const handler = (await import('../server/api/image-generate.post.ts')).default
+const {runAccountImageGeneration} = await import('../server/utils/imageGenerationService.ts')
 
 function event() {
   const request = new IncomingMessage(new Socket())
@@ -87,10 +88,10 @@ function setup(expectedOutputs = 1) {
     saveGeneratedImage: async (buffer: Buffer, mimeType: string) => {assert.ok(buffer.byteLength > 0); env.saves.push({bytes: buffer.byteLength, mimeType}); return {url: `/images/output/result-${env.saves.length}.png`, mimeType, bytes: buffer.byteLength, width: 640, height: 800}},
     removeGeneratedImage: async (url: string) => {env.removals.push(url)},
   }
-  env.gateway = {generateAnyImage: async (body: any, signal: AbortSignal, onProviderStart?: () => void) => {
+  env.gateway = {generateAnyImage: async (body: any, signal: AbortSignal, onProviderStart?: () => void | Promise<void>) => {
     env.gatewayRequests.push(body); assert.equal(signal.aborted, false)
     if (env.preCallError) throw env.preCallError
-    onProviderStart?.(); env.providerCalls += 1
+    await onProviderStart?.(); env.providerCalls += 1
     if (env.paidError) throw env.paidError
     const generated = env.outputs.map((output: any) => ({...output}))
     env.generatedReferences.push(...generated)
@@ -289,4 +290,43 @@ test('an infrastructure repair retry preserves the paid allocation while leaving
     assert.ok(env.generatedReferences.every((output: any) => output.buffer.byteLength === 0))
     assert.equal(env.closeCount, 1)
   } finally {console.error = previousError}
+})
+
+
+test('shared account generation awaits a durable provider fence after linked pending rows and before a provider call', async () => {
+  const env = setup(2)
+  const stepId = '0a7855c9-415a-462b-bf06-5dba8bba9360'
+  let releaseFence!: () => void
+  let enteredFence!: () => void
+  const entered = new Promise<void>(resolve => {enteredFence = resolve})
+  const fence = new Promise<void>(resolve => {releaseFence = resolve})
+  const work = runAccountImageGeneration(actor as any, env.body, {pipelineStepId: stepId, beforeProviderCall: async context => {
+    assert.equal(env.rows.size, 2)
+    assert.deepEqual(context.generationIds, [1, 2])
+    assert.equal(context.inputImage, env.body.inputImages[0])
+    assert.equal(context.signal.aborted, false)
+    assert.ok(env.pendingData.every((value: any) => value.pipelineStepId === stepId && value.batchId === context.batchId))
+    enteredFence()
+    await fence
+  }})
+  await entered
+  assert.equal(env.providerCalls, 0)
+  assert.equal(env.saves.length, 0)
+  releaseFence()
+  const response = await work
+  assert.equal(env.providerCalls, 1)
+  assert.equal(response.summary.succeeded, 1)
+  assert.equal(env.closeCount, 1)
+})
+
+test('a failed durable provider fence releases pending charges without starting or storing a paid output', async () => {
+  const env = setup(2)
+  const response = await runAccountImageGeneration(actor as any, env.body, {beforeProviderCall: async () => {
+    throw createError({statusCode: 409, statusMessage: 'The pipeline attempt no longer owns its claim'})
+  }})
+  assert.equal(response.summary.failed, 2)
+  assert.equal(env.providerCalls, 0)
+  assert.equal(env.saves.length, 0)
+  assert.equal(env.closeCount, 1)
+  assert.ok(env.failures.every((value: any) => value.data.releaseCharge === true))
 })

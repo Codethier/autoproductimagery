@@ -4,6 +4,7 @@ import {z} from 'zod'
 import {
     IMAGE_MODEL_PROFILES,
     ImageGenerationRequestSchema,
+    ImagePathSchema,
     isOpenAiImageSettings,
     isGeminiImageSettings,
     getImageModelProfile,
@@ -102,7 +103,21 @@ export type GeneratedImage = {
     grounding?: NonNullable<OutputMetadata['grounding']>
 }
 
-export type ProviderCallStarted = () => void
+export type ProviderCallStarted = () => void | Promise<void>
+
+// Utility nodes do not expand the curated image-generator catalogue. This
+// exact language model accepts text and validated images and returns text.
+export const PIPELINE_TEXT_MODEL_ID = 'google/gemini-2.5-flash' as const
+const PipelineTextRequestSchema = z.object({
+    model: z.literal(PIPELINE_TEXT_MODEL_ID),
+    prompt: z.string().trim().min(1).max(20_000),
+    system: z.string().trim().min(1).max(20_000).optional(),
+    imageUrls: z.array(ImagePathSchema).max(8).default([]),
+    maxOutputTokens: z.number().int().min(64).max(4096).default(1024),
+    temperature: z.number().min(0).max(2).default(0.5),
+}).strict()
+export type PipelineTextRequest = z.input<typeof PipelineTextRequestSchema>
+export type PipelineGeneratedText = {text: string; billing: ImageGenerationBilling; warnings: string[]}
 
 const googleSearchInputSchema = z.object({}).strict()
 type GoogleSearchArgs = {
@@ -163,6 +178,8 @@ function redactString(value: string): string {
         .replace(/Bearer\s+[^\s,;]+/gi, 'Bearer [REDACTED]')
         .replace(/([?&](?:key|api_key|apiKey|token)=)[^&\s]+/gi, '$1[REDACTED]')
         .replace(/data:[^;,\s]+;base64,[A-Za-z0-9+/=]+/gi, '[REDACTED_DATA_URL]')
+        .replace(/[A-Za-z]:\\[^\r\n"'<>]*/g, '[REDACTED_INTERNAL_PATH]')
+        .replace(/\/(?:Users|home|var|tmp|app|workspace|data)\/[^\r\n"'<>]*/g, '[REDACTED_INTERNAL_PATH]')
     return redacted.length > 8_000 ? `${redacted.slice(0, 8_000)}...[truncated]` : redacted
 }
 
@@ -920,7 +937,8 @@ export async function useGateway(imageStorage?: GenerationImageStorage) {
         let response: Awaited<ReturnType<typeof callGateway>>
         await assertSourcesStillReadable(request, abortSignal)
         try {
-            onProviderStart?.()
+            await onProviderStart?.()
+            abortSignal.throwIfAborted()
             response = await callGateway()
         } catch (error) {
             if (requestAbortSignal?.aborted) throw requestAbortSignal.reason
@@ -1035,7 +1053,8 @@ export async function useGateway(imageStorage?: GenerationImageStorage) {
         let response: Awaited<ReturnType<typeof aiGenerateImage>>
         await assertSourcesStillReadable(request, abortSignal)
         try {
-            onProviderStart?.()
+            await onProviderStart?.()
+            abortSignal.throwIfAborted()
             response = await aiGenerateImage({
                 model: trackedModel,
                 maxRetries: 0,
@@ -1086,6 +1105,72 @@ export async function useGateway(imageStorage?: GenerationImageStorage) {
             : generateImageViaImageModel(request, requestAbortSignal, onProviderStart)
     }
 
+    /** Awaited by a leased, account-billed pipeline step. No tools or public URLs. */
+    async function generatePipelineText(opts: PipelineTextRequest, requestAbortSignal?: AbortSignal, onProviderStart?: ProviderCallStarted): Promise<PipelineGeneratedText> {
+        requestAbortSignal?.throwIfAborted()
+        const parsed = PipelineTextRequestSchema.safeParse(opts)
+        if (!parsed.success) {
+            throw createError({statusCode: 400, statusMessage: 'Invalid pipeline text generation settings'})
+        }
+        const request = parsed.data
+        const files: Array<{buffer: Buffer; mediaType: string}> = []
+        let totalBytes = 0
+        for (const url of request.imageUrls) {
+            requestAbortSignal?.throwIfAborted()
+            const image = await fs.getImageFile(url)
+            requestAbortSignal?.throwIfAborted()
+            if (!['image/png', 'image/jpeg', 'image/webp'].includes(image.mimeType)) {
+                throw createError({statusCode: 415, statusMessage: 'Pipeline text nodes accept PNG, JPEG, and WebP images'})
+            }
+            totalBytes += image.buffer.byteLength
+            if (totalBytes > 100 * 1024 * 1024) {
+                throw createError({statusCode: 413, statusMessage: 'Pipeline reference images may total at most 100 MB'})
+            }
+            files.push({buffer: image.buffer, mediaType: image.mimeType})
+        }
+        const timeoutMs = getImageGenerationTimeoutMs()
+        const abortSignal = requestAbortSignal
+            ? AbortSignal.any([requestAbortSignal, AbortSignal.timeout(timeoutMs)])
+            : AbortSignal.timeout(timeoutMs)
+        abortSignal.throwIfAborted()
+        if (request.imageUrls.length) await fs.assertReadableImages?.([...new Set(request.imageUrls)])
+        abortSignal.throwIfAborted()
+        const callGateway = () => generateText({
+            model: gateway.languageModel(PIPELINE_TEXT_MODEL_ID),
+            maxRetries: 0,
+            abortSignal,
+            timeout: {totalMs: timeoutMs},
+            maxOutputTokens: request.maxOutputTokens,
+            temperature: request.temperature,
+            ...(request.system ? {system: request.system} : {}),
+            providerOptions: {google: {thinkingConfig: {thinkingBudget: 0}, responseModalities: ['TEXT']}},
+            ...(files.length ? {messages: [{role: 'user' as const, content: [
+                {type: 'text' as const, text: request.prompt},
+                ...files.map(file => ({type: 'file' as const, data: file.buffer, mediaType: file.mediaType})),
+            ]}]} : {prompt: request.prompt}),
+        })
+        let response: Awaited<ReturnType<typeof callGateway>>
+        try {
+            await onProviderStart?.()
+            abortSignal.throwIfAborted()
+            response = await callGateway()
+        } catch (error) {
+            if (requestAbortSignal?.aborted) throw requestAbortSignal.reason
+            if (abortSignal.aborted || isTimeoutLikeError(error)) throwGatewayTimeout('Gateway pipeline text request', timeoutMs, error)
+            throwGatewayError('Gateway pipeline text request failed', error)
+        } finally {
+            // Stop retaining references when the provider has consumed its input.
+            for (const file of files) file.buffer = Buffer.alloc(0)
+        }
+        const billing = await buildBilling(PIPELINE_TEXT_MODEL_ID, response.totalUsage, response.providerMetadata, 0)
+        const text = response.text.trim()
+        if (!text || text.length > 20_000 || response.files.length) {
+            throwGatewayError('Gateway pipeline text request returned an invalid result',
+                createError({statusCode: 502, statusMessage: 'The text model did not return a bounded text result'}), billing)
+        }
+        return {text, billing, warnings: formatWarnings(response.warnings)}
+    }
+
     return {
         gateway,
         listModels,
@@ -1095,5 +1180,6 @@ export async function useGateway(imageStorage?: GenerationImageStorage) {
         generateImageViaLanguageModel,
         generateImageViaImageModel,
         generateAnyImage,
+        generatePipelineText,
     }
 }

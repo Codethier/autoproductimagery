@@ -18,11 +18,19 @@ const integration = {skip: !process.env.TEST_DATABASE_URL, timeout: 60_000}
 const status = (code: number) => (error: unknown) => Boolean(error && typeof error === 'object' && 'statusCode' in error && error.statusCode === code)
 const actor = (organizationId: string, username: string, role: 'owner' | 'user' = 'user'): AssetActor => ({organizationId, userId: randomUUID(), username, displayName: username, role})
 type Database = ReturnType<typeof drizzle>
-async function fixture(work: (f: {db: Database; alice: AssetActor; bob: AssetActor; owner: AssetActor; outsider: AssetActor; queries: string[]}) => Promise<void>) {
+async function fixture(work: (f: {db: Database; alice: AssetActor; bob: AssetActor; owner: AssetActor; outsider: AssetActor; queries: string[]; setQueryHook(hook: ((query: string) => Promise<void>) | undefined): void}) => Promise<void>) {
     const connectionString = process.env.TEST_DATABASE_URL!
     const schema = `imagery_people_${randomUUID().replaceAll('-', '')}`
     const administrator = new Pool({connectionString, max: 1})
     const pool = new Pool({...getDatabasePoolConfig({DATABASE_URL: connectionString}), options: `-c search_path=${schema} -c timezone=UTC`})
+    let queryHook: ((query: string) => Promise<void>) | undefined
+    pool.on('connect', connection => {
+        connection.query = new Proxy(connection.query, {apply(target, thisArg, args) {
+            const text = typeof args[0] === 'string' ? args[0] : args[0]?.text
+            const wait = typeof text === 'string' ? queryHook?.(text) : undefined
+            return wait ? wait.then(() => Reflect.apply(target, thisArg, args)) : Reflect.apply(target, thisArg, args)
+        }})
+    })
     try {
         await administrator.query(`CREATE SCHEMA "${schema}"`)
         const queries: string[] = []
@@ -33,7 +41,7 @@ async function fixture(work: (f: {db: Database; alice: AssetActor; bob: AssetAct
         const alice = actor(org, 'alice'), bob = actor(org, 'bob'), owner = actor(org, 'owner', 'owner'), outsider = actor(other, 'outsider', 'owner')
         await db.insert(users).values([alice, bob, owner, outsider].map(a => ({id: a.userId, organizationId: a.organizationId,
             username: a.username, normalizedUsername: a.username, displayName: a.displayName, passwordHash: 'unused-local-test-hash', role: a.role})))
-        await work({db, alice, bob, owner, outsider, queries})
+        await work({db, alice, bob, owner, outsider, queries, setQueryHook: hook => {queryHook = hook}})
     } finally {
         await pool.end()
         await administrator.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`)
@@ -372,10 +380,28 @@ test('shared people source grouping and cursors stay recipient/scope/source boun
     await assert.rejects(() => createPeopleRepository(f.owner, f.db).list({scope: 'shared', sourceId: f.alice.userId, cursor: page.nextCursor!}), status(400))
 }))
 
-test('reciprocal people sharing completes without taking recipient account locks', integration, async () => fixture(async f => {
+test('reciprocal people shares overlap account/profile locks and foreign-key insertion without deadlocking', integration, async () => fixture(async f => {
     const alice = createPeopleRepository(f.alice, f.db), bob = createPeopleRepository(f.bob, f.db)
     const first = (await alice.create({name: 'Ada'})).person, second = (await bob.create({name: 'Bea'})).person
-    const result = await Promise.all([alice.share(first.id, {recipientUserId: f.bob.userId}), bob.share(second.id, {recipientUserId: f.alice.userId})])
+    let insertsWaiting = 0, release!: () => void
+    const bothReady = new Promise<void>(resolve => {release = resolve})
+    const queryStart = f.queries.length
+    // Pause both transactions immediately before their FK-checked INSERT.
+    // Each already holds its account/profile locks, so the old UPDATE-owner
+    // strategy deterministically creates the reciprocal KEY SHARE deadlock.
+    f.setQueryHook(async query => {
+        if (!query.startsWith('insert into "person_share"')) return
+        insertsWaiting++
+        if (insertsWaiting === 2) release()
+        await bothReady
+    })
+    let result: Awaited<ReturnType<typeof alice.share>>[]
+    try {result = await Promise.all([alice.share(first.id, {recipientUserId: f.bob.userId}), bob.share(second.id, {recipientUserId: f.alice.userId})])}
+    finally {f.setQueryHook(undefined)}
+    assert.equal(insertsWaiting, 2)
+    const shareQueries = f.queries.slice(queryStart)
+    assert.ok(shareQueries.some(query => query.includes('from "app_user"') && query.includes('order by "app_user"."id"') && query.includes('for share')))
+    assert.ok(!shareQueries.some(query => query.includes('from "app_user"') && query.includes('for update')))
     assert.equal(result[0]!.shares.length, 1)
     assert.equal(result[1]!.shares.length, 1)
     assert.equal((await alice.list({scope: 'shared'})).people[0]!.id, second.id)

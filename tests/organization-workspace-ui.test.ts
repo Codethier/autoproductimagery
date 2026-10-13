@@ -28,7 +28,7 @@ registerHooks({
     if (url !== browserUrl && url !== legacyFilesUrl && url !== layoutUrl && url !== balanceUrl && url !== teamUrl) return nextLoad(url, context)
     const filename = fileURLToPath(url)
     let source = readFileSync(filename, 'utf8')
-    if (url === browserUrl) source = source.replace('</script>', 'defineExpose({files, directories, rootFolders, loading, openSharing, shareTarget, shareRecipient, saveShare, revokeShare, grants, currentFolder, preview, selection, selectedMetadata, confirmSelection, fetchPage, view, backgroundRemovalSources, openBackgroundRemoval})\n</script>')
+    if (url === browserUrl) source = source.replace('</script>', 'defineExpose({files, directories, rootFolders, loading, openSharing, shareTarget, shareRecipient, saveShare, revokeShare, grants, currentFolder, preview, selection, selectedMetadata, confirmSelection, fetchPage, view, backgroundRemovalSources, openBackgroundRemoval, choose, selectionLimit})\n</script>')
     if (url === legacyFilesUrl) source = source.replace('import {useDataStore} from "~/stores/data.store";', '')
     if (url === teamUrl) source = source.replace('</script>', 'defineExpose({openBalance, saveBalance, balanceForm, balanceDetails, balanceError})\n</script>')
     const {descriptor} = parse(source, {filename})
@@ -57,7 +57,7 @@ function fixtureFile(name: string, sourceId: string, permission: 'owner' | 'edit
     permissions: {view: true, edit: permission !== 'view', share: permission === 'owner'}, kind: 'file', source: {userId: sourceId, username: sourceId, displayName: sourceId === 'alice' ? 'Alice' : 'Bea'},
     ...(permission !== 'owner' ? {sharedBy: {userId: sourceId, username: sourceId, displayName: sourceId === 'alice' ? 'Alice' : 'Bea'}} : {})}
 }
-async function renderBrowser(options: {shared?: boolean; files?: AssetFile[]; dirs?: AssetFolder[]; rootFolders?: AssetFolder[]; actorId?: string; currentFolder?: AssetFolder; selected?: boolean; preview?: boolean; sharing?: boolean} = {}) {
+async function renderBrowser(options: {shared?: boolean; files?: AssetFile[]; dirs?: AssetFolder[]; rootFolders?: AssetFolder[]; actorId?: string; currentFolder?: AssetFolder; selected?: boolean; preview?: boolean; sharing?: boolean; pickerLimit?: number; pickerCap?: number} = {}) {
   const calls: Array<{url: string; options: any}> = []
   const session = {account: ref({userId: options.actorId ?? 'member', organizationId: 'org', displayName: 'Member', username: 'member', role: 'user', organizationName: 'Studio'}), epoch: ref(0), identity: ref('org.member'), isOwner: ref(false)}
   const environment: any = {session, exposed: undefined, fetch: async (url: string, options: any) => {
@@ -73,7 +73,7 @@ async function renderBrowser(options: {shared?: boolean; files?: AssetFile[]; di
       environment.exposed = value; value.files.value = options.files ?? []; value.directories.value = options.dirs ?? []; value.rootFolders.value = options.rootFolders ?? []; value.loading.value = false; if (options.currentFolder) value.currentFolder.value = options.currentFolder; if (options.selected) {value.selection.value = options.files?.map(file => file.url) ?? []; for (const file of options.files ?? []) value.selectedMetadata.value.set(file.url, file)}; if (options.preview) value.preview.value = options.files?.[0]; if (options.sharing) {value.shareTarget.value = options.files?.[0]; value.grants.value = [{id: 'legacy-grant', recipientUserId: 'recipient', permission: 'edit', username: 'cora', displayName: 'Cora', createdAt: '2026-10-12T00:00:00.000Z'}]}; context.expose(value)
     }})
   }}
-  const app = createSSRApp({render: () => h(component, {initialScope: options.shared ? 'shared' : 'all', sharedOnly: options.shared})})
+  const app = createSSRApp({render: () => h(component, {initialScope: options.shared ? 'shared' : 'all', sharedOnly: options.shared, ...(options.pickerLimit !== undefined ? {selectionMode: 'multiple', maxSelection: options.pickerLimit, selectionCap: options.pickerCap} : {})})})
   app.component('UIcon', {render: () => h('span', {'aria-hidden': 'true'})})
   app.component('BackgroundRemovalPanel', {render: () => null})
   app.component('NuxtLink', {props: ['to'], setup: (props: any, {slots}: any) => () => h('a', {href: typeof props.to === 'string' ? props.to : props.to.path}, slots.default?.())})
@@ -238,12 +238,29 @@ test('library previews and selected shared images offer cutouts while the source
 })
 
 test('completed local cutouts use normal library previews with their separate zero provider charge', async () => {
-  const cutout: AssetFile = {...fixtureFile('product-cutout.png', 'alice', 'owner'), category: 'processed', priceUsd: '0', priceSource: 'local-processing'}
+  const cutout: AssetFile = {...fixtureFile('product-cutout.png', 'alice', 'owner'), category: 'processed', processingPurpose: 'background-removal', priceUsd: '0', priceSource: 'local-processing'}
   const browser = await renderBrowser({files: [cutout], actorId: 'alice', preview: true})
   assert.match(browser.html, /\$0 provider charge · background removal/)
   assert.equal(browser.html.includes(`src="/api/data${cutout.url}?preview=480"`), true)
   assert.equal(browser.html.includes(`href="/api/data${cutout.url}"`), true)
   assert.doesNotMatch(browser.html, /Confirming price|estimate/)
+})
+test('pipeline images use a pipeline-processing label in library cards and original previews', async () => {
+  const processed: AssetFile = {...fixtureFile('Crop.png', 'alice', 'owner'), category: 'processed', processingPurpose: 'pipeline', priceUsd: '0', priceSource: 'local-processing'}
+  const browser = await renderBrowser({files: [processed], actorId: 'alice', preview: true})
+  assert.equal((browser.html.match(/\$0 provider charge · pipeline processing/g) ?? []).length, 2)
+  assert.doesNotMatch(browser.html, /\$0 provider charge · background removal/)
+  const generic = await renderBrowser({files: [{...processed, processingPurpose: 'local'}], actorId: 'alice'})
+  assert.match(generic.html, /\$0 provider charge · local processing/)
+})
+test('the Library pipeline picker accepts fifty existing images and refuses a fifty-first', async () => {
+  const files = Array.from({length: 51}, (_, index) => fixtureFile(`product-${index}.png`, 'alice', 'owner'))
+  const browser = await renderBrowser({files, actorId: 'alice', pickerLimit: 50, pickerCap: 50})
+  for (const file of files) browser.exposed.choose(file)
+  assert.equal(browser.exposed.selectionLimit.value, 50)
+  assert.equal(browser.exposed.selection.value.length, 50)
+  const normal = await renderBrowser({files, actorId: 'alice', pickerLimit: 50})
+  assert.equal(normal.exposed.selectionLimit.value, 20)
 })
 
 test('balance summary separates available credit, outstanding estimates and exact confirmed charges', async () => {

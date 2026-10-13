@@ -118,6 +118,27 @@ test('sharing requests default to view and reject edit or other permissions', ()
         assert.equal(ShareAssetSchema.safeParse({recipientUserId, permission}).success, false)
     }
 })
+test('processed asset DTOs distinguish pipeline destinations from cutouts for owners and shared recipients', integration, async () => fixture(async f => {
+    const aliceFS = await useUserFS(f.alice, f.storage, f.db), bobFS = await useUserFS(f.bob, f.storage, f.db)
+    const original = await aliceFS.saveUpload('/', upload(f.bytes))
+    const source = {id: original.id!, url: original.url}
+    const cutout = await aliceFS.prepareProcessedImage(f.bytes)
+    const cutoutRow = await f.db.transaction(tx => cutout.register(tx, source))
+    const crop = await aliceFS.prepareProcessedImage(f.bytes, {purpose: 'pipeline', name: 'Crop.png'})
+    const cropRow = await f.db.transaction(tx => crop.register(tx, source))
+    const files = await aliceFS.resolveAssets([cutoutRow.outputUrl, cropRow.outputUrl, original.url])
+    assert.equal(files.find(file => file.url === cutoutRow.outputUrl)?.processingPurpose, 'background-removal')
+    assert.equal(files.find(file => file.url === cropRow.outputUrl)?.processingPurpose, 'pipeline')
+    assert.equal(files.find(file => file.url === original.url)?.processingPurpose, undefined)
+    for (const file of files.filter(file => file.category === 'processed')) {
+        assert.equal(file.priceUsd, '0'); assert.equal(file.priceSource, 'local-processing')
+    }
+    await aliceFS.share(cropRow.outputAssetId, f.bob.userId, 'view')
+    const [shared] = await bobFS.resolveAssets([cropRow.outputUrl])
+    assert.equal(shared?.processingPurpose, 'pipeline')
+    assert.equal(shared?.permissions?.edit, false)
+    assert.equal(shared?.sharedBy?.userId, f.alice.userId)
+}))
 
 test('each user has an immutable private namespace; organization owners cannot read others private assets', integration, async () => fixture(async f => {
     const aliceFS = await useUserFS(f.alice, f.storage, f.db), bobFS = await useUserFS(f.bob, f.storage, f.db)

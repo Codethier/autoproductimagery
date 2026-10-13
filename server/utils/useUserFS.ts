@@ -13,7 +13,9 @@ import {imageDeliveryEtag, imageDeliveryRevision, matchesImageEtag, IMAGE_PREVIE
 import {MAX_IMAGE_PIXELS} from './imageValidation'
 import {and, asc, eq, inArray, isNull, sql} from 'drizzle-orm'
 import {assets, assetShares, users} from '../db/schema'
-import type {BackgroundRemovalTransaction} from './backgroundRemovalJobs'
+
+export type ProcessedImageTransaction = Parameters<Parameters<ReturnType<typeof getDatabase>['transaction']>[0]>[0]
+export type ProcessedImageOptions = {purpose?: 'cutout' | 'pipeline'; name?: string; mimeType?: 'image/png' | 'image/jpeg' | 'image/webp'}
 
 type RawStorage = Awaited<ReturnType<typeof useFS>>
 // One warm-instance cache per storage backend; no disk dependency or cross-backend key collisions.
@@ -157,14 +159,30 @@ export async function useUserFS(actor: AssetActor, storage?: RawStorage, databas
             throw error
         }
     }
-    /** Stage one immutable cutout. Its registry row is published only with a successful job. */
-    async function prepareProcessedImage(data: Buffer) {
-        await ensureRawFolders([...ownParts, 'cutouts'])
-        const output = await raw.saveGeneratedImage(data, 'image/png', {organizationId: actor.organizationId, userId: actor.userId})
+    /** Stage one immutable local output. Register it only with the successful processing step. */
+    async function prepareProcessedImage(data: Buffer, options: ProcessedImageOptions = {}) {
+        const pipeline = options.purpose === 'pipeline'
+        const folderSegment = pipeline ? 'pipeline-results' : 'cutouts'
+        const folderName = pipeline ? 'Pipeline results' : 'Cutouts'
+        if (options.purpose !== undefined && !['cutout', 'pipeline'].includes(options.purpose)) {
+            throw createError({statusCode: 400, statusMessage: 'Invalid processed image destination'})
+        }
+        const requestedName = options.name?.trim()
+        if (requestedName !== undefined && (!requestedName || requestedName.length > 180 || /[\u0000-\u001f\u007f/\\]/.test(requestedName))) {
+            throw createError({statusCode: 400, statusMessage: 'Invalid processed image name'})
+        }
+        await ensureRawFolders([...ownParts, folderSegment])
+        const output = await raw.saveGeneratedImage(data, options.mimeType ?? 'image/png', {organizationId: actor.organizationId, userId: actor.userId})
+        const permittedTypes = pipeline ? ['image/png', 'image/jpeg', 'image/webp'] : ['image/png']
+        if (!permittedTypes.includes(output.mimeType) || (options.mimeType !== undefined && options.mimeType !== output.mimeType)) {
+            await raw.removeGeneratedImage(output.url).catch(() => undefined)
+            throw createError({statusCode: 415, statusMessage: 'Invalid processed image format'})
+        }
+        const outputExtension = parseImagePath(output.url).at(-1)!.split('.').at(-1)!
         return {
             ...output,
             discard: () => raw.removeGeneratedImage(output.url),
-            register: async (tx: BackgroundRemovalTransaction, source: {id: string; url: string}) => {
+            register: async (tx: ProcessedImageTransaction, source: {id: string; url: string}) => {
                 // Serialize with owner subtree deletion and repeat authorization after inference.
                 await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${actor.organizationId + ':' + actor.userId}, 0))`)
                 const fresh = createAssetRepository(actor, tx as unknown as typeof database)
@@ -185,22 +203,22 @@ export async function useUserFS(actor: AssetActor, storage?: RawStorage, databas
                 if (!enabled) throw createError({statusCode: 401, statusMessage: 'Unauthorized'})
                 const original = await fresh.requireAsset(source.url)
                 if (original.row.id !== source.id || original.row.kind !== 'file') throw createError({statusCode: 404, statusMessage: 'Image not found'})
-                const folderUrl = imagePathToUrl([...ownParts, 'cutouts'])
+                const folderUrl = imagePathToUrl([...ownParts, folderSegment])
                 let [folder] = await tx.select().from(assets).where(and(eq(assets.url, folderUrl),
                     eq(assets.organizationId, actor.organizationId), isNull(assets.deletedAt))).limit(1)
                 if (folder && (folder.kind !== 'folder' || folder.ownerUserId !== actor.userId || folder.category !== 'processed')) {
-                    throw createError({statusCode: 409, statusMessage: 'Cutout folder is unavailable'})
+                    throw createError({statusCode: 409, statusMessage: `${folderName} folder is unavailable`})
                 }
                 if (!folder) {
                     ;[folder] = await tx.insert(assets).values({id: randomUUID(), organizationId: actor.organizationId,
                         ownerUserId: actor.userId, createdByUserId: actor.userId, parentId: null,
-                        url: folderUrl, name: 'Cutouts', kind: 'folder', category: 'processed'}).returning()
+                        url: folderUrl, name: folderName, kind: 'folder', category: 'processed'}).returning()
                 }
-                if (!folder) throw new Error('Could not register cutout folder')
+                if (!folder) throw new Error('Could not register processed image folder')
                 const id = randomUUID()
                 await tx.insert(assets).values({id, organizationId: actor.organizationId, ownerUserId: actor.userId,
                     createdByUserId: actor.userId, parentId: folder.id, url: output.url,
-                    name: `Cutout · ${original.row.name.replace(/\.[^.]+$/, '')}.png`, kind: 'file', category: 'processed',
+                    name: requestedName ?? `${pipeline ? 'Pipeline' : 'Cutout'} · ${original.row.name.replace(/\.[^.]+$/, '')}.${outputExtension}`, kind: 'file', category: 'processed',
                     byteSize: output.bytes, mimeType: output.mimeType, width: output.width, height: output.height})
                 return {outputAssetId: id, outputUrl: output.url}
             },
@@ -258,6 +276,7 @@ export async function useUserFS(actor: AssetActor, storage?: RawStorage, databas
         fileExists: safe(async (url: string) => {await assertReadableImages([url]); return raw.fileExists(url)}),
         shareTargets: safe(repository.shareTargets), sharesFor: safe(repository.sharesFor),
         share: safe(repository.share), revoke: safe(repository.revoke), assetByUrl: safe(async (url: string) => repository.dto((await repository.requireAsset(url)).row)),
+        ownedImageMetadata: safe(repository.ownedImageMetadata),
         resolveAssets: safe(async (urls: string[]) => {
             if (urls.length > 200) throw createError({statusCode: 400, statusMessage: 'Too many image sources'})
             const result: AssetFile[] = []

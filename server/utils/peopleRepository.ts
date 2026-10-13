@@ -31,15 +31,15 @@ const matchingGeneration = (actor: Actor) => and(eq(systemPrompt.organizationId,
 const visibleGeneration = (actor: Actor) => and(matchingGeneration(actor), confirmedGenerationPriceCondition(), isNull(systemPrompt.outputImageDeletedAt),
     sql`(${systemPrompt.status} = 'succeeded' OR (${systemPrompt.status} IS NULL AND ${systemPrompt.errors} IS NULL))`)
 
-async function activeActor(tx: PeopleTransaction, actor: Actor) {
+async function activeActor(tx: PeopleTransaction, actor: Actor, accountLock: 'update' | 'share' = 'update') {
     const [row] = await tx.select({id: users.id, authVersion: users.authVersion}).from(users)
-        .where(and(eq(users.id, actor.userId), eq(users.organizationId, actor.organizationId), isNull(users.disabledAt))).for('update').limit(1)
+        .where(and(eq(users.id, actor.userId), eq(users.organizationId, actor.organizationId), isNull(users.disabledAt))).for(accountLock).limit(1)
     if (!row || actor.authVersion !== undefined && actor.authVersion !== row.authVersion) throw createError({statusCode: 401, statusMessage: 'Unauthorized'})
 }
 /** Hold this lock through pending-row admission so profile deletion cannot
  * race the ownership check or leave paid work linked to another account. */
-export async function lockOwnedPerson(tx: PeopleTransaction, actor: Actor, id: string) {
-    await activeActor(tx, actor)
+export async function lockOwnedPerson(tx: PeopleTransaction, actor: Actor, id: string, accountLock: 'update' | 'share' = 'update') {
+    await activeActor(tx, actor, accountLock)
     const [person] = await tx.select().from(people).where(and(eq(people.id, validAssetId(id)), scope(actor))).for('update').limit(1)
     return person ?? notFound()
 }
@@ -258,12 +258,15 @@ export function createPeopleRepository(actor: AssetActor & {authVersion?: number
         const parsed = SharePersonSchema.safeParse(input)
         if (!parsed.success) throw createError({statusCode: 400, statusMessage: 'Select a valid organization member'})
         await db.transaction(async tx => {
-            await lockOwnedPerson(tx, actor, id)
-            // A recipient availability read needs no user lock. All profile
-            // mutations hold the owner then profile locks; reciprocal shares
-            // must not try to acquire each other's account lock afterward.
-            const [recipient] = await tx.select({id: users.id}).from(users).where(and(eq(users.id, parsed.data.recipientUserId),
-                eq(users.organizationId, actor.organizationId), ne(users.id, actor.userId), isNull(users.disabledAt))).limit(1)
+            // Inserting a share also takes recipient FK KEY SHARE locks.
+            // Compatible account SHARE locks, acquired in UUID order before
+            // the profile lock, avoid reciprocal owner/recipient deadlocks
+            // while still serializing account disablement and version changes.
+            const accounts = await tx.select({id: users.id}).from(users).where(and(eq(users.organizationId, actor.organizationId),
+                inArray(users.id, [...new Set([actor.userId, parsed.data.recipientUserId])]), isNull(users.disabledAt)))
+                .orderBy(asc(users.id)).for('share')
+            await lockOwnedPerson(tx, actor, id, 'share')
+            const recipient = accounts.find(user => user.id === parsed.data.recipientUserId && user.id !== actor.userId)
             if (!recipient) throw createError({statusCode: 404, statusMessage: 'Organization member not found'})
             const [total] = await tx.select({value: count()}).from(personShares).where(eq(personShares.personId, id))
             const [existing] = await tx.select({id: personShares.id}).from(personShares)
@@ -277,7 +280,7 @@ export function createPeopleRepository(actor: AssetActor & {authVersion?: number
     async function revoke(id: string, recipientUserId: string) {
         validAssetId(recipientUserId)
         await db.transaction(async tx => {
-            await lockOwnedPerson(tx, actor, id)
+            await lockOwnedPerson(tx, actor, id, 'share')
             await tx.delete(personShares).where(and(eq(personShares.personId, id), eq(personShares.organizationId, actor.organizationId),
                 eq(personShares.sharedByUserId, actor.userId), eq(personShares.recipientUserId, recipientUserId)))
         })

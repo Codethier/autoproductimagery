@@ -12,6 +12,7 @@ provide('workspace-account-identity', session.identity)
 const nav = computed(() => [
   {to: '/edit', label: 'Edit', icon: 'i-lucide-pencil-ruler'},
   {to: '/same-origin-batch', label: 'Same-origin batch', icon: 'i-lucide-copy-plus'},
+  {to: '/pipelines', label: 'Pipelines', icon: 'i-lucide-workflow'},
   {to: '/people', label: 'People', icon: 'i-lucide-contact-round'},
   {to: '/assets', label: 'Library', icon: 'i-lucide-images'},
   {to: '/shared', label: 'Shared with me', icon: 'i-lucide-users-round'},

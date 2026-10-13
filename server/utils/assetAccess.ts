@@ -11,6 +11,8 @@ import type {AssetFile, AssetFolder, AssetPermissions, AssetSource} from '../../
 export type AssetActor = {userId: string; organizationId: string; username: string; displayName: string; role: 'owner' | 'user'}
 export type AssetRecord = typeof assets.$inferSelect
 export type PeoplePhotoGrant = {personId: string; shareId: string; ownerUserId: string}
+export type OwnedImageMetadata = {id: string; url: string; name: string; priceUsd: string | null; priceSource: string | null;
+    width?: number; height?: number; mimeType?: string; bytes?: number}
 type Database = ReturnType<typeof getDatabase>
 export const MAX_ASSET_FOLDER_DEPTH = 32
 export const MAX_REGISTERED_TREE_ENTRIES = 10_000
@@ -82,6 +84,50 @@ export function createAssetRepository(actor: AssetActor, db: Database = getDatab
         if (!price) throw createError({statusCode: 425, statusMessage: 'Image ready; waiting for its final price to be confirmed'})
         priceCache.set(row.url, price)
         return price
+    }
+    /** A bounded private projection may refer to hundreds of owned pipeline
+     * outputs. Authorize those identities together in a fresh SQL snapshot;
+     * shared identities still use the ordinary live-grant checks. */
+    async function ownedImageMetadata(urls: readonly string[]): Promise<{images: OwnedImageMetadata[]; ownedUrls: string[]}> {
+        if (urls.length > 2500) throw createError({statusCode: 400, statusMessage: 'Too many image identities'})
+        const unique = [...new Set(urls.map(canonicalAssetUrl))]
+        if (!unique.length) return {images: [], ownedUrls: []}
+        const result = await db.execute<{id: string; url: string; name: string; category: string; width: number | null; height: number | null;
+            mime_type: string | null; byte_size: string | null; price_usd: string | null; price_source: string | null; allowed: boolean}>(sql`
+            WITH RECURSIVE ancestry AS (
+                SELECT ${assets.id} AS root_id, ${assets.id} AS id, ${assets.parentId} AS parent_id,
+                    1 AS depth, ARRAY[${assets.id}] AS visited
+                FROM ${assets}
+                WHERE ${assets.organizationId} = ${actor.organizationId}::uuid AND ${assets.ownerUserId} = ${actor.userId}::uuid
+                    AND ${inArray(assets.url, unique)} AND ${assets.kind} = 'file' AND ${assets.deletedAt} IS NULL
+                UNION ALL
+                SELECT ancestry.root_id, ${parent.id}, ${parent.parentId}, ancestry.depth + 1, ancestry.visited || ${parent.id}
+                FROM ${assets} AS parent_asset JOIN ancestry ON ${parent.id} = ancestry.parent_id
+                WHERE ${parent.organizationId} = ${actor.organizationId}::uuid AND ${parent.ownerUserId} = ${actor.userId}::uuid
+                    AND ${parent.kind} = 'folder' AND ${parent.deletedAt} IS NULL AND ancestry.depth < ${MAX_ASSET_FOLDER_DEPTH}
+                    AND NOT (${parent.id} = ANY(ancestry.visited))
+            ), roots AS (SELECT DISTINCT root_id FROM ancestry WHERE parent_id IS NULL)
+            SELECT ${assets.id} AS id, ${assets.url} AS url, ${assets.name} AS name, ${assets.category} AS category,
+                ${assets.width} AS width, ${assets.height} AS height, ${assets.mimeType} AS mime_type, ${assets.byteSize}::text AS byte_size,
+                CASE WHEN ${assets.category} = 'processed' THEN '0' ELSE price.price_usd END AS price_usd,
+                CASE WHEN ${assets.category} = 'processed' THEN 'local-processing' ELSE price.price_source END AS price_source,
+                (roots.root_id IS NOT NULL AND ${assets.kind} = 'file' AND ${assets.deletedAt} IS NULL
+                    AND (${assets.category} <> 'generated' OR price.generation_id IS NOT NULL)
+                    AND EXISTS (SELECT 1 FROM ${users} WHERE ${users.id} = ${actor.userId}::uuid
+                        AND ${users.organizationId} = ${actor.organizationId}::uuid AND ${users.disabledAt} IS NULL)) AS allowed
+            FROM ${assets} LEFT JOIN roots ON roots.root_id = ${assets.id}
+            LEFT JOIN LATERAL (
+                SELECT ${systemPrompt.id} AS generation_id, ${systemPrompt.priceUsd} AS price_usd, ${systemPrompt.priceSource} AS price_source
+                FROM ${systemPrompt} WHERE ${visibleOutput()} ORDER BY ${systemPrompt.id} DESC LIMIT 1
+            ) price ON ${assets.category} = 'generated'
+            WHERE ${assets.organizationId} = ${actor.organizationId}::uuid AND ${assets.ownerUserId} = ${actor.userId}::uuid
+                AND ${inArray(assets.url, unique)}
+        `)
+        return {ownedUrls: result.rows.map(row => row.url), images: result.rows.filter(row => row.allowed).map(row => ({
+            id: row.id, url: row.url, name: row.name, priceUsd: row.price_usd, priceSource: row.price_source,
+            ...(row.width !== null ? {width: row.width} : {}), ...(row.height !== null ? {height: row.height} : {}),
+            ...(row.mime_type !== null ? {mimeType: row.mime_type} : {}), ...(row.byte_size !== null ? {bytes: Number(row.byte_size)} : {}),
+        }))}
     }
     async function byId(id: string) {
         const [row] = await db.select().from(assets).where(and(eq(assets.id, validAssetId(id)), eq(assets.organizationId, actor.organizationId), isNull(assets.deletedAt))).limit(1)
@@ -192,11 +238,23 @@ export function createAssetRepository(actor: AssetActor, db: Database = getDatab
         const owner = await source(row.ownerUserId)
         const path = logicalPath(row)
         const containingFolder = row.parentId ? await byId(row.parentId) : undefined
+        // This is a display hint from the registered logical destination, never
+        // an authorization rule or a guess from a caller-controlled filename.
+        const processingPurpose = row.kind === 'file' && row.category === 'processed'
+            ? containingFolder?.category === 'processed' && containingFolder.ownerUserId === row.ownerUserId
+                && containingFolder.organizationId === row.organizationId
+                ? containingFolder.url === imagePathToUrl([...personalImageParts({...actor, userId: row.ownerUserId}), 'pipeline-results'])
+                    ? 'pipeline' as const
+                    : containingFolder.url === imagePathToUrl([...personalImageParts({...actor, userId: row.ownerUserId}), 'cutouts'])
+                        ? 'background-removal' as const : 'local' as const
+                : 'local' as const
+            : undefined
         const price = await confirmedOutput(row)
         const count = row.kind === 'folder' ? itemCount ?? (await folderItemCounts([row])).get(row.id) ?? 0 : undefined
         return {id: row.id, kind: row.kind, name: row.name, url: row.url,
             category: row.category, ...(price ?? (row.kind === 'file' && row.category === 'processed'
                 ? {priceUsd: '0', priceSource: 'local-processing'} : {})),
+            ...(processingPurpose ? {processingPurpose} : {}),
             ...(count !== undefined ? {itemCount: count} : {}),
             folder: row.kind === 'folder' ? path : containingFolder ? logicalPath(containingFolder) : '/',
             ownerUserId: row.ownerUserId, permissions: grant.permissions, source: owner,
@@ -377,5 +435,5 @@ export function createAssetRepository(actor: AssetActor, db: Database = getDatab
         await db.delete(assetShares).where(and(eq(assetShares.organizationId, actor.organizationId), eq(assetShares.assetId, id),
             eq(assetShares.recipientUserId, validAssetId(recipientUserId))))
     }
-    return {byId, byUrl, requireAsset, ancestors, source, dto, folderDto, logicalPath, resolveFolder, list, descendants, register, markDeleted, prepareDeletion, restoreDeletion, shareTargets, sharesFor, share, revoke, lockPeoplePhotoGrant, db}
+    return {byId, byUrl, requireAsset, ancestors, source, dto, folderDto, logicalPath, resolveFolder, list, descendants, register, markDeleted, prepareDeletion, restoreDeletion, shareTargets, sharesFor, share, revoke, lockPeoplePhotoGrant, ownedImageMetadata, db}
 }

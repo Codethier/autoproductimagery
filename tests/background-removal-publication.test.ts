@@ -78,6 +78,42 @@ async function waitForLock(pool: Pool, application: string) {
     throw new Error('Expected source mutation to wait for publication locks')
 }
 
+test('pipeline processed registration keeps decoded formats, private ownership and source-grant checks', integration, async () => fixture(async f => {
+    const aFS = await useUserFS(f.a, f.raw, f.db), bFS = await useUserFS(f.b, f.raw, f.db)
+    const source = await aFS.saveUpload('/', upload(f.bytes))
+    await aFS.share(source.id!, f.b.userId, 'view')
+    const jpeg = await sharp(f.bytes).flatten({background: '#ffffff'}).jpeg({quality: 90}).toBuffer()
+    const staged = await bFS.prepareProcessedImage(jpeg, {purpose: 'pipeline', mimeType: 'image/jpeg'})
+    const output = await f.db.transaction(tx => staged.register(tx, {id: source.id!, url: source.url}))
+    const registered = await bFS.assetByUrl(output.outputUrl)
+    const [record] = await f.db.select().from(assets).where(eq(assets.id, output.outputAssetId))
+    assert.equal(registered.category, 'processed')
+    assert.equal(record!.mimeType, 'image/jpeg')
+    assert.equal(registered.source!.userId, f.b.userId)
+    assert.equal(registered.name.endsWith('.jpg'), true)
+    const [folder] = await f.db.select().from(assets).where(eq(assets.id, record!.parentId!))
+    assert.equal(folder!.name, 'Pipeline results')
+    assert.equal(folder!.category, 'processed')
+    await assert.rejects(aFS.getImageFile(output.outputUrl), error => (error as {statusCode?: number}).statusCode === 404,
+        'sharing a source does not share the recipient-owned derivative back to its owner')
+    assert.deepEqual((await bFS.getImageFile(output.outputUrl)).buffer, jpeg)
+    assert.equal((await aFS.assetByUrl(source.url)).category, 'uploaded')
+
+    const revoked = await bFS.prepareProcessedImage(f.bytes, {purpose: 'pipeline', name: 'Safe output.png'})
+    await aFS.revoke(source.id!, f.b.userId)
+    await assert.rejects(f.db.transaction(tx => revoked.register(tx, {id: source.id!, url: source.url})),
+        error => (error as {statusCode?: number}).statusCode === 404)
+    await revoked.discard()
+    assert.equal(f.objects.has(revoked.url.slice(1)), false)
+    assert.deepEqual((await aFS.getImageFile(source.url)).buffer, f.bytes)
+    const beforeMismatch = f.objects.size
+    await assert.rejects(bFS.prepareProcessedImage(jpeg, {purpose: 'pipeline', mimeType: 'image/png'}),
+        error => (error as {statusCode?: number}).statusCode === 415)
+    assert.equal(f.objects.size, beforeMismatch, 'a misdeclared staged image removes only its new immutable object')
+    await assert.rejects(bFS.prepareProcessedImage(f.bytes, {purpose: 'pipeline', name: '../private.png'}),
+        error => (error as {statusCode?: number}).statusCode === 400)
+}))
+
 test('atomic publication holds shared grants until commit so a concurrent revoke serializes after success', integration, async () => fixture(async f => {
     const aFS = await useUserFS(f.a, f.raw, f.db), bFS = await useUserFS(f.b, f.raw, f.db)
     const source = await aFS.saveUpload('/', upload(f.bytes))

@@ -136,6 +136,17 @@ test('reference picker preserves product references, deduplicates, and counts ev
   assert.deepEqual(value.events.find(event => event.name === 'confirm')?.value, [otherSource, source])
   value.exposed.togglePhoto(photo()); assert.deepEqual(value.exposed.selection.value, [otherSource])
 })
+test('People pipeline batches select fifty independent pictures while normal references remain capped at sixteen', async () => {
+  const batch = await renderComponent(browserUrl, {props: {selectionMode: 'multiple', maxSelection: 50, selectionCap: 50, selectionLabel: 'pictures'}})
+  for (let index = 0; index < 51; index++) batch.exposed.togglePhoto(photo({id: `photo-${index}`, url: source.replace('person.png', `person-${index}.png`)}))
+  assert.equal(batch.exposed.selection.value.length, 50)
+  assert.match(batch.exposed.selectionNotice.value, /batch accepts up to 50 pictures/)
+  batch.exposed.confirm()
+  assert.equal((batch.events.find(event => event.name === 'confirm')?.value as string[]).length, 50)
+  const references = await renderComponent(browserUrl, {props: {selectionMode: 'multiple', maxSelection: 50}})
+  for (let index = 0; index < 17; index++) references.exposed.togglePhoto(photo({id: `photo-${index}`, url: source.replace('person.png', `person-${index}.png`)}))
+  assert.equal(references.exposed.selection.value.length, 16)
+})
 test('external and unconfirmed images cannot be added to People reference selections', async () => {
   const value = await renderComponent(browserUrl, {props: {selectedUrls: ['https://example.org/photo.png', '//example.org/photo.png', source]}})
   assert.deepEqual(value.exposed.selection.value, [source])

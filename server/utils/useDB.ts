@@ -2,6 +2,7 @@ import { getDatabase } from "./lib/db"
 import {
     aiGatewayLog,
     runtimeLease,
+    pipelineRunSteps,
     systemPrompt,
     type NewAiGatewayLog,
 } from "../db/schema"
@@ -40,7 +41,9 @@ type PendingGeneration = {
     batchId: string
     parentSystemPromptId?: number
     personId?: string
-    generationConfig: StoredGenerationConfig
+    pipelineStepId?: string
+    pipelineTextConfig?: NonNullable<typeof systemPrompt.$inferSelect.pipelineTextConfig>
+    generationConfig: StoredGenerationConfig | null
 }
 
 type GenerationLog = Omit<NewAiGatewayLog, 'id' | 'systemPromptId' | 'createdAt'>
@@ -107,6 +110,8 @@ export async function useDB(db = getDatabase(), owner?: GenerationOwner) {
             batchId: data.batchId,
             parentSystemPromptId: data.parentSystemPromptId ?? null,
             personId: data.personId ?? null,
+            pipelineStepId: data.pipelineStepId ?? null,
+            pipelineTextConfig: data.pipelineTextConfig ?? null,
             generationConfig: data.generationConfig,
             errors: null,
             errorJson: null,
@@ -126,6 +131,21 @@ export async function useDB(db = getDatabase(), owner?: GenerationOwner) {
             if (owner) {
                 if (new Set(items.map(item => item.batchId)).size !== 1) throw new Error('Pending generations must share one batch')
                 await assertGenerationCredit(tx, owner, items[0]!.batchId)
+            }
+            const pipelineStepIds = [...new Set(items.map(item => item.pipelineStepId).filter((id): id is string => id !== undefined))].sort()
+            if (pipelineStepIds.length && !owner) throw createError({statusCode: 400, statusMessage: 'Pipeline generations require an authenticated account'})
+            for (const stepId of pipelineStepIds) {
+                const [step] = await tx.select().from(pipelineRunSteps).where(and(eq(pipelineRunSteps.id, stepId),
+                    eq(pipelineRunSteps.organizationId, owner!.organizationId), eq(pipelineRunSteps.userId, owner!.userId))).for('update').limit(1)
+                if (!step) throw createError({statusCode: 404, statusMessage: 'Pipeline step not found'})
+                const [existingBatch] = await tx.select({id: systemPrompt.id}).from(systemPrompt).where(and(eq(systemPrompt.batchId, items[0]!.batchId),
+                    eq(systemPrompt.pipelineStepId, stepId), eq(systemPrompt.organizationId, owner!.organizationId), eq(systemPrompt.userId, owner!.userId))).limit(1)
+                // Additional already-paid provider outputs must be preserved
+                // even if cancellation or lease recovery overtook publication.
+                if (!existingBatch && (!step.active || step.status !== 'running' || !step.leaseExpiresAt || new Date(step.leaseExpiresAt).getTime() <= Date.now())) {
+                    throw createError({statusCode: 409, statusMessage: 'Pipeline step execution is no longer active'})
+                }
+                if (!existingBatch) await tx.update(pipelineRunSteps).set({batchId: items[0]!.batchId, updatedAt: drizzleSql`CURRENT_TIMESTAMP`}).where(eq(pipelineRunSteps.id, stepId))
             }
             const personIds = [...new Set(items.map(item => item.personId).filter((id): id is string => id !== undefined))].sort()
             if (personIds.length && !owner) throw createError({statusCode: 400, statusMessage: 'People generations require an authenticated account'})
@@ -320,7 +340,7 @@ export async function useDB(db = getDatabase(), owner?: GenerationOwner) {
             parentSystemPromptId: systemPrompt.parentSystemPromptId,
             generationConfig: systemPrompt.generationConfig,
         }).from(systemPrompt)
-            .where(generationScope())
+            .where(and(generationScope(), drizzleSql`${systemPrompt.pipelineTextConfig} IS NULL`))
             .orderBy(desc(systemPrompt.createdAt), desc(systemPrompt.id))
             .limit(limit)
             .offset(offset)
@@ -328,7 +348,7 @@ export async function useDB(db = getDatabase(), owner?: GenerationOwner) {
     }
 
     async function countSystemPrompts() {
-        const [result] = await db.select({value: drizzleSql<number>`count(*)`}).from(systemPrompt).where(generationScope())
+        const [result] = await db.select({value: drizzleSql<number>`count(*)`}).from(systemPrompt).where(and(generationScope(), drizzleSql`${systemPrompt.pipelineTextConfig} IS NULL`))
         return Number(result?.value ?? 0)
     }
 

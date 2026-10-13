@@ -52,6 +52,14 @@ test('asset pickers respect profiles that prohibit references and clamp single s
     assert.equal(assetSelectionLimit('single'), 1)
     for (const invalid of [-1, NaN, Infinity, 1.5]) assert.equal(assetSelectionLimit('multiple', invalid), 0)
 })
+test('pipeline batch selection opts into fifty pictures without increasing default references or upload bounds', () => {
+    assert.equal(assetSelectionLimit('multiple', 50, 50), 50)
+    assert.equal(assetSelectionLimit('multiple', 100, 100), 50)
+    assert.equal(assetSelectionLimit('multiple', 50), 20)
+    assert.equal(assetSelectionLimit('single', 50, 50), 1)
+    for (const invalid of [NaN, Infinity, -1, 1.5]) assert.equal(assetSelectionLimit('multiple', 50, invalid), 0)
+    assert.match(validateAssetUploads(Array(21).fill({name: 'photo.png', type: 'image/png', size: 100}))!, /20/)
+})
 
 test('client upload preflight matches streaming limits and rejects non-image uploads', () => {
     const image = {name: 'product.png', type: 'image/png', size: 100}

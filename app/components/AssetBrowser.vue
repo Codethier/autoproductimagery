@@ -5,7 +5,7 @@ import type {AssetFile, AssetFolder, AssetListingPage, AssetSource} from '~~/sch
 import {hasConfirmedGenerationPrice} from '~~/schemas/generation-billing'
 import {generationPriceLabel, type GenerationPrice} from '../utils/generationPrice'
 import {assetFromImageUrl, assetSelectionLimit, MAX_ASSET_FAVOURITES, toggleAssetSelection, validateAssetUploads} from '~/utils/assetPreferences'
-const props = withDefaults(defineProps<{selectionMode?: 'single' | 'multiple'; selectedUrls?: string[]; acceptedExtensions?: string[]; maxSelection?: number; initialPath?: string; initialScope?: 'all' | 'shared'; sharedOnly?: boolean; title?: string}>(), {selectedUrls: () => [], acceptedExtensions: () => [], initialPath: '/', initialScope: 'all', sharedOnly: false, title: 'Library'})
+const props = withDefaults(defineProps<{selectionMode?: 'single' | 'multiple'; selectedUrls?: string[]; acceptedExtensions?: string[]; maxSelection?: number; selectionCap?: number; initialPath?: string; initialScope?: 'all' | 'shared'; sharedOnly?: boolean; title?: string}>(), {selectedUrls: () => [], acceptedExtensions: () => [], selectionCap: 20, initialPath: '/', initialScope: 'all', sharedOnly: false, title: 'Library'})
 const emit = defineEmits<{'update:selectedUrls': [urls: string[]]; select: [file: SelectableFile]; confirm: [files: SelectableFile[]]; navigate: [path: string]; deleted: [urls: string[]]}>()
 type View = 'all' | 'uploads' | 'generated' | 'favourites' | 'folder' | 'shared'
 type ShareTarget = {id: string; username: string; displayName: string}
@@ -63,7 +63,7 @@ let listingAbort: AbortController | undefined
 let focusBeforeDialog: HTMLElement | null = null
 const isPicker = computed(() => Boolean(props.selectionMode))
 const isShared = computed(() => view.value === 'shared')
-const selectionLimit = computed(() => assetSelectionLimit(props.selectionMode, props.maxSelection))
+const selectionLimit = computed(() => assetSelectionLimit(props.selectionMode, props.maxSelection, props.selectionCap))
 const favouriteSet = computed(() => new Set(favourites.urls.value))
 const canWrite = computed(() => currentFolder.value ? canEditAsset(currentFolder.value) : !isShared.value)
 const uploadPath = computed(() => currentFolder.value?.url ?? (view.value === 'folder' ? folderPath.value : '/'))
@@ -86,11 +86,18 @@ function canShareAsset(asset: AssetFile | AssetFolder) { const owner = session.a
 type PricedAsset = AssetFile & GenerationPrice
 function generated(file: AssetFile) { return (file as PricedAsset).category === 'generated' }
 function imageReady(file: AssetFile) { return !generated(file) || hasConfirmedGenerationPrice(file as PricedAsset) }
-function assetPrice(file: AssetFile) { return file.category === 'processed' ? '$0 provider charge · background removal' : generated(file) ? generationPriceLabel(file as PricedAsset) : '' }
+function assetPrice(file: AssetFile) {
+  if (file.category === 'processed') {
+    const purpose = file.processingPurpose === 'pipeline' ? 'pipeline processing'
+      : file.processingPurpose === 'background-removal' ? 'background removal' : 'local processing'
+    return `$0 provider charge · ${purpose}`
+  }
+  return generated(file) ? generationPriceLabel(file as PricedAsset) : ''
+}
 function permitted(file: AssetFile) { return imageReady(file) && (!isPicker.value || selectionLimit.value !== 0) && (!props.acceptedExtensions.length || props.acceptedExtensions.some(extension => file.name.toLowerCase().endsWith('.' + extension.replace(/^\./, '').toLowerCase()))) }
 function syncSelection(urls: readonly string[]) { selection.value = [...new Set(urls.filter(url => { const file = assetFromImageUrl(url); return file && permitted(file) }))].slice(0, selectionLimit.value) }
 watch(() => props.selectedUrls, syncSelection, {immediate: true, deep: true})
-watch(() => [props.maxSelection, props.selectionMode, props.acceptedExtensions], () => syncSelection(selection.value), {deep: true})
+watch(() => [props.maxSelection, props.selectionCap, props.selectionMode, props.acceptedExtensions], () => syncSelection(selection.value), {deep: true})
 watch(() => props.initialPath, path => { if (!isShared.value && path !== folderPath.value) enterFolder(path) })
 watch(search, value => { clearTimeout(searchTimer); searchTimer = setTimeout(() => { keyword.value = value.trim(); void refresh() }, 250) })
 watch(sourceUserId, () => { currentFolder.value = undefined; folderTrail.value = []; void refresh() })

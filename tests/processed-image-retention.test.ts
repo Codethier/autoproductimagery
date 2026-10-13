@@ -6,7 +6,8 @@ import {Pool} from 'pg'
 import {drizzle} from 'drizzle-orm/node-postgres'
 import {migrate} from 'drizzle-orm/node-postgres/migrator'
 import {eq, sql} from 'drizzle-orm'
-import {assets, assetShares, backgroundRemovalJobs, organizations, users} from '../server/db/schema.ts'
+import {assets, assetShares, backgroundRemovalJobs, organizations, users, pipelines, pipelineRuns, pipelineRunItems,
+    pipelineRunSteps, pipelineStepOutputs} from '../server/db/schema.ts'
 import {getDatabasePoolConfig} from '../server/utils/lib/db.ts'
 import {isManagedProcessedOutput, PROCESSED_IMAGE_RETENTION_LOCK, runProcessedImageRetention} from '../server/utils/processedImageRetention.ts'
 
@@ -56,6 +57,29 @@ async function cutout(f: {db: Database; alice: Actor; sourceId: string; sourceUr
         idempotencyKey: randomUUID(), attempts: 1, outputAssetId: asset!.id, outputUrl: asset!.url, createdAt: age(200),
         startedAt: age(overrides.completedAge ?? 181), completedAt: age(overrides.completedAge ?? 181)}).returning()
     return {asset: asset!, job: job!}
+}
+async function pipelineOutput(f: {db: Database; alice: Actor; sourceUrl: string}, overrides: {
+    assetAge?: number; associationAge?: number; status?: 'succeeded' | 'failed' | 'interrupted'; linkActor?: Actor;
+    outputUrl?: string; category?: 'uploaded' | 'generated' | 'processed'; existingAsset?: typeof assets.$inferSelect;
+} = {}) {
+    const actor = f.alice, linkActor = overrides.linkActor ?? actor
+    const id = randomUUID(), runId = randomUUID(), itemId = randomUUID(), stepId = randomUUID()
+    const definition = {version: 1 as const, nodes: [], edges: []}
+    await f.db.insert(pipelines).values({id, ...{organizationId: actor.organizationId, userId: actor.userId}, name: 'Local retention pipeline', definition})
+    await f.db.insert(pipelineRuns).values({id: runId, pipelineId: id, organizationId: actor.organizationId, userId: actor.userId,
+        name: 'Local retention snapshot', revision: 1, definition, inputs: {}, idempotencyKey: randomUUID(), status: 'succeeded'})
+    await f.db.insert(pipelineRunItems).values({id: itemId, runId, organizationId: actor.organizationId, userId: actor.userId, index: 0, inputUrl: f.sourceUrl})
+    await f.db.insert(pipelineRunSteps).values({id: stepId, runId, itemId, organizationId: actor.organizationId, userId: actor.userId,
+        nodeId: 'local-processing', type: 'crop', status: overrides.status ?? 'succeeded', completedAt: age(overrides.associationAge ?? 181)})
+    let asset = overrides.existingAsset
+    if (!asset) [asset] = await f.db.insert(assets).values({id: randomUUID(), organizationId: actor.organizationId,
+        ownerUserId: actor.userId, createdByUserId: actor.userId, name: 'pipeline-output.png', kind: 'file',
+        category: overrides.category ?? 'processed', url: overrides.outputUrl ?? output(actor), byteSize: 100, mimeType: 'image/png',
+        width: 8, height: 6, createdAt: age(overrides.assetAge ?? 181)}).returning()
+    const [association] = await f.db.insert(pipelineStepOutputs).values({id: randomUUID(), stepId,
+        organizationId: linkActor.organizationId, userId: linkActor.userId, outputAssetId: asset!.id,
+        outputUrl: asset!.url, createdAt: age(overrides.associationAge ?? 181)}).returning()
+    return {asset: asset!, association: association!, stepId}
 }
 
 test('processed retention accepts only the job owner canonical immutable output namespace', () => {
@@ -177,4 +201,50 @@ test('another cleanup session holds the exact advisory lock and skips all deleti
         await held.query('SELECT pg_advisory_unlock($1::integer, $2::integer)', [...PROCESSED_IMAGE_RETENTION_LOCK])
         held.release()
     }
+}))
+
+test('pipeline local outputs and failed-step prepared references use the same bounded retention without rewriting run history', integration, async () => fixture(async f => {
+    const old = await pipelineOutput(f), failedPrepared = await pipelineOutput(f, {status: 'failed'}), interruptedPrepared = await pipelineOutput(f, {status: 'interrupted'})
+    const boundary = await pipelineOutput(f, {assetAge: 180, associationAge: 180}), recent = await pipelineOutput(f, {associationAge: 1})
+    const freshAsset = await pipelineOutput(f, {assetAge: 1}), uploaded = await pipelineOutput(f, {category: 'uploaded'})
+    const generated = await pipelineOutput(f, {category: 'generated'}), wrongUser = await pipelineOutput(f, {linkActor: f.bob})
+    const wrongOrg = await pipelineOutput(f, {linkActor: f.outsider})
+    const wrongPath = await pipelineOutput(f, {outputUrl: output(f.bob)})
+    const [historical] = await f.db.select().from(pipelineRunSteps).where(eq(pipelineRunSteps.id, failedPrepared.stepId))
+    const removed: string[] = [], storage = {removeGeneratedImage: async (url: string) => {removed.push(url)}}
+    const dry = await runProcessedImageRetention({pool: f.pool, storage, retentionDays: 180, now: NOW, dryRun: true})
+    assert.equal(dry.wouldDelete, 3)
+    assert.equal(dry.skippedInvalid, 1)
+    assert.deepEqual(removed, [])
+    const first = await runProcessedImageRetention({pool: f.pool, storage, retentionDays: 180, now: NOW, maxRows: 2})
+    assert.equal(first.status, 'bounded')
+    assert.ok(first.deleted >= 1 && first.deleted <= 2)
+    const final = await runProcessedImageRetention({pool: f.pool, storage, retentionDays: 180, now: NOW})
+    assert.equal(final.deleted, 3 - first.deleted)
+    assert.deepEqual(new Set(removed), new Set([old.asset.url, failedPrepared.asset.url, interruptedPrepared.asset.url]))
+    for (const expired of [old, failedPrepared, interruptedPrepared]) {
+        const [asset] = await f.db.select().from(assets).where(eq(assets.id, expired.asset.id))
+        const [association] = await f.db.select().from(pipelineStepOutputs).where(eq(pipelineStepOutputs.id, expired.association.id))
+        assert.equal(new Date(asset!.deletedAt!).toISOString(), NOW.toISOString())
+        assert.equal(new Date(association!.deletedAt!).toISOString(), NOW.toISOString())
+    }
+    for (const retained of [boundary, recent, freshAsset, uploaded, generated, wrongUser, wrongOrg, wrongPath]) {
+        const [asset] = await f.db.select().from(assets).where(eq(assets.id, retained.asset.id))
+        assert.equal(asset!.deletedAt, null)
+    }
+    assert.deepEqual((await f.db.select().from(pipelineRunSteps).where(eq(pipelineRunSteps.id, failedPrepared.stepId)))[0], historical)
+    assert.equal((await f.db.select().from(assets).where(eq(assets.id, f.sourceId)))[0]!.deletedAt, null)
+    assert.equal((await runProcessedImageRetention({pool: f.pool, storage, retentionDays: 180, now: NOW})).deleted, 0)
+}))
+
+test('a recent pipeline association protects an older background output and pre-migration workers keep the old path working', integration, async () => fixture(async f => {
+    const protectedOutput = await cutout(f)
+    await pipelineOutput(f, {existingAsset: protectedOutput.asset, associationAge: 1})
+    const removed: string[] = [], storage = {removeGeneratedImage: async (url: string) => {removed.push(url)}}
+    assert.equal((await runProcessedImageRetention({pool: f.pool, storage, retentionDays: 180, now: NOW})).deleted, 0)
+    assert.deepEqual(removed, [])
+    await f.pool.query('ALTER TABLE pipeline_step_output RENAME TO pipeline_step_output_pending_migration')
+    const result = await runProcessedImageRetention({pool: f.pool, storage, retentionDays: 180, now: NOW})
+    assert.equal(result.deleted, 1, 'old background queue remains supported before the new association table is visible')
+    assert.deepEqual(removed, [protectedOutput.asset.url])
 }))

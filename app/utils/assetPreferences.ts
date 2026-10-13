@@ -69,8 +69,9 @@ export function toggleAssetSelection(current: readonly string[], url: string, mo
     return mode === 'single' ? [url] : [...valid, url]
 }
 
-export function assetSelectionLimit(mode?: 'single' | 'multiple', requested?: number): number {
-    const maximum = mode === 'single' ? 1 : 20
+export function assetSelectionLimit(mode?: 'single' | 'multiple', requested?: number, selectionCap = 20): number {
+    const boundedCap = Number.isInteger(selectionCap) && selectionCap >= 0 ? Math.min(50, selectionCap) : 0
+    const maximum = mode === 'single' ? Math.min(1, boundedCap) : boundedCap
     if (requested === undefined) return maximum
     // An explicitly zero limit is how model profiles prohibit extra sources.
     return Number.isInteger(requested) && requested >= 0 ? Math.min(maximum, requested) : 0

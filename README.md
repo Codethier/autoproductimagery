@@ -192,6 +192,36 @@ On Railway, use a **separate cron service** named `image-retention` alongside th
 
 Reference the same PostgreSQL and private S3 variables as the app, including its storage prefix. The worker needs no Gateway key or login credentials. Apply reviewed database migrations through the app's explicit pre-deploy step before deploying the worker. It closes PostgreSQL and S3 connections when done, so it consumes no continuously running app process. Railway schedules are in UTC and may start a few minutes after the scheduled time. See [Railway cron documentation](https://docs.railway.com/cron-jobs).
 
+## Pipelines
+
+Open **Pipelines**, start with a template or a blank workflow, and add steps from the node palette. Connect matching image or text ports by clicking the output and then the input; the properties panel also provides a connection selector. Move nodes by dragging their header or using arrow keys. Pan, zoom, fit, the overview, undo/redo, and copy/duplicate/delete work on the saved graph. Edits save with a revision check; conflicting edits require reloading the saved version. JSON export/import contains the private graph and image paths, without credentials or image bytes.
+
+Supported steps include Image Input, Text Input, Static Image, Static Text, Generate Image, Remove Background, Crop, Resize, Upscale, Expand, Translate, Describe Image, Prompt Enhancer, LLM, Prompt Concatenator, Pipeline Output and Sticky Note. Generation, AI upscaling, expansion and image translation use the existing exact image-model profiles and their own settings. Standard 2×/4× upscaling uses Lanczos resampling. Describe Image, Prompt Enhancer and LLM use the explicit `google/gemini-2.5-flash` Gateway text model; its multimodal input and text output are documented by [Google](https://ai.google.dev/gemini-api/docs/models/gemini-2.5-flash) and [Vercel](https://vercel.com/ai-gateway/models/gemini-2.5-flash/about). No direct provider SDKs are used.
+
+Use **Run pipeline** to choose the batch image-input node and up to 50 product pictures. Other image inputs, People references and text inputs are shared values for that run. Each batch picture has its own progress and results. Only the ancestors of Pipeline Output nodes run; **Run step** executes only the chosen node and its ancestors. Graphs are limited to 24 nodes, 80 connections, 50 image values per step, and 500 planned paid calls per run. Invalid graphs and excessive fanout are rejected before paid work. Cycles, video/audio, public media URLs and executable code are out of scope.
+
+Runs continue after the browser closes. The saved graph and input snapshot stay fixed even if the pipeline is edited later. Completed intermediates feed later steps only after exact Gateway costs are confirmed. Finite credit is checked for every new paid wave; local processing has a known $0 provider charge. Results show actual returned dimensions, because AI models do not guarantee exact canvas margins or upscale dimensions. Cancellation prevents later work and preserves accepted calls and charges. An interrupted paid call is not automatically repeated: the explicit retry dialog warns that a new call can incur another charge and may repeat earlier successful variants of that node. Images and earlier charged attempts remain recorded.
+
+**Download all** streams confirmed final images in a ZIP, preserving each original file's bytes. It rechecks access for every picture and limits an archive to 200 files and 256 MiB; larger runs retain individual downloads. Local pipeline outputs and prepared expansion canvases/masks expire through the existing daily processed-image policy. Uploaded sources, workflow definitions, prompts and charges are preserved.
+
+The dedicated `pipeline-worker` service follows `master` pushes, with these Railway service settings:
+
+| Setting | Value |
+| --- | --- |
+| Build | `npm run build:pipeline-worker` |
+| Start | `node .output/pipeline-worker.mjs` |
+| Health check | `/health` |
+| Worker concurrency | `PIPELINE_WORKER_CONCURRENCY=2` (bounded 1–3) |
+| Database pool | `DATABASE_POOL_MAX=6` |
+| Resources | 2 vCPU, 16 GB memory limit |
+| Scheduling | PostgreSQL notifications, with bounded fallback checks |
+| Network | No public domain or TCP proxy |
+| Restart / drain | On failure, up to 10 retries / 60 seconds |
+
+Reference the app's private PostgreSQL, S3 and `NUXT_AI_GATEWAY_API_KEY` variables. Login/bootstrap/session credentials are unnecessary. The worker needs memory above the pinned BiRefNet guards (8 GiB free for Lite, 10 GiB for Full) if it handles background-removal steps. It verifies final native libraries at startup, waits for the app's additive migration, and never applies migrations itself. The web app retains serverless sleep. Durable ownership leases, heartbeats, conditional step transitions and provider-start fences prevent a replacement worker from blindly repeating accepted paid work.
+
+Build and deploy commands are configured on the service; Git pushes rebuild it automatically. Railway no longer lets new services opt into `railway.toml`/`railway.json` Config as Code, so no inactive legacy config file is included. See [Railway's configuration policy](https://docs.railway.com/config-as-code).
+
 ## Migrations and existing local data
 
 Drizzle ORM and Kit stay pinned to `1.0.0-rc.4`. The PostgreSQL schema lives in `server/db/schema.ts`; its generated SQL and snapshots live in `drizzle/postgres/`. The earlier SQLite migration folders under `drizzle/` are retained intact as historical archives, and are not applied to PostgreSQL.

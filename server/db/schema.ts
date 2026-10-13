@@ -6,6 +6,7 @@ import type {
     StoredGenerationError,
 } from "~~/schemas/image-generation";
 import type {BackgroundRemovalModel, BackgroundRemovalStatus, BackgroundRemovalError} from '../../schemas/background-removal';
+import type {PipelineDefinition, PipelineValue} from '../../schemas/pipelines';
 
 export const organizations = pgTable('organization', {
     id: uuid('id').primaryKey(),
@@ -160,11 +161,113 @@ export const personShares = pgTable('person_share', {
     index('person_share_org_recipient_idx').on(table.organizationId, table.recipientUserId, table.personId),
 ]);
 
+// Pipeline definitions and run snapshots are private to their creator. Each
+// per-image node has durable, fenced execution; historical attempts preserve
+// paid outputs and charges when a user explicitly retries a failed step.
+export const pipelines = pgTable('pipeline', {
+    id: uuid('id').primaryKey(),
+    organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+    userId: uuid('user_id').notNull().references(() => users.id),
+    name: text('name').notNull(),
+    description: text('description').default('').notNull(),
+    revision: integer('revision').default(1).notNull(),
+    definition: jsonb('definition').$type<PipelineDefinition>().notNull(),
+    deletedAt: timestamp('deleted_at', {mode: 'string', withTimezone: true}),
+    createdAt: timestamp('created_at', {mode: 'string', withTimezone: true}).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', {mode: 'string', withTimezone: true}).defaultNow().notNull(),
+}, table => [index('pipeline_owner_history_idx').on(table.organizationId, table.userId, table.createdAt, table.id),
+    check('pipeline_name_check', sql`length(trim(${table.name})) BETWEEN 1 AND 100`),
+    check('pipeline_description_check', sql`length(${table.description}) <= 4000`),
+    check('pipeline_revision_check', sql`${table.revision} > 0`)]);
+
+export type PipelineRunState = 'queued' | 'running' | 'awaiting-price' | 'succeeded' | 'partial' | 'failed' | 'cancelled' | 'interrupted';
+export type PipelineStepState = 'queued' | 'running' | 'awaiting-price' | 'succeeded' | 'failed' | 'skipped' | 'interrupted' | 'cancelled';
+export const pipelineRuns = pgTable('pipeline_run', {
+    id: uuid('id').primaryKey(),
+    pipelineId: uuid('pipeline_id').notNull().references(() => pipelines.id),
+    organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+    userId: uuid('user_id').notNull().references(() => users.id),
+    name: text('name').notNull(),
+    revision: integer('revision').notNull(),
+    definition: jsonb('definition').$type<PipelineDefinition>().notNull(),
+    inputs: jsonb('inputs').$type<Record<string, string>>().notNull(),
+    batchInputNodeId: text('batch_input_node_id'),
+    targetNodeId: text('target_node_id'),
+    idempotencyKey: uuid('idempotency_key').notNull(),
+    status: text('status').$type<PipelineRunState>().default('queued').notNull(),
+    cancelRequested: boolean('cancel_requested').default(false).notNull(),
+    nextAttemptAt: timestamp('next_attempt_at', {mode: 'string', withTimezone: true}).defaultNow().notNull(),
+    createdAt: timestamp('created_at', {mode: 'string', withTimezone: true}).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', {mode: 'string', withTimezone: true}).defaultNow().notNull(),
+    completedAt: timestamp('completed_at', {mode: 'string', withTimezone: true}),
+}, table => [uniqueIndex('pipeline_run_idempotency_unique').on(table.organizationId, table.userId, table.idempotencyKey),
+    index('pipeline_run_worker_due_idx').on(table.status, table.nextAttemptAt, table.updatedAt),
+    index('pipeline_run_owner_history_idx').on(table.organizationId, table.userId, table.createdAt, table.id),
+    check('pipeline_run_status_check', sql`${table.status} IN ('queued','running','awaiting-price','succeeded','partial','failed','cancelled','interrupted')`)]);
+
+export const pipelineRunItems = pgTable('pipeline_run_item', {
+    id: uuid('id').primaryKey(),
+    runId: uuid('run_id').notNull().references(() => pipelineRuns.id),
+    organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+    userId: uuid('user_id').notNull().references(() => users.id),
+    index: integer('index').notNull(),
+    inputUrl: text('input_url'),
+    createdAt: timestamp('created_at', {mode: 'string', withTimezone: true}).defaultNow().notNull(),
+}, table => [uniqueIndex('pipeline_run_item_index_unique').on(table.runId, table.index),
+    index('pipeline_run_item_owner_idx').on(table.organizationId, table.userId, table.runId, table.index)]);
+
+export const pipelineRunSteps = pgTable('pipeline_run_step', {
+    id: uuid('id').primaryKey(),
+    runId: uuid('run_id').notNull().references(() => pipelineRuns.id),
+    itemId: uuid('item_id').notNull().references(() => pipelineRunItems.id),
+    organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+    userId: uuid('user_id').notNull().references(() => users.id),
+    nodeId: text('node_id').notNull(),
+    type: text('type').notNull(),
+    attempt: integer('attempt').default(1).notNull(),
+    active: boolean('active').default(true).notNull(),
+    status: text('status').$type<PipelineStepState>().default('queued').notNull(),
+    value: jsonb('value').$type<PipelineValue>(),
+    error: jsonb('error').$type<{code: string; message: string; retryable: boolean}>(),
+    claimToken: uuid('claim_token'),
+    leaseExpiresAt: timestamp('lease_expires_at', {mode: 'string', withTimezone: true}),
+    providerStartedAt: timestamp('provider_started_at', {mode: 'string', withTimezone: true}),
+    batchId: uuid('batch_id'),
+    backgroundRemovalJobId: uuid('background_removal_job_id').references(() => backgroundRemovalJobs.id),
+    createdAt: timestamp('created_at', {mode: 'string', withTimezone: true}).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', {mode: 'string', withTimezone: true}).defaultNow().notNull(),
+    startedAt: timestamp('started_at', {mode: 'string', withTimezone: true}),
+    completedAt: timestamp('completed_at', {mode: 'string', withTimezone: true}),
+}, table => [uniqueIndex('pipeline_step_active_unique').on(table.itemId, table.nodeId).where(sql`${table.active} = true`),
+    uniqueIndex('pipeline_step_attempt_unique').on(table.itemId, table.nodeId, table.attempt),
+    index('pipeline_step_owner_run_idx').on(table.organizationId, table.userId, table.runId, table.active),
+    index('pipeline_step_expired_idx').on(table.status, table.leaseExpiresAt),
+    check('pipeline_step_status_check', sql`${table.status} IN ('queued','running','awaiting-price','succeeded','failed','skipped','interrupted','cancelled')`),
+    check('pipeline_step_attempt_check', sql`${table.attempt} BETWEEN 1 AND 5`),
+    check('pipeline_step_claim_check', sql`(${table.status} = 'running' AND ${table.claimToken} IS NOT NULL AND ${table.leaseExpiresAt} IS NOT NULL) OR (${table.status} <> 'running' AND ${table.claimToken} IS NULL AND ${table.leaseExpiresAt} IS NULL)`)]);
+
+// Local image transforms have a known zero provider charge. Their exact
+// immutable object registrations participate in the existing daily retention.
+export const pipelineStepOutputs = pgTable('pipeline_step_output', {
+    id: uuid('id').primaryKey(),
+    stepId: uuid('step_id').notNull().references(() => pipelineRunSteps.id),
+    organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+    userId: uuid('user_id').notNull().references(() => users.id),
+    outputAssetId: uuid('output_asset_id').notNull().references(() => assets.id),
+    outputUrl: text('output_url').notNull(),
+    createdAt: timestamp('created_at', {mode: 'string', withTimezone: true}).defaultNow().notNull(),
+    deletedAt: timestamp('deleted_at', {mode: 'string', withTimezone: true}),
+}, table => [uniqueIndex('pipeline_step_output_asset_unique').on(table.outputAssetId),
+    index('pipeline_step_output_url_idx').on(table.outputUrl),
+    index('pipeline_step_output_retention_idx').on(table.createdAt, table.id).where(sql`${table.deletedAt} IS NULL`)]);
+
 export const systemPrompt = pgTable("systemPrompt", {
     id: serial("id").primaryKey(),
     organizationId: uuid('organizationId').references(() => organizations.id),
     userId: uuid('userId').references(() => users.id),
     personId: uuid('personId').references(() => people.id, {onDelete: 'set null'}),
+    pipelineStepId: uuid('pipelineStepId').references(() => pipelineRunSteps.id, {onDelete: 'set null'}),
+    pipelineTextConfig: jsonb('pipelineTextConfig').$type<{model: 'google/gemini-2.5-flash'; prompt: string; systemPrompt: string; temperature: number; maxOutputTokens: number; imageUrls: string[]}>(),
     TextPrompt: text("TextPrompt").notNull(),
     serverImages: jsonb("serverImages").$type<string[]>(),
     modelImages: jsonb("modelImages").$type<string[]>(),
@@ -192,6 +295,7 @@ export const systemPrompt = pgTable("systemPrompt", {
     errorJson: jsonb("errorJson").$type<StoredGenerationError>(),
 }, (table) => [
     index('systemPrompt_user_history_idx').on(table.organizationId, table.userId, table.createdAt, table.id),
+    index('systemPrompt_pipeline_step_idx').on(table.pipelineStepId, table.organizationId, table.userId),
     index('systemPrompt_person_idx').on(table.personId, table.organizationId, table.userId, table.id),
     index("systemPrompt_batchId_idx").on(table.batchId),
     index("systemPrompt_parentSystemPromptId_idx").on(table.parentSystemPromptId),
