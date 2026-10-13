@@ -41,5 +41,5 @@ export type AssetListingPage = {files: AssetFile[]; dirs?: AssetFolder[]; source
 
 export const ShareAssetSchema = z.object({
     recipientUserId: z.string().uuid(),
-    permission: z.enum(['view', 'edit']).default('view'),
+    permission: z.literal('view').default('view'),
 }).strict()

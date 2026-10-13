@@ -90,10 +90,11 @@ export function createAssetRepository(actor: AssetActor, db: Database = getDatab
         const grants = await db.select().from(assetShares).where(and(eq(assetShares.organizationId, actor.organizationId),
             eq(assetShares.recipientUserId, actor.userId), inArray(assetShares.assetId, chain.map(item => item.id))))
         if (!grants.length) assetNotFound()
-        const strongest = grants.find(grant => grant.permission === 'edit') ?? grants[0]!
-        const permissions: AssetPermissions = {view: true, edit: strongest.permission === 'edit', share: false}
-        if (intent === 'share' || (intent === 'edit' && !permissions.edit)) throw createError({statusCode: 403, statusMessage: 'This asset is shared with read-only access'})
-        return {permissions, sharedBy: await source(strongest.sharedByUserId), depth: chain.length}
+        // Sharing permits viewing, downloading and generation inputs only.
+        // Historical edit grants remain readable but never authorize mutations.
+        const permissions: AssetPermissions = {view: true, edit: false, share: false}
+        if (intent !== 'view') throw createError({statusCode: 403, statusMessage: 'This asset is shared with read-only access'})
+        return {permissions, sharedBy: await source(grants[0]!.sharedByUserId), depth: chain.length}
     }
     async function requireAsset(idOrUrl: string, intent: 'view' | 'edit' | 'share' = 'view') {
         const row = idOrUrl.startsWith('/images/') ? await byUrl(idOrUrl) : await byId(idOrUrl)
@@ -251,13 +252,13 @@ export function createAssetRepository(actor: AssetActor, db: Database = getDatab
     }
     async function sharesFor(id: string) {
         await requireAsset(id, 'share')
-        return db.select({id: assetShares.id, recipientUserId: assetShares.recipientUserId, permission: assetShares.permission,
+        return db.select({id: assetShares.id, recipientUserId: assetShares.recipientUserId, permission: sql<'view'>`'view'`,
             username: users.username, displayName: users.displayName, createdAt: assetShares.createdAt}).from(assetShares)
             .innerJoin(users, eq(users.id, assetShares.recipientUserId)).where(and(eq(assetShares.organizationId, actor.organizationId), eq(assetShares.assetId, id))).limit(200)
     }
-    async function share(id: string, recipientUserId: string, permission: 'view' | 'edit') {
+    async function share(id: string, recipientUserId: string, permission: 'view') {
         const {row} = await requireAsset(id, 'share')
-        if (permission !== 'view' && permission !== 'edit') throw createError({statusCode: 400, statusMessage: 'Invalid sharing permission'})
+        if (permission !== 'view') throw createError({statusCode: 400, statusMessage: 'Invalid sharing permission'})
         const [recipient] = await db.select({id: users.id}).from(users).where(and(eq(users.id, validAssetId(recipientUserId)),
             eq(users.organizationId, actor.organizationId), isNull(users.disabledAt), ne(users.id, actor.userId))).limit(1)
         if (!recipient) assetNotFound()

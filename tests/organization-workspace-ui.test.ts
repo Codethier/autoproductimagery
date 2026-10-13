@@ -24,7 +24,7 @@ registerHooks({
     if (url !== browserUrl && url !== layoutUrl) return nextLoad(url, context)
     const filename = fileURLToPath(url)
     let source = readFileSync(filename, 'utf8')
-    if (url === browserUrl) source = source.replace('</script>', 'defineExpose({files, directories, loading, openSharing, shareTarget, shareRecipient, sharePermission, saveShare, revokeShare, grants, currentFolder, selection, selectedMetadata, confirmSelection, fetchPage, view})\n</script>')
+    if (url === browserUrl) source = source.replace('</script>', 'defineExpose({files, directories, loading, openSharing, shareTarget, shareRecipient, saveShare, revokeShare, grants, currentFolder, preview, selection, selectedMetadata, confirmSelection, fetchPage, view})\n</script>')
     const {descriptor} = parse(source, {filename})
     const compiled = compileScript(descriptor, {id: filename, inlineTemplate: true})
     const services = `
@@ -40,13 +40,13 @@ registerHooks({
 })
 
 function fixtureFile(name: string, sourceId: string, permission: 'owner' | 'edit' | 'view'): AssetFile {
-  return {id: sourceId + '-' + name, name, url: `/images/organizations/org/users/${sourceId}/objects/blob/${name}`, folder: '/Spring', selectedImage: false, selectedModel: false, selectedMask: false,
+  return {id: sourceId + '-' + name, ownerUserId: sourceId, name, url: `/images/organizations/org/users/${sourceId}/objects/blob/${name}`, folder: '/Spring', selectedImage: false, selectedModel: false, selectedMask: false,
     permissions: {view: true, edit: permission !== 'view', share: permission === 'owner'}, kind: 'file', source: {userId: sourceId, username: sourceId, displayName: sourceId === 'alice' ? 'Alice' : 'Bea'},
     ...(permission !== 'owner' ? {sharedBy: {userId: sourceId, username: sourceId, displayName: sourceId === 'alice' ? 'Alice' : 'Bea'}} : {})}
 }
-async function renderBrowser(options: {shared?: boolean; files?: AssetFile[]; dirs?: AssetFolder[]} = {}) {
+async function renderBrowser(options: {shared?: boolean; files?: AssetFile[]; dirs?: AssetFolder[]; actorId?: string; currentFolder?: AssetFolder; selected?: boolean; preview?: boolean; sharing?: boolean} = {}) {
   const calls: Array<{url: string; options: any}> = []
-  const session = {account: ref({userId: 'member', organizationId: 'org', displayName: 'Member', username: 'member', role: 'user', organizationName: 'Studio'}), epoch: ref(0), identity: ref('org.member'), isOwner: ref(false)}
+  const session = {account: ref({userId: options.actorId ?? 'member', organizationId: 'org', displayName: 'Member', username: 'member', role: 'user', organizationName: 'Studio'}), epoch: ref(0), identity: ref('org.member'), isOwner: ref(false)}
   const environment: any = {session, exposed: undefined, fetch: async (url: string, options: any) => {
     calls.push({url, options})
     if (url === '/api/assets/share-targets') return {users: [{id: 'recipient', displayName: 'Cora', username: 'cora'}]}
@@ -57,7 +57,7 @@ async function renderBrowser(options: {shared?: boolean; files?: AssetFile[]; di
   const originalSetup = Browser.setup
   const component = {...Browser, setup(props: unknown, context: any) {
     return originalSetup(props, {...context, expose(value: any) {
-      environment.exposed = value; value.files.value = options.files ?? []; value.directories.value = options.dirs ?? []; value.loading.value = false; context.expose(value)
+      environment.exposed = value; value.files.value = options.files ?? []; value.directories.value = options.dirs ?? []; value.loading.value = false; if (options.currentFolder) value.currentFolder.value = options.currentFolder; if (options.selected) {value.selection.value = options.files?.map(file => file.url) ?? []; for (const file of options.files ?? []) value.selectedMetadata.value.set(file.url, file)}; if (options.preview) value.preview.value = options.files?.[0]; if (options.sharing) {value.shareTarget.value = options.files?.[0]; value.grants.value = [{id: 'legacy-grant', recipientUserId: 'recipient', permission: 'edit', username: 'cora', displayName: 'Cora', createdAt: '2026-10-12T00:00:00.000Z'}]}; context.expose(value)
     }})
   }}
   const app = createSSRApp({render: () => h(component, {initialScope: options.shared ? 'shared' : 'all', sharedOnly: options.shared})})
@@ -81,25 +81,44 @@ test('shared library groups images by the sharing person and hides destructive c
   browser.exposed.confirmSelection()
 })
 
-test('personal file sharing uses recipient IDs and explicit permissions, then revokes only that grant', async () => {
+test('personal file sharing grants view access with recipient IDs, then revokes only that grant', async () => {
   const file = fixtureFile('serum.png', 'alice', 'owner')
-  const browser = await renderBrowser({files: [file]})
+  const browser = await renderBrowser({files: [file], actorId: 'alice'})
   assert.match(browser.html, /aria-label="Share serum.png"/)
   await browser.exposed.openSharing(file)
   assert.equal(browser.calls[0].url, '/api/assets/share-targets')
   assert.equal(browser.calls[1].url, `/api/assets/${file.id}/shares`)
   browser.exposed.shareRecipient.value = 'recipient'
-  browser.exposed.sharePermission.value = 'view'
   await browser.exposed.saveShare()
-  assert.deepEqual(browser.calls.find(call => call.options?.method === 'POST')?.options.body, {recipientUserId: 'recipient', permission: 'view'})
+  assert.deepEqual(browser.calls.find(call => call.options?.method === 'POST')?.options.body, {recipientUserId: 'recipient'})
   await browser.exposed.revokeShare(browser.exposed.grants.value[0])
   assert.equal(browser.calls.at(-1)?.url, `/api/assets/${file.id}/shares/recipient`)
   assert.equal(browser.calls.at(-1)?.options.method, 'DELETE')
 })
 
+test('sharing dialog has one view permission and displays historical grants as view access', async () => {
+  const browser = await renderBrowser({files: [fixtureFile('serum.png', 'alice', 'owner')], actorId: 'alice', sharing: true})
+  assert.match(browser.html, /Can view/)
+  assert.match(browser.html, /Recipients can view, download, and use these images as generation inputs/)
+  assert.doesNotMatch(browser.html, /Sharing permission|Can edit|value="edit"/)
+})
+
+test('received files and folders stay read-only even when older metadata claims edit permissions', async () => {
+  const file = fixtureFile('legacy-shared.png', 'alice', 'edit')
+  file.permissions!.share = true
+  const folder: AssetFolder = {id: 'folder', ownerUserId: 'alice', name: 'Spring', url: '/images/organizations/org/users/alice/Spring', path: '/Spring', kind: 'folder', permissions: {view: true, edit: true, share: true}, sharedBy: file.sharedBy}
+  const browser = await renderBrowser({shared: true, files: [file], dirs: [folder], currentFolder: folder, selected: true, preview: true})
+  assert.match(browser.html, /Download/)
+  assert.match(browser.html, /Use in editor/)
+  assert.match(browser.html, /Can view/)
+  assert.doesNotMatch(browser.html, /Can edit|New folder|>Upload images<|>Delete<|aria-label="Delete folder|aria-label="Share legacy-shared/)
+  await browser.exposed.openSharing(file)
+  assert.deepEqual(browser.calls, [])
+})
+
 test('sharing responses from a previous account never populate the current account’s dialog', async () => {
   const file = fixtureFile('private.png', 'alice', 'owner')
-  const browser = await renderBrowser({files: [file]})
+  const browser = await renderBrowser({files: [file], actorId: 'alice'})
   let finishTargets!: (result: unknown) => void
   let finishShares!: (result: unknown) => void
   browser.environment.fetch = (url: string) => new Promise(resolve => { if (url === '/api/assets/share-targets') finishTargets = resolve; else finishShares = resolve })

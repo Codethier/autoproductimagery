@@ -9,12 +9,13 @@ import {drizzle} from 'drizzle-orm/node-postgres'
 import {migrate} from 'drizzle-orm/node-postgres/migrator'
 import {eq} from 'drizzle-orm'
 import {DeleteObjectCommand, DeleteObjectsCommand, GetObjectCommand, HeadObjectCommand, ListObjectsV2Command, PutObjectCommand} from '@aws-sdk/client-s3'
-import {assets, organizations, users} from '../server/db/schema.ts'
+import {assets, assetShares, organizations, users} from '../server/db/schema.ts'
 import {createAssetRepository, canonicalAssetUrl, decodeAssetCursor, encodeAssetCursor, assetCursorScope, type AssetActor} from '../server/utils/assetAccess.ts'
 import {createS3ImageStorage, type ImageStorageCommand} from '../server/utils/useFS.ts'
 import {useUserFS} from '../server/utils/useUserFS.ts'
 import {getDatabasePoolConfig} from '../server/utils/lib/db.ts'
 import {adoptLegacyAssets} from '../scripts/lib/legacyAssetAdoption.ts'
+import {ShareAssetSchema} from '../schemas/image-storage.ts'
 
 const integration = {skip: !process.env.TEST_DATABASE_URL, timeout: 60_000}
 const status = (code: number) => (error: unknown) => Boolean(error && typeof error === 'object' && 'statusCode' in error && error.statusCode === code)
@@ -102,6 +103,15 @@ test('asset URLs and listing cursors reject ambiguous paths and another user or 
     }
 })
 
+test('sharing requests default to view and reject edit or other permissions', () => {
+    const recipientUserId = randomUUID()
+    assert.deepEqual(ShareAssetSchema.parse({recipientUserId}), {recipientUserId, permission: 'view'})
+    assert.equal(ShareAssetSchema.safeParse({recipientUserId, permission: 'view'}).success, true)
+    for (const permission of ['edit', 'owner', 'download', null, true]) {
+        assert.equal(ShareAssetSchema.safeParse({recipientUserId, permission}).success, false)
+    }
+})
+
 test('each user has an immutable private namespace; organization owners cannot read others private assets', integration, async () => fixture(async f => {
     const aliceFS = await useUserFS(f.alice, f.storage, f.db), bobFS = await useUserFS(f.bob, f.storage, f.db)
     const ownerFS = await useUserFS(f.owner, f.storage, f.db), outsiderFS = await useUserFS(f.outsider, f.storage, f.db)
@@ -154,23 +164,42 @@ test('folder sharing inherits to descendants and new uploads, is source grouped,
     assert.deepEqual(await bobFS.resolveAssets([nested.url, added.url]), [])
 }))
 
-test('edit grants allow mutations within the granted folder but never re-sharing or unrelated access', integration, async () => fixture(async f => {
+test('historical edit grants remain readable generation sources but cannot authorize any shared mutations', integration, async () => fixture(async f => {
     const aliceFS = await useUserFS(f.alice, f.storage, f.db), bobFS = await useUserFS(f.bob, f.storage, f.db)
     const folder = await aliceFS.createFolder('/', 'Campaign')
-    await aliceFS.share(folder.id!, f.bob.userId, 'edit')
-    const contributed = await bobFS.saveUpload(folder.url!, upload(f.bytes))
-    assert.equal(contributed.ownerUserId, f.alice.userId)
-    assert.equal(contributed.permissions?.edit, true)
-    assert.equal(contributed.permissions?.share, false)
-    assert.equal(contributed.folder, '/Campaign')
-    assert.equal((await bobFS.listAssets()).files.length, 0)
-    assert.equal((await aliceFS.listAssets()).files.length, 1)
-    await bobFS.createFolder(folder.url!, 'Draft')
-    await assert.rejects(bobFS.sharesFor(contributed.id!), status(403))
-    await bobFS.deleteFileOrFolder(contributed.url, 'file')
-    await assert.rejects(aliceFS.getImageFile(contributed.url), status(404))
-    await bobFS.deleteFileOrFolder(folder.url!, 'directory')
-    assert.deepEqual((await aliceFS.readDir('/')).dirs, [])
+    const image = await aliceFS.saveUpload('/Campaign', upload(f.bytes))
+    const output = await aliceFS.saveGeneratedImage(f.bytes)
+    const outputAsset = await aliceFS.assetByUrl(output.url)
+    const grantId = randomUUID()
+    await f.db.insert(assetShares).values([
+        {id: grantId, assetId: folder.id!, organizationId: f.alice.organizationId, sharedByUserId: f.alice.userId, recipientUserId: f.bob.userId, permission: 'edit'},
+        {id: randomUUID(), assetId: outputAsset.id!, organizationId: f.alice.organizationId, sharedByUserId: f.alice.userId, recipientUserId: f.bob.userId, permission: 'edit'},
+    ])
+    await assert.rejects(Reflect.apply(aliceFS.share, undefined, [folder.id!, f.bob.userId, 'edit']), status(400))
+    const received = await bobFS.readDir('/', {folderId: folder.id!})
+    assert.deepEqual(received.files[0]?.permissions, {view: true, edit: false, share: false})
+    assert.deepEqual(received.folder?.permissions, {view: true, edit: false, share: false})
+    assert.equal((await aliceFS.sharesFor(folder.id!))[0]?.permission, 'view')
+    assert.equal((await f.db.select().from(assetShares).where(eq(assetShares.id, grantId)))[0]?.permission, 'edit', 'runtime restriction does not rewrite historical grants')
+    assert.equal((await bobFS.getImageFile(image.url)).width, 4)
+    await bobFS.assertReadableImages([image.url, output.url])
+    const beforeMutations = f.s3.commands.length
+    await assert.rejects(bobFS.saveUpload(folder.url!, upload(f.bytes)), status(403))
+    await assert.rejects(bobFS.createFolder(folder.url!, 'Draft'), status(403))
+    await assert.rejects(bobFS.deleteFileOrFolder(image.url, 'file'), status(403))
+    await assert.rejects(bobFS.deleteFileOrFolder(folder.url!, 'directory'), status(403))
+    await assert.rejects(bobFS.removeGeneratedImage(output.url), status(403))
+    await assert.rejects(bobFS.share(folder.id!, f.owner.userId, 'view'), status(403))
+    await assert.rejects(bobFS.revoke(folder.id!, f.bob.userId), status(403))
+    await assert.rejects(bobFS.sharesFor(image.id!), status(403))
+    assert.equal(f.s3.commands.length, beforeMutations, 'denied shared mutations must not reach S3')
+    const derivative = await bobFS.saveGeneratedImage((await bobFS.getImageFile(image.url)).buffer)
+    assert.match(derivative.url, new RegExp(`/users/${f.bob.userId}/output/`))
+    await assert.rejects(aliceFS.getImageFile(derivative.url), status(404))
+    assert.equal((await aliceFS.getImageFile(image.url)).width, 4)
+    await aliceFS.createFolder('/Campaign', 'Owner draft')
+    await aliceFS.deleteFileOrFolder(folder.url!, 'directory')
+    await assert.rejects(bobFS.getImageFile(image.url), status(404))
 }))
 
 test('deleting then uploading the same filename cannot reuse replay URLs or inherit a deleted file share', integration, async () => fixture(async f => {
@@ -274,15 +303,16 @@ test('legacy adoption is explicit, bootstrap-owner-only, bounded, idempotent and
     await assert.rejects(ownerFS.getImageFile('/images/Legacy/original.png'), status(404))
 }))
 
-test('deleting an edit-shared folder named objects only removes its registered descendants, preserving private UUID blobs', integration, async () => fixture(async f => {
+test('shared recipients cannot delete a folder named objects; owner deletion only removes registered descendants', integration, async () => fixture(async f => {
     const aliceFS = await useUserFS(f.alice, f.storage, f.db), bobFS = await useUserFS(f.bob, f.storage, f.db)
     const folder = await aliceFS.createFolder('/', 'objects')
-    await aliceFS.share(folder.id!, f.bob.userId, 'edit')
+    await aliceFS.share(folder.id!, f.bob.userId, 'view')
     const privateImage = await aliceFS.saveUpload('/', upload(f.bytes, 'private.png'))
     const sharedImage = await aliceFS.saveUpload('/objects', upload(f.bytes, 'shared.png'))
     await assert.rejects(bobFS.getImageFile(privateImage.url), status(404))
+    await assert.rejects(bobFS.deleteFileOrFolder(folder.url!, 'directory'), status(403))
     const beforeDelete = f.s3.commands.length
-    await bobFS.deleteFileOrFolder(folder.url!, 'directory')
+    await aliceFS.deleteFileOrFolder(folder.url!, 'directory')
     assert.ok(f.s3.commands.slice(beforeDelete).every(command => command instanceof DeleteObjectsCommand), 'deletion must batch only exact registered keys without physical prefix enumeration')
     assert.equal((await aliceFS.getImageFile(privateImage.url)).width, 4)
     await assert.rejects(aliceFS.getImageFile(sharedImage.url), status(404))
