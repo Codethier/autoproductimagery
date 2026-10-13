@@ -9,8 +9,8 @@ export default defineEventHandler(async event => {
     try {
         const actor = await useAuth(event), repository = createPeopleRepository(actor)
         const id = getRouterParam(event, 'id') ?? ''
-        await repository.requirePerson(id)
-        await refreshPendingAccountBilling(actor)
+        const person = await repository.requirePerson(id)
+        if (person.userId === actor.userId) await refreshPendingAccountBilling(actor)
         return await repository.get(id, getQuery(event))
     } catch (error) {return peopleRequestError(error)}
 })

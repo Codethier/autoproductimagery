@@ -169,6 +169,7 @@ export async function useUserFS(actor: AssetActor, storage?: RawStorage, databas
                 await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${actor.organizationId + ':' + actor.userId}, 0))`)
                 const fresh = createAssetRepository(actor, tx as unknown as typeof database)
                 const candidate = await fresh.requireAsset(source.url)
+                if (candidate.personGrant) await fresh.lockPeoplePhotoGrant(candidate.row, candidate.personGrant)
                 const chain = await fresh.ancestors(candidate.row)
                 // Hold publication's source/grant checks until commit. Revocation and
                 // subtree tombstoning either finish first or serialize after publication.

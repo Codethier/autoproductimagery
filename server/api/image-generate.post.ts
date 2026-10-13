@@ -186,7 +186,7 @@ export default defineEventHandler(async (event) => {
     )
     const database = await useDB(undefined, account)
     const imageFs = await useUserFS(account)
-    if (request.personId) await createPeopleRepository(account).requirePerson(request.personId)
+    if (request.personId) await createPeopleRepository(account).requireOwnedPerson(request.personId)
     // Check every source before reserving capacity, creating pending records,
     // or starting paid provider work. The Gateway also checks each actual read.
     await imageFs.assertReadableImages([

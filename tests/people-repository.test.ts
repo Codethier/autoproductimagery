@@ -6,12 +6,12 @@ import {Pool} from 'pg'
 import {drizzle} from 'drizzle-orm/node-postgres'
 import {migrate} from 'drizzle-orm/node-postgres/migrator'
 import {count, eq, sql} from 'drizzle-orm'
-import {assets, organizations, people, personPhotos, systemPrompt, users, accountGenerationCharges} from '../server/db/schema.ts'
+import {assets, organizations, people, personPhotos, personShares, systemPrompt, users, accountGenerationCharges} from '../server/db/schema.ts'
 import {createAssetRepository, type AssetActor} from '../server/utils/assetAccess.ts'
 import {createPeopleRepository, peopleRequestError} from '../server/utils/peopleRepository.ts'
 import {getDatabasePoolConfig} from '../server/utils/lib/db.ts'
 import {useDB} from '../server/utils/useDB.ts'
-import {CreatePersonSchema, UpdatePersonSchema, AddPersonPhotosSchema, PeopleListQuerySchema, PersonPhotosQuerySchema} from '../schemas/people.ts'
+import {CreatePersonSchema, UpdatePersonSchema, AddPersonPhotosSchema, PeopleListQuerySchema, PersonPhotosQuerySchema, SharePersonSchema} from '../schemas/people.ts'
 import {createDefaultSettings, ImageGenerationRequestSchema} from '../schemas/image-generation.ts'
 
 const integration = {skip: !process.env.TEST_DATABASE_URL, timeout: 60_000}
@@ -65,11 +65,14 @@ test('people schemas enforce bounded names, descriptions, strict JSON, query bou
     assert.equal(UpdatePersonSchema.safeParse({description: ''}).success, true)
     assert.equal(AddPersonPhotosSchema.safeParse({urls: []}).success, false)
     assert.equal(AddPersonPhotosSchema.safeParse({urls: Array.from({length: 21}, () => '/images/a.png')}).success, false)
-    assert.deepEqual(PeopleListQuerySchema.parse({}), {limit: 30, search: ''})
+    assert.deepEqual(PeopleListQuerySchema.parse({}), {limit: 30, search: '', scope: 'mine'})
     for (const query of [{limit: 51}, {limit: 0}, {search: 'x'.repeat(101)}, {cursor: 'x'.repeat(513)}, {unknown: true}]) {
         assert.equal(PeopleListQuerySchema.safeParse(query).success, false)
     }
     assert.equal(PersonPhotosQuerySchema.safeParse({limit: '40'}).success, true)
+    assert.equal(PeopleListQuerySchema.safeParse({scope: 'shared', sourceId: randomUUID()}).success, true)
+    assert.equal(PeopleListQuerySchema.safeParse({sourceId: randomUUID()}).success, false)
+    assert.equal(SharePersonSchema.safeParse({recipientUserId: randomUUID(), permission: 'edit'}).success, false)
     const request = {prompt: 'Portrait', model: 'openai/gpt-image-2', inputImages: [], settings: createDefaultSettings('openai/gpt-image-2'), personId: randomUUID(), personPictureCount: 4}
     assert.equal(ImageGenerationRequestSchema.safeParse(request).success, true)
     assert.equal(ImageGenerationRequestSchema.safeParse({...request, settings: {...request.settings, numberOfImages: 2}}).success, false)
@@ -266,4 +269,115 @@ test('profile removal finishes while generation settlement holds its output row,
     assert.equal(charge!.confirmedUnits, '250000000000')
     assert.equal((await f.db.select().from(assets).where(eq(assets.id, image.id)))[0]!.deletedAt, null)
     await assert.rejects(() => repository.get(person.id), status(404))
+}))
+
+test('same-organization people sharing is idempotent, readable and strictly view-only for recipients', integration, async () => fixture(async f => {
+    const ownerRepository = createPeopleRepository(f.alice, f.db), recipientRepository = createPeopleRepository(f.bob, f.db)
+    const person = (await ownerRepository.create({name: 'Ada', description: 'Portrait reference'})).person
+    const original = await output(f.db, f.alice, person.id)
+    await assert.rejects(() => recipientRepository.get(person.id), status(404))
+    const shared = await Promise.all([ownerRepository.share(person.id, {recipientUserId: f.bob.userId}), ownerRepository.share(person.id, {recipientUserId: f.bob.userId})])
+    assert.equal(shared[0]!.shares.length, 1)
+    assert.equal(shared[0]!.shares[0]!.id, shared[1]!.shares[0]!.id)
+    assert.equal(shared[0]!.shares[0]!.permission, 'view')
+    assert.equal((await recipientRepository.list()).people.length, 0)
+    const listing = await recipientRepository.list({scope: 'shared'})
+    assert.equal(listing.people.length, 1)
+    assert.deepEqual(listing.people[0]!.permissions, {view: true, edit: false, share: false})
+    assert.equal(listing.people[0]!.ownerUserId, f.alice.userId)
+    assert.deepEqual(listing.people[0]!.sharedBy, {userId: f.alice.userId, username: f.alice.username, displayName: f.alice.displayName})
+    assert.deepEqual(listing.sources, [listing.people[0]!.sharedBy])
+    const detail = await recipientRepository.get(person.id)
+    assert.equal(detail.photos[0]!.id, original.image.id)
+    assert.equal(detail.photos[0]!.priceUsd, '0.04')
+    for (const mutate of [() => recipientRepository.update(person.id, {name: 'Changed'}), () => recipientRepository.remove(person.id),
+        () => recipientRepository.addPhotos(person.id, {urls: [original.image.url]}), () => recipientRepository.removePhoto(person.id, original.image.id),
+        () => recipientRepository.sharesFor(person.id), () => recipientRepository.share(person.id, {recipientUserId: f.owner.userId}),
+        () => recipientRepository.revoke(person.id, f.bob.userId), () => recipientRepository.requireOwnedPerson(person.id)]) {
+        await assert.rejects(mutate, status(404))
+    }
+    await assert.rejects(() => (async () => (await useDB(f.db, f.bob)).createPendingGeneration(pendingData(person.id)))(), status(404))
+    await assert.rejects(() => createPeopleRepository(f.owner, f.db).get(person.id), status(404))
+    await assert.rejects(() => createPeopleRepository(f.outsider, f.db).get(person.id), status(404))
+}))
+
+test('people share targets enforce enabled organization membership, owner control and strict recipient requests', integration, async () => fixture(async f => {
+    const repository = createPeopleRepository(f.alice, f.db), person = (await repository.create({name: 'Ada'})).person
+    const targets = await repository.shareTargets()
+    assert.deepEqual(new Set(targets.map(row => row.id)), new Set([f.bob.userId, f.owner.userId]))
+    for (const recipientUserId of [f.alice.userId, f.outsider.userId, randomUUID()]) await assert.rejects(() => repository.share(person.id, {recipientUserId}), status(404))
+    await assert.rejects(() => repository.share(person.id, {recipientUserId: f.bob.userId, permission: 'edit'}), status(400))
+    await f.db.update(users).set({disabledAt: sql`CURRENT_TIMESTAMP`}).where(eq(users.id, f.bob.userId))
+    await assert.rejects(() => repository.share(person.id, {recipientUserId: f.bob.userId}), status(404))
+    assert.equal((await repository.shareTargets()).some(row => row.id === f.bob.userId), false)
+    assert.equal((await f.db.select().from(personShares)).length, 0)
+}))
+
+test('shared people expose future settled photos and withdraw unlinked, expired, revoked and deleted access', integration, async () => fixture(async f => {
+    const owner = createPeopleRepository(f.alice, f.db), reader = createPeopleRepository(f.bob, f.db), person = (await owner.create({name: 'Ada'})).person
+    await owner.share(person.id, {recipientUserId: f.bob.userId})
+    const awaiting = await output(f.db, f.alice, person.id, {billingState: 'awaiting', priceSource: 'estimate', priceUsd: '0.01'})
+    let view = await reader.get(person.id)
+    assert.equal(view.person.photoCount, 0)
+    assert.equal(view.pendingCount, 1)
+    assert.ok(!JSON.stringify(view).includes(awaiting.image.url))
+    await f.db.update(systemPrompt).set({billingState: 'confirmed', priceSource: 'gateway', priceUsd: '0'}).where(eq(systemPrompt.id, awaiting.generation.id))
+    assert.equal((await reader.get(person.id)).photos[0]!.priceUsd, '0')
+    await owner.removePhoto(person.id, awaiting.image.id)
+    assert.equal((await reader.get(person.id)).photos.length, 0)
+    await owner.addPhotos(person.id, {urls: [awaiting.image.url]})
+    assert.equal((await reader.get(person.id)).photos.length, 1)
+    await f.db.update(systemPrompt).set({outputImageDeletedAt: sql`CURRENT_TIMESTAMP`}).where(eq(systemPrompt.id, awaiting.generation.id))
+    assert.equal((await reader.get(person.id)).photos.length, 0)
+    await owner.revoke(person.id, f.bob.userId)
+    await assert.rejects(() => reader.get(person.id), status(404))
+    assert.equal((await reader.list({scope: 'shared'})).people.length, 0)
+    await owner.share(person.id, {recipientUserId: f.bob.userId})
+    await owner.remove(person.id)
+    await assert.rejects(() => reader.get(person.id), status(404))
+    assert.equal((await reader.list({scope: 'shared'})).sources.length, 0)
+    assert.equal((await f.db.select().from(assets).where(eq(assets.id, awaiting.image.id)))[0]!.deletedAt, null)
+}))
+
+test('disabled owners/recipients and forged cross-owner grants cannot expose people', integration, async () => fixture(async f => {
+    const owner = createPeopleRepository(f.alice, f.db), reader = createPeopleRepository(f.bob, f.db), person = (await owner.create({name: 'Ada'})).person
+    await output(f.db, f.alice, person.id)
+    await owner.share(person.id, {recipientUserId: f.bob.userId})
+    await f.db.update(users).set({disabledAt: sql`CURRENT_TIMESTAMP`}).where(eq(users.id, f.alice.userId))
+    await assert.rejects(() => reader.get(person.id), status(404))
+    assert.equal((await reader.list({scope: 'shared'})).people.length, 0)
+    await f.db.update(users).set({disabledAt: null}).where(eq(users.id, f.alice.userId))
+    await f.db.update(users).set({disabledAt: sql`CURRENT_TIMESTAMP`}).where(eq(users.id, f.bob.userId))
+    await assert.rejects(() => reader.get(person.id), status(404))
+    await f.db.update(users).set({disabledAt: null}).where(eq(users.id, f.bob.userId))
+    await f.db.update(personShares).set({sharedByUserId: f.owner.userId}).where(eq(personShares.personId, person.id))
+    await assert.rejects(() => reader.get(person.id), status(404))
+    assert.equal((await reader.list({scope: 'shared'})).sources.length, 0)
+}))
+
+test('shared people source grouping and cursors stay recipient/scope/source bound', integration, async () => fixture(async f => {
+    const alice = createPeopleRepository(f.alice, f.db), owner = createPeopleRepository(f.owner, f.db), reader = createPeopleRepository(f.bob, f.db)
+    for (const repository of [alice, alice, owner]) {
+        const person = (await repository.create({name: 'Portrait'})).person
+        await repository.share(person.id, {recipientUserId: f.bob.userId})
+    }
+    const page = await reader.list({scope: 'shared', sourceId: f.alice.userId, limit: 1})
+    assert.equal(page.people.length, 1)
+    assert.equal(page.people[0]!.ownerUserId, f.alice.userId)
+    assert.deepEqual(new Set(page.sources.map(row => row.userId)), new Set([f.alice.userId, f.owner.userId]))
+    assert.ok(page.nextCursor)
+    assert.equal((await reader.list({scope: 'shared', sourceId: f.alice.userId, cursor: page.nextCursor!, limit: 1})).people.length, 1)
+    await assert.rejects(() => reader.list({scope: 'shared', sourceId: f.owner.userId, cursor: page.nextCursor!}), status(400))
+    await assert.rejects(() => reader.list({scope: 'mine', cursor: page.nextCursor!}), status(400))
+    await assert.rejects(() => createPeopleRepository(f.owner, f.db).list({scope: 'shared', sourceId: f.alice.userId, cursor: page.nextCursor!}), status(400))
+}))
+
+test('reciprocal people sharing completes without taking recipient account locks', integration, async () => fixture(async f => {
+    const alice = createPeopleRepository(f.alice, f.db), bob = createPeopleRepository(f.bob, f.db)
+    const first = (await alice.create({name: 'Ada'})).person, second = (await bob.create({name: 'Bea'})).person
+    const result = await Promise.all([alice.share(first.id, {recipientUserId: f.bob.userId}), bob.share(second.id, {recipientUserId: f.alice.userId})])
+    assert.equal(result[0]!.shares.length, 1)
+    assert.equal(result[1]!.shares.length, 1)
+    assert.equal((await alice.list({scope: 'shared'})).people[0]!.id, second.id)
+    assert.equal((await bob.list({scope: 'shared'})).people[0]!.id, first.id)
 }))

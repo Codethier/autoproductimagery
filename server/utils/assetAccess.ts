@@ -2,7 +2,7 @@ import {createHash, randomUUID} from 'node:crypto'
 import {createError} from 'h3'
 import {and, asc, eq, gt, inArray, isNull, ne, sql, type SQLWrapper} from 'drizzle-orm'
 import {alias} from 'drizzle-orm/pg-core'
-import {assets, assetShares, users, systemPrompt} from '../db/schema'
+import {assets, assetShares, users, systemPrompt, people, personPhotos, personShares} from '../db/schema'
 import {confirmedGenerationPriceCondition} from './generationVisibility'
 import {getDatabase} from './lib/db'
 import {imagePathToUrl, parseImagePath, validateImagePathSegment} from './imageStoragePaths'
@@ -10,6 +10,7 @@ import type {AssetFile, AssetFolder, AssetPermissions, AssetSource} from '../../
 
 export type AssetActor = {userId: string; organizationId: string; username: string; displayName: string; role: 'owner' | 'user'}
 export type AssetRecord = typeof assets.$inferSelect
+export type PeoplePhotoGrant = {personId: string; shareId: string; ownerUserId: string}
 type Database = ReturnType<typeof getDatabase>
 export const MAX_ASSET_FOLDER_DEPTH = 32
 export const MAX_REGISTERED_TREE_ENTRIES = 10_000
@@ -43,6 +44,8 @@ export function encodeAssetCursor(after: string, scope: string) { return Buffer.
 
 export function createAssetRepository(actor: AssetActor, db: Database = getDatabase()) {
     const parent = alias(assets, 'parent_asset')
+    const personOwner = alias(users, 'person_photo_owner')
+    const personRecipient = alias(users, 'person_photo_recipient')
     const sourceCache = new Map<string, Promise<AssetSource>>([[actor.userId, Promise.resolve({userId: actor.userId, username: actor.username, displayName: actor.displayName})]])
     const priceCache = new Map<string, {priceUsd: string | null; priceSource: string | null; billingState: 'pending' | 'awaiting' | 'confirmed' | 'released' | null}>()
     type OutputIdentity = {organizationId: SQLWrapper; ownerUserId: SQLWrapper; url: SQLWrapper}
@@ -121,17 +124,53 @@ export function createAssetRepository(actor: AssetActor, db: Database = getDatab
         }
         return value
     }
+    async function peoplePhotoGrant(row: AssetRecord): Promise<PeoplePhotoGrant | undefined> {
+        if (row.kind !== 'file') return
+        const [grant] = await db.select({personId: people.id, shareId: personShares.id, ownerUserId: people.userId})
+            .from(personShares).innerJoin(people, eq(people.id, personShares.personId))
+            .innerJoin(personOwner, and(eq(personOwner.id, people.userId), eq(personOwner.organizationId, people.organizationId), isNull(personOwner.disabledAt)))
+            .innerJoin(personRecipient, and(eq(personRecipient.id, personShares.recipientUserId), eq(personRecipient.organizationId, people.organizationId), isNull(personRecipient.disabledAt)))
+            .where(and(eq(personShares.organizationId, actor.organizationId), eq(people.organizationId, actor.organizationId),
+                eq(personShares.recipientUserId, actor.userId), eq(personShares.sharedByUserId, people.userId),
+                eq(people.userId, row.ownerUserId), isNull(people.deletedAt),
+                sql`NOT EXISTS (SELECT 1 FROM ${personPhotos} WHERE ${personPhotos.personId} = ${people.id}
+                    AND ${personPhotos.assetId} = ${row.id} AND ${personPhotos.excluded} = true)`,
+                sql`(EXISTS (SELECT 1 FROM ${personPhotos} WHERE ${personPhotos.personId} = ${people.id}
+                    AND ${personPhotos.assetId} = ${row.id} AND ${personPhotos.excluded} = false)
+                    OR EXISTS (SELECT 1 FROM ${systemPrompt} WHERE ${systemPrompt.personId} = ${people.id}
+                        AND ${systemPrompt.organizationId} = ${people.organizationId} AND ${systemPrompt.userId} = ${people.userId}
+                        AND ${systemPrompt.outputImage} = ${row.url} AND ${systemPrompt.outputImageDeletedAt} IS NULL
+                        AND (${systemPrompt.status} = 'succeeded' OR (${systemPrompt.status} IS NULL AND ${systemPrompt.errors} IS NULL))))`))
+            .orderBy(asc(people.id)).limit(1)
+        return grant
+    }
+    /** In a publication transaction, serialize with profile/share/unlink and
+     * account mutations before locking media. People mutations lock users
+     * before profiles; keeping that order avoids account/profile deadlocks. */
+    async function lockPeoplePhotoGrant(row: AssetRecord, grant: PeoplePhotoGrant) {
+        const enabled = await db.select({id: users.id}).from(users).where(and(eq(users.organizationId, actor.organizationId),
+            inArray(users.id, [...new Set([actor.userId, row.ownerUserId])]), isNull(users.disabledAt))).orderBy(asc(users.id)).for('share')
+        if (enabled.length !== new Set([actor.userId, row.ownerUserId]).size) assetNotFound()
+        const [person] = await db.select({id: people.id}).from(people).where(and(eq(people.id, grant.personId),
+            eq(people.organizationId, actor.organizationId), eq(people.userId, row.ownerUserId), isNull(people.deletedAt))).for('share').limit(1)
+        if (!person) assetNotFound()
+        const [share] = await db.select({id: personShares.id}).from(personShares).where(and(eq(personShares.id, grant.shareId),
+            eq(personShares.personId, person.id), eq(personShares.organizationId, actor.organizationId),
+            eq(personShares.sharedByUserId, row.ownerUserId), eq(personShares.recipientUserId, actor.userId))).for('share').limit(1)
+        if (!share || !await peoplePhotoGrant(row)) assetNotFound()
+    }
     async function access(row: AssetRecord, intent: 'view' | 'edit' | 'share' = 'view') {
         const chain = await ancestors(row)
-        if (row.ownerUserId === actor.userId) return {permissions: {view: true, edit: true, share: true}, sharedBy: undefined, depth: chain.length}
+        if (row.ownerUserId === actor.userId) return {permissions: {view: true, edit: true, share: true}, sharedBy: undefined, depth: chain.length, personGrant: undefined}
         const grants = await db.select().from(assetShares).where(and(eq(assetShares.organizationId, actor.organizationId),
             eq(assetShares.recipientUserId, actor.userId), inArray(assetShares.assetId, chain.map(item => item.id))))
-        if (!grants.length) assetNotFound()
+        const personGrant = grants.length ? undefined : await peoplePhotoGrant(row)
+        if (!grants.length && !personGrant) assetNotFound()
         // Sharing permits viewing, downloading and generation inputs only.
         // Historical edit grants remain readable but never authorize mutations.
         const permissions: AssetPermissions = {view: true, edit: false, share: false}
         if (intent !== 'view') throw createError({statusCode: 403, statusMessage: 'This asset is shared with read-only access'})
-        return {permissions, sharedBy: await source(grants[0]!.sharedByUserId), depth: chain.length}
+        return {permissions, sharedBy: await source(grants[0]?.sharedByUserId ?? personGrant!.ownerUserId), depth: chain.length, personGrant}
     }
     async function requireAsset(idOrUrl: string, intent: 'view' | 'edit' | 'share' = 'view') {
         const row = idOrUrl.startsWith('/images/') ? await byUrl(idOrUrl) : await byId(idOrUrl)
@@ -338,5 +377,5 @@ export function createAssetRepository(actor: AssetActor, db: Database = getDatab
         await db.delete(assetShares).where(and(eq(assetShares.organizationId, actor.organizationId), eq(assetShares.assetId, id),
             eq(assetShares.recipientUserId, validAssetId(recipientUserId))))
     }
-    return {byId, byUrl, requireAsset, ancestors, source, dto, folderDto, logicalPath, resolveFolder, list, descendants, register, markDeleted, prepareDeletion, restoreDeletion, shareTargets, sharesFor, share, revoke, db}
+    return {byId, byUrl, requireAsset, ancestors, source, dto, folderDto, logicalPath, resolveFolder, list, descendants, register, markDeleted, prepareDeletion, restoreDeletion, shareTargets, sharesFor, share, revoke, lockPeoplePhotoGrant, db}
 }

@@ -16,7 +16,7 @@ const progressUrl = new URL('app/composables/usePeopleGenerationProgress.ts', ro
 const favouritesUrl = new URL('app/composables/useImageModelFavourites.ts', root).href
 const key = '__peopleUiTest'
 const exposures: Record<string, string> = {
-  [browserUrl]: 'people, activePerson, photos, pendingCount, failedCount, photoCursor, selection, loading, loadingMore, detailLoading, saving, removing, attaching, detailError, errorMessage, newName, newDescription, editName, editDescription, search, keyword, createOpen, selectionNotice, openPerson, back, loadPeople, loadPerson, pollDetail, togglePhoto, confirm, createPerson, savePerson, removePhoto, generated, generatorClosed, visibilityChanged, pollingPaused',
+  [browserUrl]: 'people, activePerson, photos, pendingCount, failedCount, photoCursor, selection, loading, loadingMore, detailLoading, saving, removing, attaching, detailError, errorMessage, newName, newDescription, editName, editDescription, search, keyword, createOpen, selectionNotice, openPerson, back, loadPeople, loadPerson, pollDetail, togglePhoto, confirm, createPerson, savePerson, deletePerson, attachPhotos, removePhoto, generated, generatorClosed, visibilityChanged, pollingPaused, scope, sources, sourceId, shareTarget, shares, shareUsers, shareRecipient, shareLoading, shareSaving, shareError, openShares, closeShares, loadShares, grantShare, revokeShare, changeScope, editablePerson',
   [generatorUrl]: 'model, settings, models, referenceUrls, selectedReferences, scene, pictureCount, totalPictures, canGenerate, generate, generating, running, errorMessage, toggleReference, generationPrompt, loadModels',
 }
 registerHooks({
@@ -47,13 +47,13 @@ registerHooks({
 const source = '/images/organizations/org/users/alice/objects/portrait/person.png'
 const otherSource = '/images/organizations/org/users/alice/objects/product/product.png'
 function photo(overrides: Partial<PersonPhoto> = {}): PersonPhoto { return {id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', url: source, name: 'Portrait.png', priceUsd: '0.035', priceSource: 'gateway', generationId: 42, ...overrides} }
-function person(overrides: Partial<Person> = {}): Person { return {id: '11111111-1111-4111-8111-111111111111', name: 'Alex', description: 'An adult with short auburn hair, freckles, and relaxed style.', photoCount: 1, cover: photo(), createdAt: '2026-10-13T00:00:00.000Z', updatedAt: '2026-10-13T00:00:00.000Z', ...overrides} }
+function person(overrides: Partial<Person> = {}): Person { return {id: '11111111-1111-4111-8111-111111111111', ownerUserId: 'alice', permissions: {view: true, edit: true, share: true}, name: 'Alex', description: 'An adult with short auburn hair, freckles, and relaxed style.', photoCount: 1, cover: photo(), createdAt: '2026-10-13T00:00:00.000Z', updatedAt: '2026-10-13T00:00:00.000Z', ...overrides} }
 function detail(pictures = [photo()], overrides: Record<string, unknown> = {}) { return {person: person({photoCount: pictures.length}), photos: pictures, pendingCount: 0, failedCount: 0, nextCursor: null, ...overrides} }
 function environment(fetch?: (url: string, options: any) => unknown) {
   const calls: Array<{url: string; options: any}> = []
   const states = new Map<string, ReturnType<typeof ref>>()
   const favouriteIds = ref<ImageModelId[]>([])
-  const account = {epoch: ref(1), identity: ref('org.alice')}
+  const account = {epoch: ref(1), identity: ref('org.alice'), account: ref({userId: 'alice', organizationId: 'org'})}
   const models = SUPPORTED_IMAGE_MODEL_IDS.map(id => ({id, catalogStatus: 'available'}))
   return {account, calls, models, states,
     state(name: string, initial: () => unknown) { if (!states.has(name)) states.set(name, ref(initial())); return states.get(name)! },
@@ -250,5 +250,124 @@ test('hidden profiles perform no progress requests and terminal profiles do not 
   await value.exposed.pollDetail(); assert.equal(env.calls.length, count)
   value.exposed.pendingCount.value = 1; (globalThis as any).document.visibilityState = 'hidden'; value.exposed.visibilityChanged()
   await value.exposed.pollDetail(); assert.equal(env.calls.length, count)
+  value.app.unmount()
+})
+
+const beaId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+const charlieId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
+const sharedPhoto = () => photo({url: source.replace('/alice/', '/bea/')})
+function sharedPerson(overrides: Partial<Person> = {}): Person { return person({ownerUserId: beaId, sharedBy: {userId: beaId, username: 'bea', displayName: 'Bea Studio'}, permissions: {view: true, edit: false, share: false}, cover: sharedPhoto(), ...overrides}) }
+const target = (id = beaId) => ({id, username: id === beaId ? 'bea' : 'charlie', displayName: id === beaId ? 'Bea Studio' : 'Charlie Studio'})
+const share = (id = beaId) => ({id: 'grant-1', recipientUserId: id, ...target(id), permission: 'view', createdAt: '2026-10-14T00:00:00.000Z'})
+
+test('shared collections group live profiles by the sharer and request the explicit shared scope', async () => {
+  const first = sharedPerson()
+  const second = sharedPerson({id: '22222222-2222-4222-8222-222222222222', ownerUserId: charlieId, name: 'Jordan', sharedBy: {userId: charlieId, username: 'charlie', displayName: 'Charlie Studio'}})
+  const env = environment(() => ({people: [first, second], sources: [first.sharedBy, second.sharedBy], nextCursor: null}))
+  const value = await renderComponent(browserUrl, {env, props: {sharedOnly: true, sourceId: beaId}})
+  assert.equal(env.calls[0]!.options.query.scope, 'shared'); assert.equal(env.calls[0]!.options.query.sourceId, beaId)
+  assert.match(value.html, /Bea Studio/); assert.match(value.html, /Charlie Studio/); assert.match(value.html, /Shared by bea · Can view/)
+  assert.doesNotMatch(value.html, /Create person|Create your first person|People collections/)
+})
+test('shared profile recipients can select and download confirmed pictures but cannot mutate or generate into the profile', async () => {
+  const value = await renderComponent(browserUrl, {props: {sharedOnly: true, selectedUrls: [otherSource]}, initialize: state => {state.activePerson.value = sharedPerson(); state.photos.value = [sharedPhoto()]}})
+  assert.match(value.html, /Shared by Bea Studio · Can view/); assert.match(value.html, /Download/)
+  assert.doesNotMatch(value.html, /Share person|Edit profile|Remove profile|Add from library|Generate pictures|>Unlink</)
+  value.exposed.editName.value = 'Unauthorized edit'
+  await value.exposed.savePerson(); await value.exposed.deletePerson(); await value.exposed.removePhoto(sharedPhoto()); await value.exposed.attachPhotos([{url: source, name: 'Photo', directory: false}]); value.exposed.openShares(sharedPerson())
+  assert.equal(value.env.calls.some(call => call.options.method), false)
+  value.exposed.togglePhoto(sharedPhoto()); value.exposed.confirm()
+  assert.deepEqual(value.events.find(event => event.name === 'confirm')?.value, [otherSource, sharedPhoto().url])
+})
+test('ownership and explicit permissions decide editing, rather than a My people collection or organization role', async () => {
+  const value = await renderComponent(browserUrl, {initialize: state => {state.activePerson.value = sharedPerson({permissions: {view: true, edit: true, share: true}, sharedBy: undefined}); state.photos.value = [sharedPhoto()]}})
+  assert.equal(value.exposed.editablePerson.value, false)
+  assert.doesNotMatch(value.html, /Share person|Edit profile|Remove profile|Generate pictures|>Unlink</)
+  const ownerWithoutShare = await renderComponent(browserUrl, {initialize: state => {state.activePerson.value = person({permissions: {view: true, edit: true, share: false}})}})
+  assert.match(ownerWithoutShare.html, /Edit profile/); assert.doesNotMatch(ownerWithoutShare.html, /Share person/)
+})
+test('switching personal and shared collections preserves existing reference choices and rejects a late previous-scope list', async () => {
+  let finish!: (value: unknown) => void
+  const env = environment((_url, options) => options.query.scope === 'mine' ? new Promise(resolve => {finish = resolve}) : {people: [sharedPerson()], sources: [sharedPerson().sharedBy], nextCursor: null})
+  const value = await mountComponent(browserUrl, env, {selectionMode: 'multiple', selectedUrls: [otherSource]})
+  value.exposed.changeScope('shared'); await flush()
+  assert.deepEqual(value.exposed.selection.value, [otherSource]); assert.equal(value.exposed.people.value[0].ownerUserId, beaId)
+  finish({people: [person()], sources: [], nextCursor: null}); await flush()
+  assert.equal(value.exposed.people.value[0].ownerUserId, beaId)
+  value.exposed.sourceId.value = beaId; await flush()
+  assert.equal(env.calls.at(-1)!.options.query.sourceId, beaId)
+  assert.deepEqual(value.exposed.selection.value, [otherSource]); value.app.unmount()
+})
+test('owner sharing uses only a current organization target, then refreshes the view-only grant list', async () => {
+  let granted = false
+  const env = environment((url, options) => {
+    if (url === '/api/people') return {people: [person()], sources: [], nextCursor: null}
+    if (url === '/api/people/share-targets') return {users: [target()]}
+    if (options.method === 'POST') {granted = true; return {ok: true}}
+    return {shares: granted ? [share()] : []}
+  })
+  const value = await mountComponent(browserUrl, env)
+  value.exposed.openShares(person()); await flush()
+  value.exposed.shareRecipient.value = charlieId; await value.exposed.grantShare(); assert.equal(env.calls.some(call => call.options.method === 'POST'), false)
+  value.exposed.shareRecipient.value = beaId; await value.exposed.grantShare()
+  const paid = env.calls.find(call => call.options.method === 'POST')!
+  assert.equal(paid.url, `/api/people/${person().id}/shares`); assert.deepEqual(paid.options.body, {recipientUserId: beaId})
+  assert.equal(value.exposed.shares.value.length, 1); assert.equal(value.exposed.shares.value[0].permission, 'view')
+  value.exposed.shareRecipient.value = beaId; await value.exposed.grantShare(); assert.equal(env.calls.filter(call => call.options.method === 'POST').length, 1)
+  value.app.unmount()
+})
+test('removing a person grant targets exactly that recipient and never deletes image storage', async () => {
+  const env = environment((url, options) => url === '/api/people' ? {people: [person()], sources: [], nextCursor: null} : url === '/api/people/share-targets' ? {users: [target(), target(charlieId)]} : options.method === 'DELETE' ? {ok: true} : {shares: [share(), share(charlieId)]})
+  const value = await mountComponent(browserUrl, env)
+  value.exposed.openShares(person()); await flush(); await value.exposed.revokeShare(beaId)
+  const deletion = env.calls.find(call => call.options.method === 'DELETE')!
+  assert.equal(deletion.url, `/api/people/${person().id}/shares/${beaId}`)
+  assert.deepEqual(value.exposed.shares.value.map((entry: any) => entry.recipientUserId), [charlieId])
+  assert.equal(env.calls.some(call => call.url.includes('/api/data') || call.url.includes('/photos/')), false)
+  value.app.unmount()
+})
+test('closing and opening another share modal discards a late prior grant result without clearing the new recipient', async () => {
+  let finish!: (value: unknown) => void
+  const env = environment((url, options) => url === '/api/people' ? {people: [person()], sources: [], nextCursor: null} : url === '/api/people/share-targets' ? {users: [target(), target(charlieId)]} : options.method === 'POST' ? new Promise(resolve => {finish = resolve}) : {shares: []})
+  const value = await mountComponent(browserUrl, env)
+  value.exposed.openShares(person()); await flush(); value.exposed.shareRecipient.value = beaId
+  const granting = value.exposed.grantShare(); assert.equal(value.exposed.shareSaving.value, true)
+  value.exposed.closeShares(); const second = person({id: '22222222-2222-4222-8222-222222222222', name: 'Jordan'})
+  value.exposed.openShares(second); await flush(); value.exposed.shareRecipient.value = charlieId
+  finish({ok: true}); await granting; await flush()
+  assert.equal(value.exposed.shareTarget.value.id, second.id); assert.equal(value.exposed.shareRecipient.value, charlieId); assert.deepEqual(value.exposed.shares.value, [])
+  value.app.unmount()
+})
+test('account changes abort sharing reads and discard all grant recipients and late private share data', async () => {
+  const finishers: Array<(value: unknown) => void> = []
+  const env = environment(url => url === '/api/people' ? {people: [person()], sources: [], nextCursor: null} : new Promise(resolve => {finishers.push(resolve)}))
+  const value = await mountComponent(browserUrl, env)
+  value.exposed.openShares(person()); value.exposed.shareRecipient.value = beaId
+  env.account.identity.value = 'org.charlie'; env.account.epoch.value += 1
+  for (const call of env.calls.filter(call => call.url !== '/api/people')) assert.equal(call.options.signal.aborted, true)
+  finishers[0]!({shares: [share()]}); finishers[1]!({users: [target()]}); await flush()
+  assert.equal(value.exposed.shareTarget.value, null); assert.deepEqual(value.exposed.shares.value, []); assert.deepEqual(value.exposed.shareUsers.value, []); assert.equal(value.exposed.shareRecipient.value, '')
+  value.app.unmount()
+})
+test('revoked shared profile refresh removes pictures, names, sharer metadata and its known selected references', async () => {
+  let revoked = false
+  const env = environment(url => {
+    if (url === '/api/people') return {people: [sharedPerson()], sources: [sharedPerson().sharedBy], nextCursor: null}
+    if (revoked) throw {statusCode: 404, statusMessage: 'sensitive internal path'}
+    return detail([sharedPhoto()], {person: sharedPerson()})
+  })
+  const value = await mountComponent(browserUrl, env, {sharedOnly: true, selectedUrls: [otherSource, sharedPhoto().url]})
+  value.exposed.openPerson(sharedPerson()); await flush(); revoked = true
+  await value.exposed.loadPerson(person().id, {quiet: true})
+  assert.equal(value.exposed.activePerson.value, null); assert.deepEqual(value.exposed.photos.value, []); assert.deepEqual(value.exposed.people.value, []); assert.deepEqual(value.exposed.sources.value, [])
+  assert.deepEqual(value.exposed.selection.value, [otherSource]); assert.doesNotMatch(value.exposed.errorMessage.value, /sensitive|internal|path/)
+  value.app.unmount()
+})
+test('returning to a visible shared person revalidates access while a hidden tab makes no requests', async () => {
+  const env = environment(url => url === '/api/people' ? {people: [sharedPerson()], sources: [sharedPerson().sharedBy], nextCursor: null} : detail([sharedPhoto()], {person: sharedPerson()}))
+  const value = await mountComponent(browserUrl, env, {sharedOnly: true})
+  value.exposed.openPerson(sharedPerson()); await flush(); const before = env.calls.length
+  ;(globalThis as any).document.visibilityState = 'hidden'; value.exposed.visibilityChanged(); await flush(); assert.equal(env.calls.length, before)
+  ;(globalThis as any).document.visibilityState = 'visible'; value.exposed.visibilityChanged(); await flush(); assert.equal(env.calls.length, before + 1)
   value.app.unmount()
 })

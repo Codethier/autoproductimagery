@@ -1,11 +1,12 @@
 import {randomUUID} from 'node:crypto'
-import {and, asc, count, eq, gt, inArray, isNull, sql} from 'drizzle-orm'
+import {and, asc, count, eq, gt, inArray, isNull, ne, or, sql} from 'drizzle-orm'
 import {createError} from 'h3'
-import {assets, people, personPhotos, systemPrompt, users} from '../db/schema'
+import {assets, people, personPhotos, personShares, systemPrompt, users} from '../db/schema'
 import {getDatabase} from './lib/db'
 import {assetCursorScope, canonicalAssetUrl, createAssetRepository, decodeAssetCursor, encodeAssetCursor, validAssetId, type AssetActor} from './assetAccess'
 import {confirmedGenerationPriceCondition} from './generationVisibility'
-import {AddPersonPhotosSchema, CreatePersonSchema, PeopleListQuerySchema, PersonPhotosQuerySchema, UpdatePersonSchema, type Person, type PersonPhoto} from '../../schemas/people'
+import {AddPersonPhotosSchema, CreatePersonSchema, PeopleListQuerySchema, PersonPhotosQuerySchema, SharePersonSchema, UpdatePersonSchema, type Person, type PersonPhoto, type PersonShare, type PersonShareTarget} from '../../schemas/people'
+import type {AssetSource} from '../../schemas/image-storage'
 
 type Database = ReturnType<typeof getDatabase>
 export type PeopleTransaction = Parameters<Parameters<Database['transaction']>[0]>[0]
@@ -14,6 +15,16 @@ type Actor = Pick<AssetActor, 'organizationId' | 'userId'> & {authVersion?: numb
 const MAX_PEOPLE = 200
 const MAX_PERSON_PHOTOS = 200
 const scope = (actor: Actor) => and(eq(people.organizationId, actor.organizationId), eq(people.userId, actor.userId), isNull(people.deletedAt))
+const enabledActor = (actor: Actor) => sql`EXISTS (SELECT 1 FROM ${users} WHERE ${users.id} = ${actor.userId}
+    AND ${users.organizationId} = ${actor.organizationId} AND ${users.disabledAt} IS NULL)`
+const enabledProfileOwner = () => sql`EXISTS (SELECT 1 FROM ${users} WHERE ${users.id} = ${people.userId}
+    AND ${users.organizationId} = ${people.organizationId} AND ${users.disabledAt} IS NULL)`
+const sharedCondition = (actor: Actor) => and(eq(people.organizationId, actor.organizationId), isNull(people.deletedAt), enabledProfileOwner(), enabledActor(actor),
+    sql`EXISTS (SELECT 1 FROM ${personShares} WHERE ${personShares.personId} = ${people.id}
+        AND ${personShares.organizationId} = ${actor.organizationId} AND ${personShares.recipientUserId} = ${actor.userId}
+        AND ${personShares.sharedByUserId} = ${people.userId})`)
+const readableCondition = (actor: Actor) => and(eq(people.organizationId, actor.organizationId), isNull(people.deletedAt), enabledProfileOwner(), enabledActor(actor),
+    or(eq(people.userId, actor.userId), sharedCondition(actor)))
 const notFound = (): never => {throw createError({statusCode: 404, statusMessage: 'Person not found'})}
 const ownedAsset = (actor: Actor) => and(eq(assets.organizationId, actor.organizationId), eq(assets.ownerUserId, actor.userId), eq(assets.kind, 'file'), isNull(assets.deletedAt))
 const matchingGeneration = (actor: Actor) => and(eq(systemPrompt.organizationId, actor.organizationId), eq(systemPrompt.userId, actor.userId), eq(systemPrompt.outputImage, assets.url))
@@ -54,19 +65,25 @@ export async function assertPersonPhotoCapacity(tx: PeopleTransaction, actor: Ac
 }
 
 export function createPeopleRepository(actor: AssetActor & {authVersion?: number}, db: Database = getDatabase()) {
+    async function requireOwnedPerson(id: string, executor: Executor = db) {
+        const [row] = await executor.select().from(people).where(and(eq(people.id, validAssetId(id)), scope(actor), enabledProfileOwner())).limit(1)
+        return row ?? notFound()
+    }
     async function requirePerson(id: string, executor: Executor = db) {
-        const [row] = await executor.select().from(people).where(and(eq(people.id, validAssetId(id)), scope(actor))).limit(1)
+        const [row] = await executor.select().from(people).where(and(eq(people.id, validAssetId(id)), readableCondition(actor))).limit(1)
         return row ?? notFound()
     }
     function visiblePhotos(ids: string[]) {
         const selected = sql`(${sql.join(ids.map(id => sql`${id}::uuid`), sql`, `)})`
         return sql`WITH photo_links AS (
-            SELECT ${personPhotos.personId} AS person_id, ${personPhotos.assetId} AS asset_id FROM ${personPhotos}
-                JOIN ${people} ON ${people.id} = ${personPhotos.personId} WHERE ${scope(actor)} AND ${people.id} IN ${selected} AND ${personPhotos.excluded} = false
-            UNION SELECT ${systemPrompt.personId}, ${assets.id} FROM ${systemPrompt}
+            SELECT ${personPhotos.personId} AS person_id, ${personPhotos.assetId} AS asset_id,
+                ${people.organizationId} AS organization_id, ${people.userId} AS owner_user_id FROM ${personPhotos}
+                JOIN ${people} ON ${people.id} = ${personPhotos.personId} WHERE ${readableCondition(actor)} AND ${people.id} IN ${selected} AND ${personPhotos.excluded} = false
+            UNION SELECT ${systemPrompt.personId}, ${assets.id}, ${people.organizationId}, ${people.userId} FROM ${systemPrompt}
                 JOIN ${people} ON ${people.id} = ${systemPrompt.personId}
                 JOIN ${assets} ON ${assets.url} = ${systemPrompt.outputImage}
-                WHERE ${scope(actor)} AND ${people.id} IN ${selected} AND ${matchingGeneration(actor)}
+                WHERE ${readableCondition(actor)} AND ${people.id} IN ${selected}
+                    AND ${systemPrompt.organizationId} = ${people.organizationId} AND ${systemPrompt.userId} = ${people.userId}
                     AND NOT EXISTS (SELECT 1 FROM ${personPhotos} WHERE ${personPhotos.personId} = ${people.id}
                         AND ${personPhotos.assetId} = ${assets.id} AND ${personPhotos.excluded} = true)
         ), visible_photos AS (
@@ -76,34 +93,49 @@ export function createPeopleRepository(actor: AssetActor & {authVersion?: number
                 settled.generation_id
             FROM photo_links JOIN ${assets} ON ${assets.id} = photo_links.asset_id
             LEFT JOIN LATERAL (SELECT ${systemPrompt.id} AS generation_id, ${systemPrompt.priceUsd} AS price_usd,
-                ${systemPrompt.priceSource} AS price_source FROM ${systemPrompt} WHERE ${visibleGeneration(actor)}
+                ${systemPrompt.priceSource} AS price_source FROM ${systemPrompt}
+                WHERE ${systemPrompt.organizationId} = photo_links.organization_id AND ${systemPrompt.userId} = photo_links.owner_user_id
+                    AND ${systemPrompt.outputImage} = ${assets.url} AND ${confirmedGenerationPriceCondition()}
+                    AND ${systemPrompt.outputImageDeletedAt} IS NULL
+                    AND (${systemPrompt.status} = 'succeeded' OR (${systemPrompt.status} IS NULL AND ${systemPrompt.errors} IS NULL))
                 ORDER BY ${systemPrompt.id} DESC LIMIT 1) settled ON true
-            WHERE ${ownedAsset(actor)} AND (${assets.category} <> 'generated' OR settled.generation_id IS NOT NULL)
+            WHERE ${assets.organizationId} = photo_links.organization_id AND ${assets.ownerUserId} = photo_links.owner_user_id
+                AND ${assets.kind} = 'file' AND ${assets.deletedAt} IS NULL
+                AND (${assets.category} <> 'generated' OR settled.generation_id IS NOT NULL)
         )`
     }
     type PhotoRow = {person_id: string; id: string; url: string; name: string; price_usd: string | null; price_source: string | null; generation_id: number | null; photo_count?: number}
     const photoDto = (row: PhotoRow): PersonPhoto => ({id: row.id, url: row.url, name: row.name, priceUsd: row.price_usd, priceSource: row.price_source, generationId: row.generation_id})
     async function projectPersons(rows: Array<typeof people.$inferSelect>): Promise<Person[]> {
         if (!rows.length) return []
-        const covers = await db.execute<PhotoRow>(sql`${visiblePhotos(rows.map(row => row.id))}
+        const otherOwners = [...new Set(rows.map(row => row.userId).filter(id => id !== actor.userId))]
+        const [covers, owners] = await Promise.all([db.execute<PhotoRow>(sql`${visiblePhotos(rows.map(row => row.id))}
             SELECT * FROM (SELECT *, count(*) OVER (PARTITION BY person_id)::integer AS photo_count,
-                row_number() OVER (PARTITION BY person_id ORDER BY id) AS position FROM visible_photos) ranked WHERE position = 1`)
+                row_number() OVER (PARTITION BY person_id ORDER BY id) AS position FROM visible_photos) ranked WHERE position = 1`),
+            otherOwners.length ? db.select({userId: users.id, username: users.username, displayName: users.displayName}).from(users)
+                .where(and(inArray(users.id, otherOwners), eq(users.organizationId, actor.organizationId), isNull(users.disabledAt))).limit(50) : Promise.resolve([])])
         const byId = new Map(covers.rows.map(row => [row.person_id, row]))
-        return rows.map(row => ({id: row.id, name: row.name, description: row.description,
+        const sources = new Map(owners.map(owner => [owner.userId, owner]))
+        return rows.map(row => ({id: row.id, ownerUserId: row.userId,
+            permissions: {view: true, edit: row.userId === actor.userId, share: row.userId === actor.userId},
+            ...(row.userId !== actor.userId && sources.has(row.userId) ? {sharedBy: sources.get(row.userId)!} : {}),
+            name: row.name, description: row.description,
             photoCount: Number(byId.get(row.id)?.photo_count ?? 0), cover: byId.has(row.id) ? photoDto(byId.get(row.id)!) : null,
             createdAt: new Date(row.createdAt).toISOString(), updatedAt: new Date(row.updatedAt).toISOString()}))
     }
     async function list(query: unknown = {}) {
         const parsed = PeopleListQuerySchema.safeParse(query)
         if (!parsed.success) throw createError({statusCode: 400, statusMessage: 'Invalid people listing request'})
-        const {limit, search, cursor} = parsed.data
-        const cursorScope = assetCursorScope(actor, ['people', search]), after = decodeAssetCursor(cursor, cursorScope)
+        const {limit, search, cursor, scope: listScope, sourceId} = parsed.data
+        const cursorScope = assetCursorScope(actor, ['people', listScope, sourceId ?? null, search]), after = decodeAssetCursor(cursor, cursorScope)
         const escaped = search.replace(/[\\%_]/g, match => '\\' + match)
-        const rows = await db.select().from(people).where(and(scope(actor), after ? gt(people.id, after) : undefined,
+        const rows = await db.select().from(people).where(and(listScope === 'shared' ? sharedCondition(actor) : and(scope(actor), enabledProfileOwner()),
+            sourceId ? eq(people.userId, sourceId) : undefined, after ? gt(people.id, after) : undefined,
             search ? sql`(${people.name} ILIKE ${'%' + escaped + '%'} OR ${people.description} ILIKE ${'%' + escaped + '%'})` : undefined))
             .orderBy(asc(people.id)).limit(limit + 1)
         const page = rows.slice(0, limit)
-        return {people: await projectPersons(page), nextCursor: rows.length > limit ? encodeAssetCursor(page.at(-1)!.id, cursorScope) : null}
+        const sources: AssetSource[] = listScope === 'shared' ? await sharedSources() : []
+        return {people: await projectPersons(page), nextCursor: rows.length > limit ? encodeAssetCursor(page.at(-1)!.id, cursorScope) : null, sources}
     }
     async function get(id: string, query: unknown = {}) {
         const row = await requirePerson(id)
@@ -117,7 +149,7 @@ export function createPeopleRepository(actor: AssetActor & {authVersion?: number
             db.select({pendingCount: sql<number>`count(*) FILTER (WHERE ${systemPrompt.status} = 'pending' OR (${systemPrompt.status} = 'succeeded'
                 AND ${systemPrompt.outputImageDeletedAt} IS NULL AND NOT COALESCE((${confirmedGenerationPriceCondition()}), false)))::integer`,
                 failedCount: sql<number>`count(*) FILTER (WHERE ${systemPrompt.status} = 'failed')::integer`}).from(systemPrompt)
-                .where(and(eq(systemPrompt.personId, row.id), eq(systemPrompt.organizationId, actor.organizationId), eq(systemPrompt.userId, actor.userId))),
+                .where(and(eq(systemPrompt.personId, row.id), eq(systemPrompt.organizationId, row.organizationId), eq(systemPrompt.userId, row.userId))),
         ])
         const page = result.rows.slice(0, limit)
         return {person: projected[0]!, photos: page.map(photoDto), nextCursor: result.rows.length > limit ? encodeAssetCursor(page.at(-1)!.id, cursorScope) : null,
@@ -157,7 +189,7 @@ export function createPeopleRepository(actor: AssetActor & {authVersion?: number
     async function addPhotos(id: string, input: unknown) {
         const parsed = AddPersonPhotosSchema.safeParse(input)
         if (!parsed.success) throw createError({statusCode: 400, statusMessage: 'Select between 1 and 20 owned image files'})
-        await requirePerson(id)
+        await requireOwnedPerson(id)
         const assetRepository = createAssetRepository(actor, db)
         const photoRows: Array<typeof assets.$inferSelect> = []
         for (const url of new Set(parsed.data.urls)) {
@@ -201,7 +233,57 @@ export function createPeopleRepository(actor: AssetActor & {authVersion?: number
         })
         return {ok: true as const}
     }
-    return {list, get, create, update, remove, addPhotos, removePhoto, requirePerson}
+    async function sharedSources(): Promise<AssetSource[]> {
+        return db.selectDistinct({userId: users.id, username: users.username, displayName: users.displayName}).from(personShares)
+            .innerJoin(people, eq(people.id, personShares.personId)).innerJoin(users, eq(users.id, people.userId))
+            .where(and(sharedCondition(actor), eq(personShares.organizationId, actor.organizationId), eq(personShares.recipientUserId, actor.userId),
+                eq(personShares.sharedByUserId, people.userId), isNull(users.disabledAt)))
+            .orderBy(asc(users.displayName), asc(users.id)).limit(200)
+    }
+    async function shareTargets(): Promise<PersonShareTarget[]> {
+        return db.select({id: users.id, username: users.username, displayName: users.displayName}).from(users)
+            .where(and(eq(users.organizationId, actor.organizationId), ne(users.id, actor.userId), isNull(users.disabledAt)))
+            .orderBy(asc(users.displayName), asc(users.id)).limit(200)
+    }
+    async function sharesFor(id: string): Promise<PersonShare[]> {
+        await requireOwnedPerson(id)
+        const rows = await db.select({id: personShares.id, recipientUserId: personShares.recipientUserId,
+            username: users.username, displayName: users.displayName, createdAt: personShares.createdAt}).from(personShares)
+            .innerJoin(users, eq(users.id, personShares.recipientUserId)).where(and(eq(personShares.personId, id),
+                eq(personShares.organizationId, actor.organizationId), eq(personShares.sharedByUserId, actor.userId), eq(users.organizationId, actor.organizationId)))
+            .orderBy(asc(users.displayName), asc(users.id)).limit(200)
+        return rows.map(row => ({...row, permission: 'view', createdAt: new Date(row.createdAt).toISOString()}))
+    }
+    async function share(id: string, input: unknown) {
+        const parsed = SharePersonSchema.safeParse(input)
+        if (!parsed.success) throw createError({statusCode: 400, statusMessage: 'Select a valid organization member'})
+        await db.transaction(async tx => {
+            await lockOwnedPerson(tx, actor, id)
+            // A recipient availability read needs no user lock. All profile
+            // mutations hold the owner then profile locks; reciprocal shares
+            // must not try to acquire each other's account lock afterward.
+            const [recipient] = await tx.select({id: users.id}).from(users).where(and(eq(users.id, parsed.data.recipientUserId),
+                eq(users.organizationId, actor.organizationId), ne(users.id, actor.userId), isNull(users.disabledAt))).limit(1)
+            if (!recipient) throw createError({statusCode: 404, statusMessage: 'Organization member not found'})
+            const [total] = await tx.select({value: count()}).from(personShares).where(eq(personShares.personId, id))
+            const [existing] = await tx.select({id: personShares.id}).from(personShares)
+                .where(and(eq(personShares.personId, id), eq(personShares.recipientUserId, recipient.id))).limit(1)
+            if (!existing && Number(total?.value ?? 0) >= 200) throw createError({statusCode: 409, statusMessage: 'This person has reached the sharing limit'})
+            await tx.insert(personShares).values({id: randomUUID(), personId: id, organizationId: actor.organizationId,
+                sharedByUserId: actor.userId, recipientUserId: recipient.id}).onConflictDoNothing()
+        })
+        return {shares: await sharesFor(id)}
+    }
+    async function revoke(id: string, recipientUserId: string) {
+        validAssetId(recipientUserId)
+        await db.transaction(async tx => {
+            await lockOwnedPerson(tx, actor, id)
+            await tx.delete(personShares).where(and(eq(personShares.personId, id), eq(personShares.organizationId, actor.organizationId),
+                eq(personShares.sharedByUserId, actor.userId), eq(personShares.recipientUserId, recipientUserId)))
+        })
+        return {ok: true as const}
+    }
+    return {list, get, create, update, remove, addPhotos, removePhoto, requirePerson, requireOwnedPerson, sharedSources, shareTargets, sharesFor, share, revoke}
 }
 
 export function peopleRequestError(error: unknown): never {

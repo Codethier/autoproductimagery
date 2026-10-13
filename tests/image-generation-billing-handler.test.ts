@@ -15,7 +15,7 @@ const key = '__imageGenerationBillingHandlerTest'
 const actor = {organizationId: 'organization-alice', userId: 'alice'}
 const dependency = (path: string) => new URL(path, root).href
 const mocks = new Map([
-  [dependency('server/utils/peopleRepository.ts'), `export const createPeopleRepository = actor => ({requirePerson: async id => {globalThis.${key}.peopleChecks.push({actor,id}); if(globalThis.${key}.personError)throw globalThis.${key}.personError; return {id};}});`],
+  [dependency('server/utils/peopleRepository.ts'), `export const createPeopleRepository = actor => ({requireOwnedPerson: async id => {globalThis.${key}.peopleChecks.push({actor,id}); if(globalThis.${key}.personError)throw globalThis.${key}.personError; return {id};}});`],
   [dependency('server/utils/useDB.ts'), `export const useDB = async (_db, actor) => {globalThis.${key}.dbScopes.push(actor); return globalThis.${key}.database};`],
   [dependency('server/utils/useGateway.ts'), `export const useGateway = async storage => {globalThis.${key}.gatewayInitializations.push(storage); return globalThis.${key}.gateway};`],
   [dependency('server/utils/useUserFS.ts'), `export const useUserFS = async actor => {globalThis.${key}.storageScopes.push(actor); return globalThis.${key}.storage};`],

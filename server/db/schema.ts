@@ -148,6 +148,18 @@ export const personPhotos = pgTable('person_photo', {
     createdAt: timestamp('created_at', {mode: 'string', withTimezone: true}).defaultNow().notNull(),
 }, table => [uniqueIndex('person_photo_asset_unique').on(table.personId, table.assetId), index('person_photo_asset_idx').on(table.assetId)]);
 
+export const personShares = pgTable('person_share', {
+    id: uuid('id').primaryKey(),
+    personId: uuid('person_id').notNull().references(() => people.id, {onDelete: 'cascade'}),
+    organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+    sharedByUserId: uuid('shared_by_user_id').notNull().references(() => users.id),
+    recipientUserId: uuid('recipient_user_id').notNull().references(() => users.id),
+    createdAt: timestamp('created_at', {mode: 'string', withTimezone: true}).defaultNow().notNull(),
+}, table => [
+    uniqueIndex('person_share_recipient_unique').on(table.personId, table.recipientUserId),
+    index('person_share_org_recipient_idx').on(table.organizationId, table.recipientUserId, table.personId),
+]);
+
 export const systemPrompt = pgTable("systemPrompt", {
     id: serial("id").primaryKey(),
     organizationId: uuid('organizationId').references(() => organizations.id),

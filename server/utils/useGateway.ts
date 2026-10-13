@@ -439,11 +439,14 @@ export function enrichImageModelInfo(model: GatewayModelInfo): GatewayModelInfo 
     }
 }
 
-export async function useGateway(imageStorage?: Pick<Awaited<ReturnType<typeof useFS>>, 'getImageFile'>) {
+type GenerationImageStorage = Pick<Awaited<ReturnType<typeof useFS>>, 'getImageFile'> & {
+    assertReadableImages?: (urls: readonly string[]) => Promise<void>
+}
+export async function useGateway(imageStorage?: GenerationImageStorage) {
     const gateway = getGateway()
     // Generation APIs inject the account-authorized storage facade. Catalog
     // and billing lookups do not read image sources.
-    const fs = imageStorage ?? await useFS()
+    const fs: GenerationImageStorage = imageStorage ?? await useFS()
 
     async function listModels(opts: ListModelsOpts = {}): Promise<GatewayModelInfo[]> {
         let models: GatewayModelInfo[]
@@ -702,6 +705,16 @@ export async function useGateway(imageStorage?: Pick<Awaited<ReturnType<typeof u
         return mask.buffer
     }
 
+    async function assertSourcesStillReadable(request: ImageGenerationRequest, abortSignal: AbortSignal) {
+        abortSignal.throwIfAborted()
+        const paths = [...new Set([...request.inputImages, ...request.modelImages, ...(request.maskImage ? [request.maskImage] : [])])]
+        // Earlier sources may be revoked while a later image is decoding.
+        // HTTP generation injects the account facade; recheck all bounded,
+        // validated paths at the paid-call boundary without rereading S3.
+        if (paths.length) await fs.assertReadableImages?.(paths)
+        abortSignal.throwIfAborted()
+    }
+
     function validationError(issues: z.core.$ZodIssue[]): never {
         const errorData: StoredGenerationError = {
             name: 'ValidationError',
@@ -905,6 +918,7 @@ export async function useGateway(imageStorage?: Pick<Awaited<ReturnType<typeof u
                 : {prompt: request.prompt}),
         })
         let response: Awaited<ReturnType<typeof callGateway>>
+        await assertSourcesStillReadable(request, abortSignal)
         try {
             onProviderStart?.()
             response = await callGateway()
@@ -1019,6 +1033,7 @@ export async function useGateway(imageStorage?: Pick<Awaited<ReturnType<typeof u
             },
         }
         let response: Awaited<ReturnType<typeof aiGenerateImage>>
+        await assertSourcesStillReadable(request, abortSignal)
         try {
             onProviderStart?.()
             response = await aiGenerateImage({
