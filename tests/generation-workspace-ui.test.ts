@@ -25,7 +25,7 @@ registerHooks({
     if (url === formUrl || (url.startsWith(settingsDirectory) && url.endsWith('.vue'))) {
       const filename = fileURLToPath(url)
       let source = readFileSync(filename, 'utf8')
-      if (url === formUrl) source = source.replace('</script>', 'defineExpose({ submit, uploadFiles, loadMoreHistory, sourceImages, data, pickerKind, confirmPicker, previewOutput, previewResult, previewPricePending, recentImages, canSubmit, prompt, pendingGenerations, activeGenerationCount, errorMsg, uploading, displayedHistory })\n</script>')
+      if (url === formUrl) source = source.replace('</script>', 'defineExpose({ submit, uploadFiles, loadMoreHistory, sourceImages, data, pickerKind, confirmPicker, previewOutput, previewResult, recentImages, canSubmit, prompt, pendingGenerations, activeGenerationCount, errorMsg, uploading, displayedHistory, historyOpen, confirmedHistory })\n</script>')
       const { descriptor } = parse(source, { filename })
       const compiled = compileScript(descriptor, { id: filename, inlineTemplate: true })
       const nuxtServices = url === formUrl ? `
@@ -102,7 +102,10 @@ function registerUiPrimitives(app: ReturnType<typeof createSSRApp>) {
   app.component('UIcon', { render: () => h('span', { 'aria-hidden': 'true' }) })
   app.component('UModal', { render: () => null })
   app.component('AssetBrowser', { render: () => null })
-  app.component('system-promp', { render: () => h('article') })
+  // The parent must not mount result components until their exact prices exist.
+  // A marked stub makes that boundary observable independently of the child's
+  // defensive visibility gate tested in generated-image-retention-ui.test.ts.
+  app.component('system-promp', { props: ['data'], setup: (props: any) => () => h('article', {'data-history-result': props.data.id}, props.data.TextPrompt) })
 }
 
 type MemoryNode = { tag: string; text: string; children: MemoryNode[]; parent: MemoryNode | null; props: Record<string, unknown>; [key: string]: any }
@@ -125,6 +128,12 @@ const memoryRenderer = createRenderer<MemoryNode, MemoryNode>({
   parentNode: node => node.parent, nextSibling: node => node.parent?.children[node.parent.children.indexOf(node) + 1] ?? null,
   patchProp(node, key, _old, value) { node.props[key] = value; node[key] = value },
 })
+function descendants(node: MemoryNode): MemoryNode[] { return [node, ...node.children.flatMap(descendants)] }
+function historyResultIds(node: MemoryNode): number[] {
+  return descendants(node).filter(item => item.tag === 'article' && item.props['data-history-result'] !== undefined)
+    .map(item => item.props['data-history-result'] as number)
+}
+function renderedText(node: MemoryNode): string { return descendants(node).map(item => item.text).join(' ') }
 
 async function mountWorkspace(mode: 'edit' | 'batch', environment: any) {
   ;(globalThis as any)[environmentKey] = environment
@@ -210,9 +219,10 @@ test('the editor withholds generated previews until confirmed billing arrives in
     await mounted.exposed.submit()
     await nextTick()
     assert.equal(mounted.exposed.previewOutput.value, null)
-    assert.equal(mounted.exposed.previewPricePending.value, true)
     const imageSources = (node: MemoryNode): unknown[] => [node.props.src, ...node.children.flatMap(imageSources)].filter(Boolean)
     assert.equal(imageSources(mounted.rootNode).includes(`/api/data${pending.outputImage}`), false)
+    assert.equal(imageSources(mounted.rootNode).includes('/api/data/images/edit.png'), true, 'the original input remains visible while generated output awaits its final price')
+    assert.doesNotMatch(renderedText(mounted.rootNode), /confirming price|Pending confirmation|Result ·|Check prices?/)
     workspace.environment.history.value = {count: 1, items: [pending]}
     await nextTick()
     assert.equal(mounted.exposed.recentImages.value.length, 0)
@@ -228,6 +238,45 @@ test('the editor withholds generated previews until confirmed billing arrives in
     await nextTick()
     assert.equal(mounted.exposed.previewOutput.value, null)
     assert.equal(mounted.exposed.previewResult.value, null)
+  } finally {
+    mounted.app.unmount()
+    ;(globalThis as any).window = previousWindow
+  }
+})
+
+test('history mounts only exact-priced result cards and automatically reveals later confirmations without a price-check control', async () => {
+  const workspace = await renderWorkspace('edit', {editSource: '/images/edit.png'})
+  const rows = [
+    {id: 11, status: 'succeeded', TextPrompt: 'Estimated result', outputImage: '/images/output/estimated.png',
+      priceUsd: '0.01000000', priceSource: 'estimate', billingState: 'awaiting'},
+    {id: 12, status: 'succeeded', TextPrompt: 'Gateway price still pending', outputImage: '/images/output/pending.png',
+      priceUsd: '0.01000000', priceSource: 'gateway', billingState: 'awaiting'},
+    {id: 13, status: 'succeeded', TextPrompt: 'Confirmed free result', outputImage: '/images/output/free.png',
+      priceUsd: '0.000000000000', priceSource: 'gateway', billingState: 'confirmed'},
+    {id: 14, status: 'succeeded', TextPrompt: 'Small confirmed charge', outputImage: '/images/output/tiny.png',
+      priceUsd: '0.000000000001', priceSource: 'gateway', billingState: 'confirmed'},
+    {id: 15, status: 'succeeded', TextPrompt: 'Invalid confirmed price', outputImage: '/images/output/invalid.png',
+      priceUsd: '-0.01000000', priceSource: 'gateway', billingState: 'confirmed'},
+    {id: 16, status: 'succeeded', TextPrompt: 'Incomplete BYOK price', outputImage: '/images/output/byok.png',
+      priceUsd: '0.01000000', priceSource: 'gateway', billingState: 'confirmed', usageJson: {gatewayBilling: {isByok: true}}},
+  ]
+  workspace.environment.history.value = {ok: true, count: rows.length, items: rows}
+  const previousWindow = (globalThis as any).window
+  const mounted = await mountWorkspace('edit', workspace.environment)
+  try {
+    mounted.exposed.historyOpen.value = true
+    await nextTick()
+    assert.deepEqual(historyResultIds(mounted.rootNode), [13, 14])
+    assert.deepEqual(mounted.exposed.recentImages.value.map((row: any) => row.id), [13, 14])
+    assert.equal(mounted.exposed.displayedHistory.value.length, rows.length, 'unpriced metadata must remain available for automatic reconciliation and raw pagination')
+    assert.doesNotMatch(renderedText(mounted.rootNode), /Check prices?|Estimated result|Gateway price still pending|Invalid confirmed price|Incomplete BYOK price/)
+    workspace.environment.history.value = {ok: true, count: rows.length, items: rows.map(row => row.id === 11
+      ? {...row, priceUsd: '0.034000000001', priceSource: 'gateway', billingState: 'confirmed'} : row)}
+    await nextTick()
+    assert.deepEqual(historyResultIds(mounted.rootNode), [11, 13, 14])
+    assert.deepEqual(mounted.exposed.recentImages.value.map((row: any) => row.id), [11, 13, 14])
+    assert.doesNotMatch(renderedText(mounted.rootNode), /Check prices?|confirming price/)
+    assert.deepEqual(workspace.requests, [], 'history prop updates must not trigger a manual billing or generation request')
   } finally {
     mounted.app.unmount()
     ;(globalThis as any).window = previousWindow

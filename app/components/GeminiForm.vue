@@ -356,8 +356,6 @@ type GenerationResult = GenerationPrice & {id?: number; outputImage?: string | n
 const previewResult = ref<GenerationResult | null>(null)
 const previewOutput = computed(() => previewResult.value && hasConfirmedGenerationPrice(previewResult.value)
   && !previewResult.value.outputImageDeletedAt ? previewResult.value.outputImage || null : null)
-const previewPricePending = computed(() => previewResult.value && !hasConfirmedGenerationPrice(previewResult.value)
-  && !previewResult.value.errors && previewResult.value.status === 'succeeded')
 const previewPrice = computed(() => previewResult.value ? generationPriceLabel(previewResult.value) : '')
 const sourceUnavailable = ref(false)
 const previewImage = computed(() => previewOutput.value || data.editSource)
@@ -365,6 +363,7 @@ const zoom = ref(1)
 const imageDimensions = ref('')
 const additionalHistory = ref<NonNullable<typeof pastPrompts.data.value>['items']>([])
 const displayedHistory = computed(() => [...(pastPrompts.data.value?.items || []), ...additionalHistory.value])
+const confirmedHistory = computed(() => displayedHistory.value.filter(hasConfirmedGenerationPrice))
 watch(() => pastPrompts.data.value, () => { additionalHistory.value = [] })
 const recentImages = computed(() => displayedHistory.value
   .filter(item => !!item.outputImage && !item.outputImageDeletedAt && hasConfirmedGenerationPrice(item))
@@ -392,17 +391,11 @@ function scheduleBillingPoll() {
     billingPollRunning = true
     billingPollAttempts += 1
     try { await pastPrompts.refresh() }
-    catch { /* The history retry and row price controls remain available. */ }
+    catch { /* Leave unconfirmed results hidden and retry automatically. */ }
     finally { billingPollRunning = false; if (isCurrentAccount(snapshot)) scheduleBillingPoll() }
   }, 10_000)
 }
 watch(awaitingPrices, awaiting => { scheduleBillingPoll(); if (!awaiting) void accountBalance.refresh() })
-async function refreshHistoryPrices() {
-  const snapshot = accountSnapshot()
-  billingPollAttempts = 0
-  try { await pastPrompts.refresh() }
-  finally { if (isCurrentAccount(snapshot)) { scheduleBillingPoll(); void accountBalance.refresh() } }
-}
 onMounted(() => { billingPollingMounted = true; scheduleBillingPoll() })
 
 watch(account.epoch, () => {
@@ -719,8 +712,7 @@ async function submit() {
               <button type="button" aria-label="Zoom in" :disabled="zoom >= 2" @click="adjustZoom(0.25)"><UIcon name="i-lucide-plus" class="size-4" /></button>
               <button type="button" @click="zoom = 1">Fit</button>
             </div>
-            <span v-if="previewPricePending" role="status" class="studio-price-status"><UIcon name="i-lucide-receipt-text" class="size-4" />Image ready · confirming price. Your result will appear once its final cost is confirmed.</span>
-            <button v-if="previewResult" type="button" class="studio-text-button" @click="previewResult = null">View original</button>
+            <button v-if="previewOutput" type="button" class="studio-text-button" @click="previewResult = null">View original</button>
             <button v-else type="button" class="studio-text-button" @click="clearInputImages">Close image</button>
           </div>
         </template>
@@ -810,13 +802,12 @@ async function submit() {
       <div class="studio-pending-grid"><div v-for="job in pendingGenerations" :key="job.id" class="studio-pending-card"><img :src="sourceUrl(job.inputImages[0]!)" alt="Generation source"><div><UIcon :name="job.status === 'failed' ? 'i-lucide-triangle-alert' : 'i-lucide-loader-circle'" :class="{ 'animate-spin': job.status === 'pending' }" class="size-4" /><strong>{{ job.status === 'failed' ? 'Failed' : 'Generating' }}</strong><span>{{ elapsedLabel(job.startedAt) }}</span><p v-if="job.error">{{ job.error }}</p></div></div></div>
     </section>
     <details class="studio-history" :open="historyOpen" @toggle="historyOpen = ($event.target as HTMLDetailsElement).open">
-      <summary><span>Generation history <span v-if="pastPrompts.data.value?.count" class="studio-history-count">{{ pastPrompts.data.value.count }}</span></span><UIcon name="i-lucide-chevron-down" class="size-4" /></summary>
+      <summary><span>Generation history <span v-if="confirmedHistory.length" class="studio-history-count">{{ confirmedHistory.length }}</span></span><UIcon name="i-lucide-chevron-down" class="size-4" /></summary>
       <div v-if="historyOpen" class="studio-history-content">
-        <p v-if="awaitingPrices" class="studio-billing-note" role="status">Some images are ready and awaiting final prices. <button type="button" @click="refreshHistoryPrices">Check prices</button></p>
         <p v-if="pastPrompts.status.value === 'pending'" class="studio-help" role="status">Loading history…</p>
         <p v-else-if="pastPrompts.error.value" class="studio-validation">Could not load generation history. <button type="button" @click="pastPrompts.refresh()">Try again</button></p>
-        <div v-else-if="displayedHistory.length" class="studio-history-grid"><system-promp v-for="item in displayedHistory" :key="item.id" :data="item" /></div>
-        <p v-else class="studio-help">Your generated images and their settings will appear here.</p>
+        <div v-else-if="confirmedHistory.length" class="studio-history-grid"><system-promp v-for="item in confirmedHistory" :key="item.id" :data="item" /></div>
+        <p v-else class="studio-help">Your generated images will appear here with their final prices.</p>
         <UButton v-if="showMoreHistory" color="neutral" variant="soft" :loading="loadingHistory" @click="loadMoreHistory">Load more history</UButton>
       </div>
     </details>
@@ -831,7 +822,6 @@ async function submit() {
 
 <style scoped>
 .studio-generation-price{font-size:10px;line-height:1.7;color:#e3c19a;margin-top:12px}.studio-generation-credit{font-size:10px;color:var(--workspace-muted);margin-top:8px}
-.studio-billing-note{font-size:11px;line-height:1.7;color:#edc9a6;margin-bottom:18px}.studio-billing-note button{text-decoration:underline;margin-left:8px}
 .generation-studio { color: var(--workspace-text); }
 .studio-route-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; min-height: 76px; padding: 18px 32px; border-bottom: 1px solid var(--workspace-border); background: var(--workspace-bg); }
 .studio-route-header h1 { display: flex; align-items: center; gap: 9px; font-size: 20px; letter-spacing: -.4px; font-weight: 550; }
@@ -858,7 +848,6 @@ async function submit() {
 .studio-recent-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 9px; }
 .studio-recent-grid button { position: relative; border: 1px solid var(--workspace-border); border-radius: 8px; overflow: hidden; aspect-ratio: 1; background: var(--workspace-surface); cursor: pointer; }
 .studio-recent-price { position: absolute; bottom: 0; left: 0; right: 0; font-size: 8px; line-height: 1.4; padding: 4px; color: #f8eddc; background: #211a13de; }
-.studio-price-status { display: flex; align-items: center; gap: 8px; color: #edc9a6; font-size: 11px; max-width: 470px; line-height: 1.6; }
 .studio-recent-grid img { width: 100%; height: 100%; object-fit: cover; }
 .studio-recent-grid button:hover { border-color: var(--workspace-accent); }
 .studio-canvas-toolbar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; padding: 15px 22px; border-bottom: 1px solid var(--workspace-border); min-height: 65px; }
@@ -951,7 +940,7 @@ async function submit() {
 .studio-history > summary { padding: 19px 0; display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: var(--workspace-muted); list-style: none; cursor: pointer; }
 .studio-history-count { margin-left: 6px; background: var(--workspace-border); padding: 2px 6px; border-radius: 5px; font-size: 10px; }
 .studio-history-content { padding-bottom: 24px; }
-.studio-history-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 16px; margin-bottom: 18px; }
+.studio-history-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 288px), 1fr)); gap: 18px; align-items: stretch; margin-bottom: 18px; }
 .studio-debug-toggle { display: flex; justify-content: end; padding: 0 26px 15px; }
 .studio-debug-toggle button { display: flex; align-items: center; gap: 6px; font-size: 10px; color: #8c8273; cursor: pointer; }
 .studio-diagnostics { margin: 10px 26px 30px; padding: 18px; background: #151517; border: 1px solid var(--workspace-border); border-radius: 10px; }

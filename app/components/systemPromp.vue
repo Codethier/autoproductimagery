@@ -126,17 +126,9 @@ const tokenUsageText = computed(() => {
 const priceText = computed(() => {
   return formatUsd(currentResult.value?.priceUsd)
 })
-const priceSourceText = computed(() => {
-  const source = currentResult.value?.priceSource
-  if (source === 'gateway') return 'Gateway'
-  if (source === 'estimate') return 'Estimated'
-  return ''
-})
-
 const regenLoading = ref(false)
 const regenCount = ref<number>(1)
 const toast = useToast()
-const billingLoading = ref(false)
 
 async function loadOutputDetails() {
   if (!cardIsCurrent.value || detailLoading.value || detailLoaded.value) return
@@ -165,8 +157,6 @@ const currentResult = ref<SystemPrompt>(props.data)
 const priceConfirmed = computed(() => hasConfirmedGenerationPrice(currentResult.value))
 const currentImage = computed(() => cardIsCurrent.value && priceConfirmed.value && !currentResult.value.outputImageDeletedAt
   ? currentResult.value.outputImage || null : null)
-const pricePending = computed(() => !priceConfirmed.value && !currentResult.value.errors
-  && (currentResult.value.status === 'succeeded' || !!currentResult.value.outputImage))
 const outputImageExpired = computed(() => !!currentResult.value.outputImageDeletedAt && !currentImage.value)
 const outputImageDeletedAt = computed(() => props.data?.outputImageDeletedAt
   ? new Date(props.data.outputImageDeletedAt).toLocaleString()
@@ -235,27 +225,6 @@ async function sendRefine() {
     if (cardIsCurrent.value) toast.add({ title: 'Refinement failed', description: e?.data?.statusMessage || e?.message || 'Request failed', color: 'warning' })
   } finally {
     if (cardIsCurrent.value) chatLoading.value = false
-  }
-}
-
-async function refreshBilling() {
-  if (!cardIsCurrent.value || billingLoading.value || !props.data?.id) return
-  billingLoading.value = true
-  try {
-    const response = await $fetch<{ok: true; item: SystemPrompt}>(`/api/systemprompts/${currentResult.value.id}/billing-refresh`, {method: 'POST'})
-    if (!cardIsCurrent.value) return
-    currentResult.value = response.item
-    toast.add({ title: hasConfirmedGenerationPrice(response.item) ? 'Price confirmed' : 'Price is still pending' })
-    await refreshNuxtData(historyKey)
-  } catch (e: any) {
-    if (!cardIsCurrent.value) return
-    toast.add({
-      title: 'Cost unavailable',
-      description: e?.data?.statusMessage || e?.message || 'Gateway billing is not ready yet.',
-      color: 'warning'
-    })
-  } finally {
-    if (cardIsCurrent.value) billingLoading.value = false
   }
 }
 
@@ -337,7 +306,9 @@ async function regenerate() {
       if (!cardIsCurrent.value) return
       const row = res?.obj?.[0]
       if (row && !row.errors && (row.status === 'succeeded' || row.outputImage)) {
-        currentResult.value = row
+        // Keep the existing priced output while the new generation's final
+        // charge is pending. History adds the new card when it is confirmed.
+        if (hasConfirmedGenerationPrice(row)) currentResult.value = row
       } else {
         throw new Error(row?.errors || 'Unknown generation error')
       }
@@ -361,90 +332,60 @@ async function regenerate() {
 </script>
 
 <template>
-  <div
-    v-if="cardIsCurrent"
-    class="group relative overflow-hidden rounded-xl border border-gray-200 dark:border-gray-800 bg-white/70 dark:bg-gray-900/50 shadow-sm hover:shadow-lg transition-all duration-200"
-  >
-    <div v-if="currentImage" class="relative">
+  <article v-if="cardIsCurrent && priceConfirmed" class="generation-result-card">
+    <div v-if="currentImage" class="generation-preview">
       <DownloadableImage
         :src="currentImage"
         :alt="props.data?.TextPrompt || 'Output image'"
-        class="w-full h-auto object-contain bg-gray-50 dark:bg-gray-800"
+        class="generation-preview-image"
       />
-      <span class="absolute top-2 left-2 px-2 py-0.5 text-[10px] font-medium rounded bg-white/80 dark:bg-gray-900/70 text-gray-800 dark:text-gray-200 border border-gray-200 dark:border-gray-700">
-        Output
-      </span>
+      <span class="generation-output-badge">Output</span>
     </div>
-    <div v-else-if="outputImageExpired" role="status" class="flex flex-col items-center gap-2 p-6 bg-gray-50 dark:bg-gray-800/60 text-gray-600 dark:text-gray-300 border-b border-gray-200 dark:border-gray-800 text-center">
-      <UIcon name="i-lucide-image-off" class="size-6" aria-hidden="true" />
-      <span class="text-sm font-medium">Image expired</span>
-      <p class="text-xs">Automatically deleted under the generated-image retention policy on {{ outputImageDeletedAt }}.</p>
-      <p class="text-xs">The prompt, settings, and generation history are retained. You can regenerate if the original source images are still available.</p>
+    <div v-else-if="outputImageExpired" role="status" class="generation-empty-preview">
+      <UIcon name="i-lucide-image-off" class="size-7" aria-hidden="true" />
+      <span>Image expired</span>
+      <p>Automatically deleted under the generated-image retention policy on {{ outputImageDeletedAt }}.</p>
+      <p>Your prompt and settings are retained. Regenerate if the original images are still available.</p>
     </div>
-    <div v-else-if="pricePending" role="status" class="generation-price-pending">
-      <UIcon name="i-lucide-receipt-text" class="size-6" aria-hidden="true" />
-      <span>Image ready · confirming price</span>
-      <p>Your result will appear when Gateway confirms its final cost.</p>
-    </div>
-    <div v-else class="relative flex items-center gap-2 justify-center p-6 bg-red-50 dark:bg-red-900/30 text-red-700 dark:text-red-300 border-b border-red-200 dark:border-red-800">
-      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-5 h-5">
-        <path fill-rule="evenodd" d="M8.257 3.099c.765-1.36 2.721-1.36 3.486 0l6.518 11.58c.75 1.333-.213 2.996-1.742 2.996H3.48c-1.53 0-2.492-1.663-1.743-2.996L8.257 3.1zM11 14a1 1 0 10-2 0 1 1 0 002 0zm-1-2a.75.75 0 01-.75-.75v-3.5a.75.75 0 011.5 0v3.5A.75.75 0 0110 12z" clip-rule="evenodd" />
-      </svg>
-      <span class="text-sm font-medium">No output image</span>
+    <div v-else role="status" class="generation-empty-preview generation-empty-error">
+      <UIcon name="i-lucide-image-off" class="size-7" aria-hidden="true" />
+      <span>No output image</span>
     </div>
 
-    <div class="p-3 flex flex-col gap-3">
-      <p class="text-sm font-medium text-gray-900 dark:text-gray-100 line-clamp-3" :title="props.data?.TextPrompt">
-        {{ props.data?.TextPrompt }}
-      </p>
+    <div class="generation-card-content">
+      <p class="generation-prompt" :title="props.data?.TextPrompt">{{ props.data?.TextPrompt }}</p>
 
-      <div
-        v-if="generationModelText || tokenUsageText || settingsSummary || outputDimensions || currentResult"
-        class="grid grid-cols-1 gap-1 text-[11px] text-gray-600 dark:text-gray-400 bg-gray-50 dark:bg-gray-800/70 rounded p-2"
-      >
-        <div v-if="generationModelText">
-          <span class="font-medium text-gray-700 dark:text-gray-300">Model:</span>
-          {{ generationModelText }}
+      <div class="generation-facts">
+        <div class="generation-final-price" data-generation-price>
+          <span>Final price</span>
+          <strong>{{ priceText }}</strong>
         </div>
-        <div v-if="settingsSummary">
-          <span class="font-medium text-gray-700 dark:text-gray-300">Settings:</span>
-          {{ settingsSummary }}
-          <span v-if="isLegacyConfig" class="text-amber-600 dark:text-amber-300"> (legacy defaults inferred)</span>
-        </div>
-        <div v-if="outputDimensions">
-          <span class="font-medium text-gray-700 dark:text-gray-300">Output:</span>
-          {{ outputDimensions }}
-        </div>
-        <div v-if="tokenUsageText">
-          <span class="font-medium text-gray-700 dark:text-gray-300">Tokens:</span>
-          {{ tokenUsageText }}
-        </div>
-        <div class="flex items-center justify-between gap-2" data-generation-price>
-          <span>
-            <span class="font-medium text-gray-700 dark:text-gray-300">Price:</span>
-            <span v-if="priceText">
-              {{ priceText }}<span>{{ priceConfirmed ? ' · confirmed' : priceSourceText ? ` · ${priceSourceText.toLowerCase()}` : ' · unconfirmed' }}</span>
-            </span>
-            <span v-else>Pending confirmation</span>
-          </span>
-          <UButton
-              v-if="pricePending"
-              size="xs"
-              variant="ghost"
-              :loading="billingLoading"
-              :disabled="billingLoading"
-              @click="refreshBilling"
-          >
-            Check price
-          </UButton>
-        </div>
+        <dl class="generation-metadata">
+          <div v-if="generationModelText">
+            <dt>Model</dt>
+            <dd>{{ generationModelText }}</dd>
+          </div>
+          <div v-if="settingsSummary">
+            <dt>Settings</dt>
+            <dd>
+              {{ settingsSummary }}
+              <span v-if="isLegacyConfig" class="generation-warning-note">Legacy defaults inferred</span>
+            </dd>
+          </div>
+          <div v-if="outputDimensions">
+            <dt>Output</dt>
+            <dd>{{ outputDimensions }}</dd>
+          </div>
+          <div v-if="tokenUsageText">
+            <dt>Tokens</dt>
+            <dd>{{ tokenUsageText }}</dd>
+          </div>
+        </dl>
       </div>
 
-      <div v-if="props.data?.errors" class="flex items-start gap-2 text-xs text-red-700 dark:text-red-400 bg-red-50 dark:bg-red-900/20 p-2 rounded border border-red-200 dark:border-red-800">
-        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-4 h-4 mt-0.5">
-          <path fill-rule="evenodd" d="M8.257 3.099c.765-1.36 2.721-1.36 3.486 0l6.518 11.58c.75 1.333-.213 2.996-1.742 2.996H3.48c-1.53 0-2.492-1.663-1.743-2.996L8.257 3.1zM11 14a1 1 0 10-2 0 1 1 0 002 0zm-1-2a.75.75 0 01-.75-.75v-3.5a.75.75 0 011.5 0v3.5A.75.75 0 0110 12z" clip-rule="evenodd" />
-        </svg>
-        <span class="whitespace-pre-line">{{ props.data.errors }}</span>
+      <div v-if="props.data?.errors" class="generation-note generation-note-error" role="alert">
+        <UIcon name="i-lucide-triangle-alert" class="size-4" aria-hidden="true" />
+        <span>{{ props.data.errors }}</span>
       </div>
 
       <UButton
@@ -452,41 +393,39 @@ async function regenerate() {
         size="xs"
         variant="soft"
         color="neutral"
+        class="generation-details-button"
         :loading="detailLoading"
         @click="loadOutputDetails"
       >
         Load output details
+        <UIcon name="i-lucide-chevron-down" class="size-3.5" aria-hidden="true" />
       </UButton>
 
-      <div
-        v-if="outputMetadata?.responseText"
-        class="rounded border border-gray-200 bg-gray-50 p-2 text-xs whitespace-pre-wrap text-gray-700 dark:border-gray-800 dark:bg-gray-800/60 dark:text-gray-200"
-      >
+      <div v-if="outputMetadata?.responseText" class="generation-output-text">
         {{ outputMetadata.responseText }}
       </div>
 
-      <details v-if="outputMetadata?.reasoningText" class="text-xs text-gray-600 dark:text-gray-300">
-        <summary class="cursor-pointer">Thought summary</summary>
-        <div class="mt-1 whitespace-pre-wrap rounded bg-gray-50 p-2 dark:bg-gray-800/60">{{ outputMetadata.reasoningText }}</div>
+      <details v-if="outputMetadata?.reasoningText" class="generation-details">
+        <summary>Thought summary</summary>
+        <div class="generation-output-text">{{ outputMetadata.reasoningText }}</div>
       </details>
 
-      <details v-if="outputMetadata?.warnings?.length" class="text-xs text-amber-700 dark:text-amber-300">
-        <summary class="cursor-pointer">Provider warnings ({{ outputMetadata.warnings.length }})</summary>
-        <ul class="mt-1 list-disc space-y-1 pl-5">
+      <details v-if="outputMetadata?.warnings?.length" class="generation-details generation-provider-warnings">
+        <summary>Provider warnings ({{ outputMetadata.warnings.length }})</summary>
+        <ul>
           <li v-for="warning in outputMetadata.warnings" :key="warning">{{ warning }}</li>
         </ul>
       </details>
 
-      <div v-if="grounding" class="rounded border border-blue-200 bg-blue-50 p-2 text-xs dark:border-blue-900 dark:bg-blue-950/30">
-        <div class="font-medium text-blue-900 dark:text-blue-100">Google Search grounding</div>
-        <div v-if="grounding.sources.length" class="mt-1 flex flex-wrap gap-x-3 gap-y-1">
+      <div v-if="grounding" class="generation-grounding">
+        <div class="generation-section-label">Google Search grounding</div>
+        <div v-if="grounding.sources.length" class="generation-grounding-sources">
           <a
             v-for="source in grounding.sources"
             :key="source.url"
             :href="source.url"
             target="_blank"
             rel="noopener noreferrer"
-            class="text-blue-700 underline dark:text-blue-300"
           >{{ source.title || source.url }}</a>
         </div>
         <iframe
@@ -494,88 +433,215 @@ async function regenerate() {
           :srcdoc="grounding.searchEntryPointHtml"
           sandbox="allow-popups allow-popups-to-escape-sandbox"
           title="Google Search suggestions"
-          class="mt-2 h-16 w-full rounded border-0 bg-white"
+          class="generation-grounding-frame"
         />
       </div>
 
-      <div v-if="props.data?.serverImages?.length" class="mt-1">
-        <div class="text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Input image(s)</div>
-        <div class="grid grid-cols-5 gap-1">
+      <div v-if="props.data?.serverImages?.length" class="generation-sources">
+        <div class="generation-section-label">Input images</div>
+        <div class="generation-source-grid">
           <DownloadableImage
-            v-for="s in props.data.serverImages"
-            :key="s"
-            :src="s"
-            :alt="'Input ' + s"
-            class="h-16 w-full object-cover rounded bg-gray-50 dark:bg-gray-800"
+            v-for="(source, index) in props.data.serverImages"
+            :key="source"
+            :src="source"
+            :alt="`Input image ${index + 1}`"
+            class="generation-source-image"
           />
         </div>
       </div>
 
-      <div v-if="props.data?.modelImages?.length" class="mt-1">
-        <div class="text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Model image(s)</div>
-        <div class="grid grid-cols-5 gap-1">
+      <div v-if="props.data?.modelImages?.length" class="generation-sources">
+        <div class="generation-section-label">Reference images</div>
+        <div class="generation-source-grid">
           <DownloadableImage
-            v-for="m in props.data.modelImages"
-            :key="m"
-            :src="m"
-            :alt="'Model ' + m"
-            class="h-16 w-full object-cover rounded bg-gray-50 dark:bg-gray-800"
+            v-for="(source, index) in props.data.modelImages"
+            :key="source"
+            :src="source"
+            :alt="`Reference image ${index + 1}`"
+            class="generation-source-image"
           />
         </div>
       </div>
 
-      <div class="flex items-center justify-between">
-        <div class="flex items-center gap-2">
-          <UButton size="xs" :loading="regenLoading" :disabled="regenLoading || !!replayUnavailableReason" @click="regenerate">
+      <div class="generation-replay">
+        <div class="generation-replay-controls">
+          <UButton
+            size="xs"
+            class="generation-regenerate-button"
+            :loading="regenLoading"
+            :disabled="regenLoading || !!replayUnavailableReason"
+            @click="regenerate"
+          >
+            <UIcon name="i-lucide-rotate-cw" class="size-3.5" aria-hidden="true" />
             Regenerate
           </UButton>
-          <div class="flex items-center gap-1 text-[11px] text-gray-600 dark:text-gray-300">
+          <label class="generation-replay-count">
             <span>×</span>
-            <UInput v-model.number="regenCount" type="number" size="xs" class="w-14" min="1" :disabled="regenLoading" />
-            <span>times</span>
-          </div>
-          <p v-if="replayUnavailableReason" class="text-xs text-amber-700 dark:text-amber-300">
-            {{ replayUnavailableReason }}
-          </p>
+            <UInput
+              v-model.number="regenCount"
+              type="number"
+              size="xs"
+              class="generation-count-input"
+              aria-label="Number of regenerations"
+              min="1"
+              max="50"
+              :disabled="regenLoading"
+            />
+          </label>
         </div>
-        <span class="text-[11px] text-gray-500 dark:text-gray-400">{{ createdAt }}</span>
+        <p v-if="replayUnavailableReason" class="generation-warning-note">{{ replayUnavailableReason }}</p>
       </div>
 
-      <!-- Standalone refinement -->
-      <div v-if="currentImage" class="mt-2 border-t border-gray-200 dark:border-gray-800 pt-2">
-        <div class="text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Refine</div>
-        <div class="flex items-end gap-2">
+      <div v-if="currentImage" class="generation-refinement">
+        <label :for="`generation-refine-${props.data.id}`" class="generation-section-label">Refine this image</label>
+        <div class="generation-refinement-controls">
           <UTextarea
+            :id="`generation-refine-${props.data.id}`"
             v-model="chatInput"
-            placeholder="Describe a refinement"
-            class="flex-1"
-            :rows="1"
+            placeholder="Describe a refinement…"
+            class="generation-refinement-input"
+            :rows="2"
             autoresize
             :disabled="chatLoading"
             @keydown="onChatKeydown"
           />
           <UButton
             size="xs"
+            class="generation-refine-button"
             :loading="chatLoading"
             :disabled="chatLoading || !chatInput.trim() || !currentImage"
             @click="sendRefine"
           >
-            Send
+            <UIcon name="i-lucide-arrow-up" class="size-4" aria-hidden="true" />
+            <span>Send</span>
           </UButton>
         </div>
       </div>
+
+      <time class="generation-created-at" :datetime="props.data.createdAt">{{ createdAt }}</time>
     </div>
-  </div>
+  </article>
 </template>
 
 <style scoped>
-.generation-price-pending { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 30px 22px; text-align: center; background: #362c23; color: #edc9a6; border-bottom: 1px solid #5d4631; }
-.generation-price-pending > span { font-size: 13px; font-weight: 600; }
-.generation-price-pending > p { max-width: 270px; font-size: 11px; line-height: 1.7; color: #c1ae98; }
-.line-clamp-3 {
+.generation-result-card {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--workspace-border);
+  border-radius: 16px;
+  background: var(--workspace-surface);
+  color: var(--workspace-text);
+}
+.generation-preview {
+  position: relative;
+  display: block;
+  aspect-ratio: 4 / 3;
+  overflow: hidden;
+  border-bottom: 1px solid var(--workspace-border);
+  background: var(--workspace-bg);
+}
+.generation-preview-image,
+.generation-preview :deep(img) {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+.generation-preview-image {
+  position: absolute;
+  inset: 0;
+  min-height: 0;
+}
+.generation-output-badge {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  padding: 4px 8px;
+  border: 1px solid #f2eee626;
+  border-radius: 6px;
+  background: #211f1bd9;
+  color: var(--workspace-text);
+  font-size: 10px;
+  font-weight: 600;
+  pointer-events: none;
+}
+.generation-empty-preview {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  min-height: 210px;
+  padding: 24px 20px;
+  border-bottom: 1px solid var(--workspace-border);
+  background: var(--workspace-bg);
+  text-align: center;
+  color: var(--workspace-muted);
+}
+.generation-empty-preview > span {font-size: 13px; font-weight: 600; color: var(--workspace-text);}
+.generation-empty-preview > p {margin: 0; font-size: 11px; line-height: 1.65;}
+.generation-empty-error > .iconify {color: #e9b29a;}
+.generation-card-content {display: flex; flex: 1; flex-direction: column; gap: 16px; padding: 18px; min-width: 0;}
+.generation-prompt {
   display: -webkit-box;
   -webkit-line-clamp: 3;
   -webkit-box-orient: vertical;
   overflow: hidden;
+  overflow-wrap: anywhere;
+  margin: 0;
+  color: var(--workspace-text);
+  font-size: 13px;
+  font-weight: 550;
+  line-height: 1.6;
+}
+.generation-facts {overflow: hidden; border: 1px solid var(--workspace-border); border-radius: 10px; background: var(--workspace-bg);}
+.generation-final-price {display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 6px 10px; padding: 12px; border-bottom: 1px solid var(--workspace-border);}
+.generation-final-price > span {font-size: 11px; color: var(--workspace-muted);}
+.generation-final-price > strong {font-size: 15px; font-weight: 600; letter-spacing: -.2px; font-variant-numeric: tabular-nums; color: var(--workspace-accent); overflow-wrap: anywhere;}
+.generation-metadata {display: grid; gap: 8px; padding: 12px; font-size: 10px; line-height: 1.65;}
+.generation-metadata > div {display: grid; grid-template-columns: 44px minmax(0, 1fr); gap: 8px;}
+.generation-metadata dt {color: var(--workspace-muted);}
+.generation-metadata dd {margin: 0; color: #ddd6ca; overflow-wrap: anywhere;}
+.generation-warning-note {display: block; margin-top: 4px; color: #e3c19a; font-size: 10px; line-height: 1.6;}
+.generation-note {display: flex; align-items: start; gap: 8px; padding: 11px 12px; border: 1px solid var(--workspace-border); border-radius: 9px; font-size: 11px; line-height: 1.7;}
+.generation-note > .iconify {flex: 0 0 auto; margin-top: 2px;}
+.generation-note > span {white-space: pre-line; overflow-wrap: anywhere;}
+.generation-note-error {background: #382a24; border-color: #614639; color: #f1b8a2;}
+.generation-details-button {justify-content: space-between; width: 100%; padding: 9px 11px; border: 1px solid var(--workspace-border); border-radius: 8px; background: var(--workspace-surface-raised); color: var(--workspace-text); font-size: 11px; font-weight: 500;}
+.generation-details-button:hover:not(:disabled) {background: #39352e;}
+.generation-output-text {border: 1px solid var(--workspace-border); border-radius: 9px; background: var(--workspace-bg); padding: 11px 12px; color: #ddd6ca; font-size: 11px; line-height: 1.7; white-space: pre-wrap; overflow-wrap: anywhere;}
+.generation-details {color: var(--workspace-muted); font-size: 11px; line-height: 1.7;}
+.generation-details summary {cursor: pointer; color: var(--workspace-text);}
+.generation-details[open] summary {margin-bottom: 10px;}
+.generation-provider-warnings {color: #e3c19a;}
+.generation-provider-warnings ul {padding-left: 18px; list-style: disc;}
+.generation-provider-warnings li + li {margin-top: 5px;}
+.generation-grounding {padding: 12px; border: 1px solid var(--workspace-border); border-radius: 9px; background: var(--workspace-bg);}
+.generation-grounding-sources {display: flex; flex-wrap: wrap; gap: 7px 12px; margin-top: 10px; font-size: 11px; line-height: 1.65;}
+.generation-grounding-sources a {color: var(--workspace-accent); text-decoration: underline; text-underline-offset: 3px; overflow-wrap: anywhere;}
+.generation-grounding-frame {width: 100%; height: 64px; margin-top: 10px; border: 0; border-radius: 6px; background: #fff;}
+.generation-section-label {display: block; color: var(--workspace-muted); font-size: 10px; font-weight: 500;}
+.generation-source-grid {display: flex; flex-wrap: wrap; gap: 7px; margin-top: 8px;}
+.generation-source-image {display: block; width: 52px; height: 62px; overflow: hidden; border: 1px solid var(--workspace-border); border-radius: 7px; background: var(--workspace-bg);}
+.generation-source-grid :deep(img) {width: 100%; height: 100%; object-fit: cover;}
+.generation-replay {display: grid; gap: 5px;}
+.generation-replay-controls {display: flex; align-items: center; flex-wrap: wrap; gap: 10px;}
+.generation-regenerate-button, .generation-refine-button {justify-content: center; gap: 7px; min-height: 34px; padding: 8px 11px; border: 1px solid transparent; border-radius: 8px; background: var(--workspace-accent); color: #241c15; font-size: 11px; font-weight: 600;}
+.generation-regenerate-button:hover:not(:disabled), .generation-refine-button:hover:not(:disabled) {background: #edaf84;}
+.generation-replay-count {display: flex; align-items: center; gap: 7px; color: var(--workspace-muted); font-size: 11px;}
+.generation-count-input {width: 58px;}
+.generation-count-input :deep(input) {min-height: 34px; border-radius: 8px; background: var(--workspace-bg); color: var(--workspace-text); font-size: 11px; font-variant-numeric: tabular-nums;}
+.generation-refinement {padding-top: 15px; border-top: 1px solid var(--workspace-border);}
+.generation-refinement-controls {display: flex; align-items: end; gap: 8px; margin-top: 8px;}
+.generation-refinement-input {flex: 1; min-width: 0;}
+.generation-refinement-input :deep(textarea) {min-height: 62px; padding: 10px 11px; border-radius: 9px; background: var(--workspace-bg); color: var(--workspace-text); font-size: 11px; line-height: 1.6;}
+.generation-refinement-input :deep(textarea::placeholder) {color: var(--workspace-muted);}
+.generation-refine-button {flex: 0 0 auto; min-height: 34px; padding: 8px 10px;}
+.generation-created-at {margin-top: auto; padding-top: 3px; color: var(--workspace-muted); font-size: 10px; line-height: 1.6; overflow-wrap: anywhere;}
+@media (max-width: 480px) {
+  .generation-card-content {padding: 16px;}
+  .generation-final-price > strong {font-size: 16px;}
 }
 </style>
