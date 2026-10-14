@@ -3,7 +3,8 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "build": "nuxt build && npm run build:background-removal",
+    "build": "nuxt build && npm run build:database-migration && npm run build:background-removal",
+    "build:database-migration": "node scripts/build-database-migration.mjs",
     "build:background-removal": "node scripts/build-background-removal.mjs",
     "build:retention": "node scripts/build-retention-worker.mjs",
     "build:pipeline-worker": "node scripts/build-pipeline-worker.mjs && npm run build:background-removal",
@@ -16,7 +17,7 @@
     "drizzle:generate": "drizzle-kit generate",
     "drizzle:up": "drizzle-kit up",
     "drizzle:studio": "drizzle-kit studio",
-    "drizzle:migrate": "drizzle-kit migrate"
+    "drizzle:migrate": "node scripts/migrate-database.mjs"
   },
   "dependencies": {
     "@ai-sdk/provider-utils": "^4.0.27",

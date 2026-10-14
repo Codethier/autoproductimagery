@@ -8,6 +8,7 @@ import {useUserFS} from './useUserFS'
 import type {AssetActor} from './assetAccess'
 import {assertGenerationCredit} from './accountBilling'
 import {createPeopleRepository} from './peopleRepository'
+import {wakePipelineWorker, type PipelineWorkerWakeResult} from './pipelineWorkerWake'
 import {hasConfirmedGenerationPrice} from '../../schemas/generation-billing'
 import {CREDIT_EXHAUSTED_CODE, CREDIT_EXHAUSTED_MESSAGE, formatUsdUnits} from '../../schemas/account-billing'
 import {SavePipelineSchema, UpdatePipelineSchema, StartPipelineRunSchema, RetryPipelineRunSchema, RerunPipelineRunSchema,
@@ -67,7 +68,7 @@ export function pipelineItemState(steps: Array<{status: PipelineStepState}>): Pi
 }
 
 export function createPipelineRepository(actor: PipelineActor, db: Database = getDatabase(),
-    options: {storage?: Awaited<ReturnType<typeof useUserFS>>; leaseMs?: number} = {}) {
+    options: {storage?: Awaited<ReturnType<typeof useUserFS>>; leaseMs?: number; workerWake?: () => Promise<PipelineWorkerWakeResult>} = {}) {
     const scope = (table: {organizationId: typeof pipelineRuns.organizationId; userId: typeof pipelineRuns.userId}) =>
         and(eq(table.organizationId, actor.organizationId), eq(table.userId, actor.userId))
     const stepScope = () => and(eq(pipelineRunSteps.organizationId, actor.organizationId), eq(pipelineRunSteps.userId, actor.userId))
@@ -271,7 +272,9 @@ export function createPipelineRepository(actor: PipelineActor, db: Database = ge
                 || existing[0].batchInputNodeId !== (input.batchInputNodeId ?? null) || existing[0].targetNodeId !== (input.targetNodeId ?? null)) throw createError({statusCode: 409, statusMessage: 'This pipeline request key was already used'})
             const previous = await db.select({inputUrl: pipelineRunItems.inputUrl}).from(pipelineRunItems).where(eq(pipelineRunItems.runId, existing[0].id)).orderBy(asc(pipelineRunItems.index))
             if (JSON.stringify(previous.map(item => item.inputUrl)) !== JSON.stringify(images)) throw createError({statusCode: 409, statusMessage: 'This pipeline request key was already used'})
-            return {run: await detail(existing[0].id)}
+            const run = await detail(existing[0].id)
+            const workerWake = !run.cancelRequested && liveStatuses.includes(run.status) ? await notify(run.id) : undefined
+            return {run, ...(workerWake ? {workerWake} : {})}
         }
         const persistedRunId = await db.transaction(async tx => {
             await lockQueue(tx); const user = await activeActor(tx)
@@ -299,8 +302,8 @@ export function createPipelineRepository(actor: PipelineActor, db: Database = ge
             }
             return runId
         })
-        await notify(persistedRunId)
-        return {run: await detail(persistedRunId)}
+        const workerWake = await notify(persistedRunId)
+        return {run: await detail(persistedRunId), workerWake}
     }
     async function allSteps(runId: string, executor: Database | PipelineTransaction = db, active = true) {
         return executor.select().from(pipelineRunSteps).where(and(eq(pipelineRunSteps.runId, runId), stepScope(), active ? eq(pipelineRunSteps.active, true) : undefined)).orderBy(asc(pipelineRunSteps.createdAt), asc(pipelineRunSteps.id))
@@ -605,8 +608,8 @@ export function createPipelineRepository(actor: PipelineActor, db: Database = ge
             }
             await tx.update(pipelineRuns).set({cancelRequested: false, status: 'queued', completedAt: null, updatedAt: sql`CURRENT_TIMESTAMP`}).where(and(eq(pipelineRuns.id, id), runScope()))
         })
-        await notify(id)
-        return {run: await detail(id)}
+        const workerWake = await notify(id)
+        return {run: await detail(id), workerWake}
     }
     async function rerun(id: string, raw: unknown) {
         const parsed = RerunPipelineRunSchema.safeParse(raw)
@@ -662,8 +665,8 @@ export function createPipelineRepository(actor: PipelineActor, db: Database = ge
             // Preserve its state/claim and derive the overall run from all jobs.
             await synchronize(id, tx)
         })
-        await notify(id)
-        return {run: await detail(id)}
+        const workerWake = await notify(id)
+        return {run: await detail(id), workerWake}
     }
     async function publishPreparation<T>(stepId: string, token: string, publish: (tx: PipelineTransaction) => Promise<T>, sourceUrls: string[] = []): Promise<T> {
         return db.transaction(async tx => {
@@ -678,13 +681,20 @@ export function createPipelineRepository(actor: PipelineActor, db: Database = ge
         })
     }
     async function notify(id: string) {
-        await db.execute(sql`SELECT pg_notify('pipeline_run_ready', ${id})`).catch(() => console.error('Pipeline wake notification is temporarily unavailable.'))
+        // The run transaction has committed before dispatch. PostgreSQL
+        // notifications accelerate an already-active runner; HTTP wakes one
+        // that Railway has stopped. Neither executes provider work here.
+        const [, workerWake] = await Promise.all([
+            db.execute(sql`SELECT pg_notify('pipeline_run_ready', ${id})`).catch(() => console.error('Pipeline wake notification is temporarily unavailable.')),
+            (options.workerWake ?? wakePipelineWorker)().catch((): PipelineWorkerWakeResult => 'unavailable'),
+        ])
+        return workerWake
     }
     async function wake(id: string) {
         await db.transaction(async tx => {await activeActor(tx); const run = await requireRun(id, tx, true)
             if (!run.cancelRequested && liveStatuses.includes(run.status)) await tx.update(pipelineRuns).set({nextAttemptAt: sql`CURRENT_TIMESTAMP`}).where(and(eq(pipelineRuns.id, id), runScope()))})
-        await notify(id)
-        return {run: await detail(id)}
+        const workerWake = await notify(id)
+        return {run: await detail(id), workerWake}
     }
     async function schedule(id: string, waitMs: number) {
         await db.update(pipelineRuns).set({nextAttemptAt: sql`CURRENT_TIMESTAMP + (${Math.max(0, Math.min(900_000, waitMs))} * interval '1 millisecond')`})

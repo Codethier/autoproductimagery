@@ -36,7 +36,7 @@ const favourites = new URL("app/composables/useImageModelFavourites.ts", root)
   .href;
 const exposures: Record<string, string> = {
   [workspace]:
-    "pipelines,pipeline,definition,name,description,editing,selectedId,selectedEdgeId,models,dirty,conflict,saveError,notice,useTemplate,addNode,updateNode,moveNode,removeNode,duplicateNode,copyNode,pasteNode,connect,disconnect,disconnectNode,undo,redo,canUndo,canRedo,loadPipelines,openPipeline,save,prepareRun,runTarget,batchInput,batchImages,runInputs,inputNodes,executionNodes,canStart,runIssues,creditBlockReason,startRun,runMode,activeRun,runError,starting,picker,pickerUrls,pickerTab,peopleOnlyPicker,pickerTabKey,openPicker,confirmPicker,refreshRun,resumeRun,cancelRun,retryRun,rerunJob,closeRun,loadRuns,runHistory,keyboard,metadataOpen,deleteOpen,discardOpen,openRuns",
+    "pipelines,pipeline,definition,name,description,editing,selectedId,selectedEdgeId,models,dirty,conflict,saveError,notice,useTemplate,addNode,updateNode,moveNode,removeNode,duplicateNode,copyNode,pasteNode,connect,disconnect,disconnectNode,undo,redo,canUndo,canRedo,loadPipelines,openPipeline,save,prepareRun,runTarget,batchInput,batchImages,runInputs,inputNodes,executionNodes,canStart,runIssues,creditBlockReason,startRun,runMode,activeRun,runError,runWakeNotice,starting,picker,pickerUrls,pickerTab,peopleOnlyPicker,pickerTabKey,openPicker,confirmPicker,refreshRun,resumeRun,cancelRun,retryRun,rerunJob,closeRun,loadRuns,runHistory,keyboard,metadataOpen,deleteOpen,discardOpen,openRuns",
   [properties]:
     "updateNode,changeModel,settings,orderedModels,ai,imageProfile,connect,selectImage,errorMessage",
   [results]:
@@ -197,6 +197,7 @@ function environment(fetch?: (url: string, options: any) => unknown) {
       navigations.push(value);
     },
     fetch: async (url: string, options: any = {}) => {
+      options.onRequest?.({options});
       calls.push({ url, options });
       if (fetch) return fetch(url, options);
       if (url === "/api/image-models") return { items: models };
@@ -965,6 +966,58 @@ test('historical background credit failures use fresh balance and do not ask top
     } finally {value.app.unmount()}
   }
 })
+
+test('a committed run survives an unavailable wake and transient progress failure without replaying the queued mutation', async () => {
+  const env = environment(), baseFetch = env.fetch;
+  let refreshReady = false;
+  const queued = run();
+  env.fetch = async (url: string, options: any) => {
+    if (url === `/api/pipeline-runs/${queued.id}`) {
+      options.onRequest?.({options}); env.calls.push({url, options});
+      if (!refreshReady) throw {statusCode: 503};
+      return {run: {...queued, status: 'running'}, workerWake: 'accepted'};
+    }
+    const response = await baseFetch(url, options);
+    return url.endsWith('/runs') ? {run: queued, workerWake: 'unavailable'} : response;
+  };
+  const value = await mount(env);
+  try {
+    const s = value.exposed;
+    s.useTemplate(PIPELINE_TEMPLATES[1]); await s.prepareRun(); s.batchImages.value = [source];
+    await s.startRun();
+    assert.equal(s.activeRun.value.id, queued.id);
+    assert.equal(s.activeRun.value.status, 'queued');
+    assert.equal(s.runMode.value, 'results');
+    assert.match(s.runWakeNotice.value, /run is saved.*could not be reached.*Refresh progress/);
+    const submitted = env.calls.filter((call: any) => call.url.endsWith('/runs'));
+    assert.equal(submitted.length, 1);
+    assert.equal(submitted[0].options.retry, 0);
+    assert.equal(submitted[0].options.workspaceRequestState.budget, 180_000);
+    await s.refreshRun();
+    assert.equal(s.activeRun.value.id, queued.id);
+    assert.equal(s.activeRun.value.status, 'queued');
+    assert.match(s.runWakeNotice.value, /run is saved/);
+    assert.match(s.runError.value, /Background work continues/);
+    refreshReady = true; await s.refreshRun();
+    assert.equal(s.activeRun.value.id, queued.id);
+    assert.equal(s.activeRun.value.status, 'running');
+    assert.equal(s.runError.value, ''); assert.equal(s.runWakeNotice.value, '');
+    assert.equal(env.calls.filter((call: any) => call.url.endsWith('/runs')).length, 1);
+    const reads = env.calls.filter((call: any) => call.url === `/api/pipeline-runs/${queued.id}`);
+    assert.equal(reads[0].options.workspaceRequestState.budget, 90_000);
+    assert.equal(reads[0].options.retry, 1);
+  } finally {value.app.unmount();}
+});
+
+test('queued runs explain initial warm-up and unavailable processing without claiming a confirmed failure', async () => {
+  const waiting = await render(results, {run: run()});
+  assert.match(waiting.html, /run is saved in the queue.*take a little longer to start after being idle/);
+  assert.match(waiting.html, /you can close this page and check it later/);
+  const unavailable = await render(results, {run: run(), notice: 'Your run is saved; processing cannot be reached yet. Refresh progress.'});
+  assert.match(unavailable.html, /Your run is saved; processing cannot be reached yet/);
+  assert.doesNotMatch(unavailable.html, /role="alert"/);
+  assert.doesNotMatch(unavailable.html, /run is saved in the queue/);
+});
 
 test("uncertain run submission reuses one idempotency key and does not duplicate accepted work", async () => {
   let attempts = 0;

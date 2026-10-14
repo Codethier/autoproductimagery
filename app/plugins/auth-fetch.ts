@@ -1,3 +1,5 @@
+import {prepareServerlessRequest, SERVERLESS_MUTATION_TIMEOUT_MS} from '../utils/serverlessRequests'
+
 export default defineNuxtPlugin(() => {
   if (!import.meta.client) return
 
@@ -12,7 +14,7 @@ export default defineNuxtPlugin(() => {
     session.clear()
 
     // Only the server can clear the HttpOnly session cookie.
-    await baseFetch('/api/logout', { method: 'POST' }).catch(() => undefined)
+    await baseFetch('/api/logout', {method: 'POST', retry: 0, timeout: SERVERLESS_MUTATION_TIMEOUT_MS}).catch(() => undefined)
 
     const current = router.currentRoute.value
     if (current.path === '/login') {
@@ -36,7 +38,7 @@ export default defineNuxtPlugin(() => {
 
   globalThis.$fetch = baseFetch.create({
     onRequest({options}) {
-      ;(options as typeof options & {workspaceAccountEpoch?: number}).workspaceAccountEpoch = session.epoch.value
+      prepareServerlessRequest(options, session.epoch.value)
     },
     onResponseError({ response, options }) {
       if ((options as typeof options & {workspaceAccountEpoch?: number}).workspaceAccountEpoch !== session.epoch.value) return

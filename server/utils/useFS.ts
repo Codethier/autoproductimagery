@@ -11,6 +11,7 @@ import type { AssetFile, AssetListingPage } from "~~/schemas/image-storage"
 import type { BufferedUploadFile } from "./uploadPolicy"
 import { canonicalImageExtension, hasSupportedImageExtension, inspectDecodedImage, MAX_STORED_IMAGE_BYTES } from "./imageValidation"
 import { imagePathToUrl, normalizeImageStoragePrefix, parseImagePath, validateImagePathSegment } from "./imageStoragePaths"
+import {createStorageHttpAgents} from './lib/storageHttpAgents'
 
 export const DELETE_TREE_ENTRY_LIMIT = 10_000
 export const S3_OPERATION_TIMEOUT_MS = 30_000
@@ -588,6 +589,7 @@ export async function useFS() {
         credentials: { accessKeyId: S3_ACCESS_KEY_ID, secretAccessKey: S3_SECRET_ACCESS_KEY },
         forcePathStyle: S3_FORCE_PATH_STYLE !== "false", maxAttempts: 2,
         requestChecksumCalculation: "WHEN_REQUIRED", responseChecksumValidation: "WHEN_REQUIRED",
+        requestHandler: {...createStorageHttpAgents(), connectionTimeout: 10_000},
     })
     cachedStorage = createS3ImageStorage({ client, bucket: S3_BUCKET, prefix: S3_PREFIX })
     cachedClient = client

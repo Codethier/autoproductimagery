@@ -204,6 +204,7 @@ async function sendRefine() {
     chatInput.value = ''
     const res = await $fetch<{ ok: boolean; obj: SystemPrompt[] }>('/api/image-generate', {
       method: 'POST',
+      timeout: 360_000,
       body: {
         prompt: text,
         inputImages: [sourceImage],
@@ -308,6 +309,7 @@ async function regenerate() {
       }
       const res = await $fetch<{ ok: boolean; obj: SystemPrompt[] }>('/api/image-generate', {
         method: 'POST',
+        timeout: 360_000,
         body: {
           prompt: editedPrompt,
           inputImages: replayInputs,

@@ -1,4 +1,5 @@
 import {publishAccountChange} from '../utils/accountChanges'
+import {serverlessFetchOptions} from '../utils/serverlessRequests'
 
 export type WorkspaceAccount = {
   userId: string
@@ -25,7 +26,7 @@ export function useAccount() {
   }
   async function load() {
     const currentEpoch = epoch.value
-    const next = await useRequestFetch()<WorkspaceAccount>('/api/account/me')
+    const next = await useRequestFetch()<WorkspaceAccount>('/api/account/me', serverlessFetchOptions({}, currentEpoch))
     if (currentEpoch !== epoch.value) return null
     if (account.value && account.value.userId !== next.userId) clear()
     account.value = next
@@ -34,7 +35,7 @@ export function useAccount() {
   }
   async function signOut() {
     clear()
-    try { await $fetch('/api/logout', {method: 'POST'}) }
+    try { await $fetch('/api/logout', serverlessFetchOptions({method: 'POST'}, epoch.value)) }
     finally { if (import.meta.client) publishAccountChange(); await navigateTo('/login', {replace: true}) }
   }
   function notifyTabs() { if (import.meta.client) publishAccountChange() }

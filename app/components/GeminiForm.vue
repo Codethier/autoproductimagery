@@ -536,7 +536,7 @@ async function uploadFiles(files: File[]) {
   files.forEach(file => form.append('files', file))
   form.append('path', '/')
   try {
-    const result = await $fetch<{ savedFiles: Array<{url: string}>; failed: Array<{ filename: string; reason: string }> }>('/api/upload', { method: 'POST', body: form })
+    const result = await $fetch<{ savedFiles: Array<{url: string}>; failed: Array<{ filename: string; reason: string }> }>('/api/upload', { method: 'POST', body: form, timeout: 240_000, retry: 0 })
     if (!isCurrentAccount(snapshot)) return
     for (const file of result.savedFiles) chooseSource(ImagePathSchema.parse(file.url))
     if (result.failed.length) errorMsg.value = result.failed.map(file => `${file.filename}: ${file.reason}`).join(' ')
@@ -668,7 +668,7 @@ async function submit() {
   let serverCreatedRows = false
   try {
     const response = await $fetch<{ ok: boolean; obj?: GenerationResult[] }>('/api/image-generate', {
-      method: 'POST', body: requestBody,
+      method: 'POST', body: requestBody, timeout: 360_000,
     })
     if (!isCurrentAccount(snapshot)) return
     serverCreatedRows = true

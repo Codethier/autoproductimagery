@@ -28,6 +28,7 @@ test('PostgreSQL pools initialize lazily, require PostgreSQL, bound warm-instanc
   assert.equal(defaults.max, 3)
   assert.equal(defaults.min, 0)
   assert.equal(defaults.connectionTimeoutMillis, 10_000)
+  assert.equal(defaults.idleTimeoutMillis, 5_000)
   assert.equal(defaults.statement_timeout, 30_000)
   assert.equal(defaults.allowExitOnIdle, true)
   assert.equal(getDatabasePoolConfig({DATABASE_URL: 'postgres://localhost/imagery', DATABASE_POOL_MAX: '1000'}).max, 10)

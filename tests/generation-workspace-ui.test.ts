@@ -550,10 +550,13 @@ test('navigation unmounts and remounts the editor without losing an in-flight re
 test('uploads select the server-assigned immutable image URL instead of rebuilding it from a filename', async () => {
   const workspace = await renderWorkspace('edit')
   const url = '/images/organizations/11111111-1111-4111-8111-111111111111/users/22222222-2222-4222-8222-222222222222/objects/33333333-3333-4333-8333-333333333333/product.png'
-  workspace.environment.fetch = async () => ({saved: ['product.png'], savedFiles: [{name: 'product.png', url}], failed: []})
+  let uploadOptions: any
+  workspace.environment.fetch = async (_url: string, options: any) => {uploadOptions = options; return {saved: ['product.png'], savedFiles: [{name: 'product.png', url}], failed: []}}
   await workspace.exposed.uploadFiles([new File(['test'], 'product.png', {type: 'image/png'})])
   assert.equal(workspace.store.editSource, url)
   assert.equal(workspace.exposed.errorMsg.value, null)
+  assert.equal(uploadOptions.timeout, 240_000)
+  assert.equal(uploadOptions.retry, 0)
 })
 
 test('Same-origin batch uploads fifty images with shared preflight and rejects fifty-one before sending', async () => {

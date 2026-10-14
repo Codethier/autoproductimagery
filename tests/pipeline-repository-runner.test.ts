@@ -13,7 +13,7 @@ import {organizations, users, assets, pipelines, pipelineRuns, pipelineRunSteps,
 import {createS3ImageStorage, type ImageStorageCommand} from '../server/utils/useFS.ts'
 import {useUserFS} from '../server/utils/useUserFS.ts'
 import {createPipelineRepository, pipelineRequestError, safePipelineError} from '../server/utils/pipelineRepository.ts'
-import {createPipelineExecutor} from '../server/utils/pipelineRunner.ts'
+import {createPipelineExecutor, hasPendingPipelineWorkerWork} from '../server/utils/pipelineRunner.ts'
 import {createPeopleRepository} from '../server/utils/peopleRepository.ts'
 import {useDB} from '../server/utils/useDB.ts'
 import {createAccountBilling} from '../server/utils/accountBilling.ts'
@@ -74,6 +74,66 @@ async function saveStart(repo:ReturnType<typeof createPipelineRepository>, defin
     return {pipeline,run}
 }
 const noGateway = {async getGenerationBilling(){return undefined}} as unknown as Awaited<ReturnType<typeof useGateway>>
+
+test('pipeline acceptance preserves committed jobs and idempotency when a sleeping runner cannot acknowledge its wake', integration, async () => fixture(async f => {
+    const storage = await useUserFS(f.a, f.raw, f.db)
+    let wakes = 0
+    const repo = createPipelineRepository(f.a, f.db, {storage, workerWake: async () => {
+        wakes++
+        // A separate database connection must already see the accepted row.
+        const result = await f.pool.query('SELECT id FROM pipeline_run WHERE user_id = $1', [f.a.userId])
+        assert.equal(result.rowCount, 1)
+        throw Error('private wake transport diagnostic')
+    }})
+    const text = createPipelineNode('static-text', 'text'), output = createPipelineNode('output', 'output')
+    text.config.text = 'Free synthetic local workflow'
+    const {pipeline} = await repo.create({name: 'Wake fixture', description: '', definition: graph([text, output], [['text', 'output', 'media']])})
+    const request = {revision: pipeline.revision, idempotencyKey: randomUUID(), inputImages: [], inputs: {}}
+    const accepted = await repo.start(pipeline.id, request)
+    assert.equal(accepted.workerWake, 'unavailable'); assert.equal(accepted.run.status, 'queued')
+    const repeated = await repo.start(pipeline.id, request)
+    assert.equal(repeated.workerWake, 'unavailable'); assert.equal(repeated.run.id, accepted.run.id)
+    assert.deepEqual(repeated.run.items.map(item => item.steps.map(step => step.id)), accepted.run.items.map(item => item.steps.map(step => step.id)))
+    assert.equal(wakes, 2)
+    const [count] = await f.db.select({id: pipelineRuns.id}).from(pipelineRuns)
+    assert.equal(count!.id, accepted.run.id)
+}))
+
+test('worker idle detection includes unfinished future-scheduled runs and stops after completion or owner disablement', integration, async () => fixture(async f => {
+    const storage = await useUserFS(f.a, f.raw, f.db), repo = createPipelineRepository(f.a, f.db, {storage})
+    const text = createPipelineNode('static-text', 'text'), output = createPipelineNode('output', 'output')
+    text.config.text = 'Known-free local workflow'
+    assert.equal(await hasPendingPipelineWorkerWork(f.db), false)
+    const {run} = await saveStart(repo, graph([text, output], [['text', 'output', 'media']]))
+    await f.db.update(pipelineRuns).set({nextAttemptAt: sql`CURRENT_TIMESTAMP + INTERVAL '15 minutes'`}).where(eq(pipelineRuns.id, run.id))
+    assert.equal(await hasPendingPipelineWorkerWork(f.db), true)
+    await f.db.update(users).set({disabledAt: new Date().toISOString()}).where(eq(users.id, f.a.userId))
+    assert.equal(await hasPendingPipelineWorkerWork(f.db), false)
+    await f.db.update(users).set({disabledAt: null}).where(eq(users.id, f.a.userId))
+    assert.equal(await hasPendingPipelineWorkerWork(f.db), true)
+    await drain(createPipelineExecutor(f.a, repo, {runtimeConfig, gateway: noGateway}), run.id)
+    assert.equal(await hasPendingPipelineWorkerWork(f.db), false)
+}))
+
+test('a cancelled or disabled-owner accepted live claim prevents idle sleep without making its paid fence replayable', integration, async () => fixture(async f => {
+    const storage = await useUserFS(f.a, f.raw, f.db), repo = createPipelineRepository(f.a, f.db, {storage})
+    const text = createPipelineNode('static-text', 'text'), output = createPipelineNode('output', 'output')
+    text.config.text = 'Free synthetic claim'
+    const {run} = await saveStart(repo, graph([text, output], [['text', 'output', 'media']]))
+    const claim = await repo.claim(run.id)
+    assert.ok(claim)
+    await repo.providerStarted(claim.step.id, claim.token, randomUUID())
+    await repo.cancel(run.id)
+    await f.db.update(users).set({disabledAt: new Date().toISOString()}).where(eq(users.id, f.a.userId))
+    assert.equal(await hasPendingPipelineWorkerWork(f.db), true)
+    const [live] = await f.db.select().from(pipelineRunSteps).where(eq(pipelineRunSteps.id, claim.step.id))
+    assert.equal(live!.status, 'running'); assert.ok(live!.providerStartedAt)
+    await f.db.update(pipelineRunSteps).set({leaseExpiresAt: sql`CURRENT_TIMESTAMP - INTERVAL '1 second'`}).where(eq(pipelineRunSteps.id, claim.step.id))
+    assert.equal(await hasPendingPipelineWorkerWork(f.db), false)
+    const [expired] = await f.db.select().from(pipelineRunSteps).where(eq(pipelineRunSteps.id, claim.step.id))
+    assert.equal(expired!.status, 'running'); assert.equal(expired!.providerStartedAt, live!.providerStartedAt)
+    assert.equal(expired!.claimToken, live!.claimToken)
+}))
 async function drain(executor:ReturnType<typeof createPipelineExecutor>, runId:string, limit=40) {
     let value=await executor.get(runId)
     for(let i=0;i<limit&&['queued','running','awaiting-price'].includes(value.run.status);i++)value=await executor.advance(runId)

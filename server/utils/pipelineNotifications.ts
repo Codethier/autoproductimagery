@@ -14,7 +14,7 @@ export type PipelineNotificationDependencies = {
 export function createPipelineNotifications(
   deps: PipelineNotificationDependencies,
 ) {
-  let closed = false;
+  let closed = false, epoch = 0;
   let current:
     { client: NotificationClient; release(): void; ready: boolean } | undefined;
   let connecting: Promise<boolean> | undefined;
@@ -23,6 +23,7 @@ export function createPipelineNotifications(
     if (closed) return false;
     if (current?.ready) return true;
     if (connecting) return connecting;
+    const connectingEpoch = epoch;
     connecting = (async () => {
       let client: NotificationClient;
       try {
@@ -56,7 +57,7 @@ export function createPipelineNotifications(
       };
       client.on("error", disconnected);
       client.on("end", disconnected);
-      if (closed) {
+      if (closed || connectingEpoch !== epoch) {
         release();
         return false;
       }
@@ -64,7 +65,7 @@ export function createPipelineNotifications(
       client.on("notification", notification);
       try {
         await client.query("LISTEN pipeline_run_ready");
-        if (closed || released) {
+        if (closed || released || connectingEpoch !== epoch) {
           release();
           return false;
         }
@@ -80,15 +81,17 @@ export function createPipelineNotifications(
     });
     return connecting;
   }
-  async function close() {
-    closed = true;
+  async function disconnect() {
+    epoch++;
     current?.release();
     // A client acquired after shutdown begins is released in connect()
     // before PostgreSQL's pool is allowed to close.
     await connecting;
   }
+  async function close() {closed = true; await disconnect();}
   return {
     connect,
+    disconnect,
     close,
     get connected() {
       return Boolean(current?.ready);

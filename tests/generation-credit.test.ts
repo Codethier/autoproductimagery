@@ -9,6 +9,7 @@ import {computed, createRenderer, createSSRApp, effectScope, h, nextTick, ref, w
 import {CREDIT_EXHAUSTED_CODE, CREDIT_EXHAUSTED_MESSAGE, type AccountBalance} from '../schemas/account-billing.ts'
 import {createGenerationCreditController, generationCreditStatus, initialGenerationCreditState, isCreditExhaustionError,
     CREDIT_OUTSTANDING_MESSAGE, CREDIT_UNAVAILABLE_MESSAGE} from '../app/utils/generationCredit.ts'
+import {serverlessFetchOptions, SERVERLESS_READ_ATTEMPT_MS} from '../app/utils/serverlessRequests.ts'
 
 const root = new URL('../', import.meta.url)
 const dialogUrl = new URL('app/components/GenerationCreditDialog.vue', root).href
@@ -147,15 +148,16 @@ test('an authoritative HTTP credit refusal opens immediately even when the subse
 
 function balanceFixture() {
     const source = stripTypeScriptTypes(readFileSync(new URL('app/composables/useAccountBalance.ts', root), 'utf8'))
+        .replace(/import \{serverlessFetchOptions\} from '[^']+'/, '')
         .replace('export function useAccountBalance', 'return function useAccountBalance')
     const account = {identity: ref('org.alice'), epoch: ref(1)}
     const requests: Array<ReturnType<typeof deferred<AccountBalance>>> = []
     const transport: Array<{url: string; options: unknown}> = []
     const state = ref<any>()
     const scope = effectScope()
-    const factory = new Function('computed', 'watch', 'useAccount', 'useState', 'useRequestFetch', source)
+    const factory = new Function('computed', 'watch', 'useAccount', 'useState', 'useRequestFetch', 'serverlessFetchOptions', source)
     const balance = scope.run(() => factory(computed, watch, () => account, (_key: string, initial: () => unknown) => {state.value ??= initial(); return state},
-        () => (url: string, options: unknown) => {transport.push({url, options}); const request = deferred<AccountBalance>(); requests.push(request); return request.promise})())
+        () => (url: string, options: any) => {options.onRequest?.({options}); transport.push({url, options}); const request = deferred<AccountBalance>(); requests.push(request); return request.promise}, serverlessFetchOptions)())
     return {account, balance, requests, transport, scope}
 }
 
@@ -167,9 +169,9 @@ test('a forced balance refresh supersedes a pending header response and returns 
         assert.equal(fixture.requests.length, 1)
         const forced = fixture.balance.refresh({force: true})
         assert.equal(fixture.requests.length, 2)
-        assert.deepEqual(fixture.transport, [
-            {url: '/api/account/balance', options: {timeout: 20_000}},
-            {url: '/api/account/balance', options: {timeout: 20_000}},
+        assert.deepEqual(fixture.transport.map(({url, options}: any) => ({url, timeout: options.timeout, retry: options.retry, epoch: options.workspaceAccountEpoch})), [
+            {url: '/api/account/balance', timeout: SERVERLESS_READ_ATTEMPT_MS, retry: 1, epoch: 1},
+            {url: '/api/account/balance', timeout: SERVERLESS_READ_ATTEMPT_MS, retry: 1, epoch: 1},
         ])
         fixture.requests[0]!.resolve(money('500'))
         assert.equal(await header, null)
@@ -195,7 +197,10 @@ test('a bounded balance transport timeout clears pending state and cannot author
         const credit = fixture.scope.run(() => createGenerationCreditController(fixture.account, checkedBalance, ref(initialGenerationCreditState())))!
         const authorization = credit.ensureCredit()
         assert.equal(fixture.balance.pending.value, true)
-        assert.deepEqual(fixture.transport.at(-1), {url: '/api/account/balance', options: {timeout: 20_000}})
+        const transport = fixture.transport.at(-1)! as {url: string; options: any}
+        assert.equal(transport.url, '/api/account/balance')
+        assert.equal(transport.options.timeout, SERVERLESS_READ_ATTEMPT_MS)
+        assert.equal(transport.options.workspaceRequestState.budget, 90_000)
         fixture.requests[1]!.reject(Object.assign(new Error('Request timed out'), {name: 'TimeoutError'}))
         assert.equal(await authorization, false)
         assert.equal(freshResponse, null)

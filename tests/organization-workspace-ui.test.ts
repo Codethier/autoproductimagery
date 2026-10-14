@@ -10,6 +10,7 @@ import {formatBalanceUsd, formatUsd} from '../app/utils/generationPrice.ts'
 import {createAssetFavourites} from '../app/utils/assetPreferences.ts'
 import {createImageModelFavourites} from '../app/utils/imageModelFavourites.ts'
 import type {AssetFile, AssetFolder} from '../schemas/image-storage.ts'
+import {prepareServerlessRequest, serverlessFetchOptions, SERVERLESS_MUTATION_TIMEOUT_MS} from '../app/utils/serverlessRequests.ts'
 
 const root = new URL('../', import.meta.url)
 const browserUrl = new URL('app/components/AssetBrowser.vue', root).href
@@ -315,11 +316,11 @@ test('balance summary separates available credit, outstanding estimates and exac
 })
 
 test('a late balance response cannot populate or override another user’s active balance request', async () => {
-  const source = stripTypeScriptTypes(readFileSync(new URL('app/composables/useAccountBalance.ts', root), 'utf8')).replace('export function useAccountBalance', 'return function useAccountBalance')
+  const source = stripTypeScriptTypes(readFileSync(new URL('app/composables/useAccountBalance.ts', root), 'utf8')).replace(/import \{serverlessFetchOptions\} from '[^']+'/, '').replace('export function useAccountBalance', 'return function useAccountBalance')
   const state = ref<any>({identity: '', epoch: -1, balance: null, pending: false, error: ''})
   const account = {identity: ref('org.alice'), epoch: ref(1)}
   const completions: Array<(response: unknown) => void> = []
-  const useBalance = new Function('computed', 'watch', 'useAccount', 'useState', 'useRequestFetch', source)(computed, watch, () => account, () => state, () => () => new Promise(resolve => completions.push(resolve)))
+  const useBalance = new Function('computed', 'watch', 'useAccount', 'useState', 'useRequestFetch', 'serverlessFetchOptions', source)(computed, watch, () => account, () => state, () => () => new Promise(resolve => completions.push(resolve)), serverlessFetchOptions)
   const balance = useBalance()
   const alice = balance.refresh()
   account.identity.value = 'org.bea'; account.epoch.value += 1
@@ -390,7 +391,7 @@ test('asset and model favorites stay isolated between user storage namespaces', 
 })
 
 test('permission denials preserve the session and late unauthorized responses cannot sign out a new account', async () => {
-  const source = stripTypeScriptTypes(readFileSync(new URL('app/plugins/auth-fetch.ts', root), 'utf8')).replace('export default defineNuxtPlugin', 'return defineNuxtPlugin').replace('if (!import.meta.client) return', '')
+  const source = stripTypeScriptTypes(readFileSync(new URL('app/plugins/auth-fetch.ts', root), 'utf8')).replace(/import \{prepareServerlessRequest, SERVERLESS_MUTATION_TIMEOUT_MS\} from '[^']+'/, '').replace('export default defineNuxtPlugin', 'return defineNuxtPlugin').replace('if (!import.meta.client) return', '')
   let hooks: any
   let clears = 0
   const session = {epoch: ref(0), clear() {clears += 1; this.epoch.value += 1}}
@@ -398,13 +399,14 @@ test('permission denials preserve the session and late unauthorized responses ca
   const fetch: any = async () => true
   fetch.create = (options: unknown) => {hooks = options; return fetch}
   ;(globalThis as any).$fetch = fetch
-  const initialize = new Function('defineNuxtPlugin', 'useRouter', 'useAccount', 'useToast', 'navigateTo', source)
+  const initialize = new Function('defineNuxtPlugin', 'useRouter', 'useAccount', 'useToast', 'navigateTo', 'prepareServerlessRequest', 'SERVERLESS_MUTATION_TIMEOUT_MS', source)
   try {
-    initialize((callback: () => unknown) => callback(), () => ({currentRoute: ref({path: '/assets', fullPath: '/assets'})}), () => session, () => ({add() {}}), async () => undefined)
+    initialize((callback: () => unknown) => callback(), () => ({currentRoute: ref({path: '/assets', fullPath: '/assets'})}), () => session, () => ({add() {}}), async () => undefined, prepareServerlessRequest, SERVERLESS_MUTATION_TIMEOUT_MS)
     const forbiddenOptions: any = {}; hooks.onRequest({options: forbiddenOptions})
     await hooks.onResponseError({response: {status: 403}, options: forbiddenOptions})
     assert.equal(clears, 0)
     const oldOptions: any = {}; hooks.onRequest({options: oldOptions}); session.epoch.value += 1
+    hooks.onRequest({options: oldOptions})
     await hooks.onResponseError({response: {status: 401}, options: oldOptions})
     assert.equal(clears, 0)
     const currentOptions: any = {}; hooks.onRequest({options: currentOptions})

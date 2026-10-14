@@ -166,3 +166,29 @@ test("LISTEN or connection failure is best effort and authoritative worker polli
   assert.equal(unavailable, 2);
   await Promise.all([helper.close(), worker.close()]);
 });
+
+test('idle disconnect releases LISTEN without closing the helper and a later wake reconnects', async () => {
+  const first = new Client(), second = new Client();
+  let connections = 0;
+  const helper = createPipelineNotifications({pool: {connect: async () => clientAs(++connections === 1 ? first : second)},
+    notify: () => {}, unavailable: () => assert.fail('Idle release is not an outage')});
+  assert.equal(await helper.connect(), true);
+  await helper.disconnect();
+  assert.equal(first.releases, 1); assert.equal(helper.connected, false);
+  assert.equal(await helper.connect(), true);
+  assert.deepEqual(second.queries, ['LISTEN pipeline_run_ready']);
+  await helper.close(); assert.equal(second.releases, 1);
+});
+
+test('idle disconnect fences a client acquired late and allows a clean subsequent reconnect', async () => {
+  const first = new Client(), second = new Client(), acquiring = gate<PoolClient>();
+  let connections = 0;
+  const helper = createPipelineNotifications({pool: {connect: () => ++connections === 1 ? acquiring.promise : Promise.resolve(clientAs(second))},
+    notify: () => {}, unavailable: () => assert.fail('Idle release is not an outage')});
+  const connecting = helper.connect(), disconnecting = helper.disconnect();
+  acquiring.resolve(clientAs(first));
+  assert.equal(await connecting, false); await disconnecting;
+  assert.equal(first.releases, 1); assert.deepEqual(first.queries, []);
+  assert.equal(await helper.connect(), true);
+  await helper.close(); assert.equal(second.releases, 1);
+});

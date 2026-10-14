@@ -18,6 +18,7 @@ import {
   type PipelineRunListDTO,
 } from "../../schemas/pipelines";
 import {getPipelineDisplayNodes} from '../../schemas/pipeline-display';
+import {serverlessFetchOptions} from '../utils/serverlessRequests';
 import {
   ImagePathSchema,
   IMAGE_MODEL_PROFILES,
@@ -61,6 +62,7 @@ const loading = ref(false),
 const errorMessage = ref(""),
   saveError = ref(""),
   runError = ref(""),
+  runWakeNotice = ref(""),
   notice = ref("");
 const pipeline = ref<PipelineDTO | null>(null),
   definition = ref<PipelineDefinition>({ version: 1, nodes: [], edges: [] });
@@ -166,6 +168,14 @@ const isRunActive = computed(
     activeRun.value &&
     ["queued", "running", "awaiting-price"].includes(activeRun.value.status),
 );
+type RunResponse = {run: PipelineRunDTO; workerWake?: 'accepted' | 'unavailable' | 'not-configured'};
+function applyRunResponse(response: RunResponse) {
+  if (activeRun.value?.id !== response.run.id) runWakeNotice.value = '';
+  activeRun.value = response.run;
+  if (!isRunActive.value || response.workerWake === 'accepted') runWakeNotice.value = '';
+  else if (response.workerWake === 'unavailable') runWakeNotice.value = 'Your run is saved, but processing could not be reached yet. It may still be starting after being idle. Refresh progress if it does not start.';
+  else if (response.workerWake === 'not-configured') runWakeNotice.value = 'Your run is saved, but background processing is not configured for this workspace. Ask an organization owner to check its setup.';
+}
 const runIssues = computed(() => [
   ...pipelineRunIssues(definition.value, runTarget.value ?? undefined),
   ...executionNodes.value.flatMap((node) => {
@@ -251,11 +261,10 @@ async function request<T>(
   const controller = new AbortController();
   requests.add(controller);
   try {
-    return await requestFetch<T>(url, {
+    return await requestFetch<T>(url, serverlessFetchOptions({
       ...options,
       signal: controller.signal,
-      timeout: options.timeout ?? 30_000,
-    });
+    }, account.epoch.value));
   } finally {
     requests.delete(controller);
   }
@@ -911,13 +920,13 @@ async function startRun() {
       ...requestBody,
       idempotencyKey: key,
     });
-    const response = await request<{ run: PipelineRunDTO }>(
+    const response = await request<RunResponse>(
       `/api/pipelines/${saved.id}/runs`,
       { method: "POST", body: parsed, timeout: 40_000 },
     );
     if (!current(value)) return;
     runAttemptKeys.delete(fingerprint);
-    activeRun.value = response.run;
+    applyRunResponse(response);
     if (prepared === prepareVersion && runMode.value === "prepare")
       runMode.value = "results";
     pollAttempts = 0;
@@ -965,11 +974,11 @@ async function refreshRun(poll = false) {
   runRefreshing.value = true;
   if (poll) pollAttempts += 1;
   try {
-    const response = await request<{ run: PipelineRunDTO }>(
+    const response = await request<RunResponse>(
       `/api/pipeline-runs/${id}`,
     );
     if (current(value) && activeRun.value?.id === id && number === runNumber) {
-      activeRun.value = response.run;
+      applyRunResponse(response);
       runError.value = "";
       if (!isRunActive.value) await balance.refresh();
     }
@@ -998,12 +1007,12 @@ async function cancelRun() {
     id = activeRun.value.id;
   runMutating.value = true;
   try {
-    const response = await request<{ run: PipelineRunDTO }>(
+    const response = await request<RunResponse>(
       `/api/pipeline-runs/${id}/cancel`,
       { method: "POST", body: {} },
     );
     if (current(value) && activeRun.value?.id === id) {
-      activeRun.value = response.run;
+      applyRunResponse(response);
       runError.value = "";
       await balance.refresh();
     }
@@ -1035,12 +1044,12 @@ async function retryRun(stepIds: string[]) {
       return;
     }
     if (!current(value) || activeRun.value?.id !== id) return;
-    const response = await request<{ run: PipelineRunDTO }>(
+    const response = await request<RunResponse>(
       `/api/pipeline-runs/${id}/retry`,
       { method: "POST", body: { stepIds, confirmPossibleCharge: true } },
     );
     if (current(value) && activeRun.value?.id === id) {
-      activeRun.value = response.run;
+      applyRunResponse(response);
       runError.value = "";
       pollAttempts = 0;
       pollingPaused.value = false;
@@ -1080,12 +1089,12 @@ async function rerunJob(itemId: string) {
       return;
     }
     if (!current(value) || activeRun.value?.id !== id) return;
-    const response = await request<{run: PipelineRunDTO}>(`/api/pipeline-runs/${id}/rerun`, {
+    const response = await request<RunResponse>(`/api/pipeline-runs/${id}/rerun`, {
       method: 'POST',
       body: {itemIds: [itemId], expectedStepIds, confirmPossibleCharge: usesCredit},
     });
     if (current(value) && activeRun.value?.id === id) {
-      activeRun.value = response.run;
+      applyRunResponse(response);
       runError.value = '';
       pollAttempts = 0;
       pollingPaused.value = false;
@@ -1149,11 +1158,11 @@ async function openRun(id: string) {
   runRefreshing.value = true;
   runError.value = "";
   try {
-    const response = await request<{ run: PipelineRunDTO }>(
+    const response = await request<RunResponse>(
       `/api/pipeline-runs/${id}`,
     );
     if (current(value) && number === runNumber) {
-      activeRun.value = response.run;
+      applyRunResponse(response);
       runMode.value = "results";
       pollAttempts = 0;
       pollingPaused.value = false;
@@ -1373,6 +1382,7 @@ watch(
     errorMessage.value = "";
     saveError.value = "";
     runError.value = "";
+    runWakeNotice.value = "";
     saving.value = false;
     loading.value = false;
     loadingMore.value = false;
@@ -2148,6 +2158,7 @@ onBeforeUnmount(() => {
           :run="activeRun"
           :busy="runMutating || runRefreshing || generationCredit.checking.value"
           :error="runError"
+          :notice="runWakeNotice"
           :paused="pollingPaused"
           @close="closeRun"
           @refresh="resumeRun"

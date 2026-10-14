@@ -17,6 +17,7 @@ import {extractGatewayErrorBilling} from './billingGatewayError'
 import {reserveGenerationBatch, getGenerationRuntimeSettings, getGenerationRequestTimeoutMs} from './generationLimiter'
 import {createBackgroundRemovalRepository} from './backgroundRemovalJobs'
 import {kickBackgroundRemovalQueue} from './backgroundRemovalRunner'
+import {wakePipelineWorker} from './pipelineWorkerWake'
 import {getBackgroundRemovalModel} from '../../schemas/background-removal-models'
 import {processLocalPipelineImage, prepareExpansionCanvas, type LocalPipelineImageOperation} from './pipelineImageProcessing'
 import type {AuthContext} from './accountSession'
@@ -333,7 +334,15 @@ export function createPipelineExecutor(actor: PipelineActor, repository = create
         await repository.schedule(id, waiting ? 15_000 : 0)
         return {run, advanced: true}
     }
-    async function get(id: string) {await priceRefresh(await repository.storage()); return {run: await repository.detail(id)}}
+    async function get(id: string) {
+        await priceRefresh(await repository.storage())
+        const run = await repository.detail(id)
+        // An accepted job remains durable if a cold proxy could not acknowledge
+        // its initial wake. Account-authorized status reads provide recovery.
+        const workerWake = !run.cancelRequested && ['queued', 'running', 'awaiting-price'].includes(run.status)
+            ? await wakePipelineWorker({budgetMs: 1500}) : undefined
+        return {run, ...(workerWake ? {workerWake} : {})}
+    }
     return {advance, get, execute}
 }
 
@@ -348,6 +357,16 @@ export async function listRunnablePipelineRunAccounts(limit = 10) {
             eq(pipelineRuns.cancelRequested, false), isNull(users.disabledAt), lte(pipelineRuns.nextAttemptAt, sql`CURRENT_TIMESTAMP`)))
         .orderBy(asc(pipelineRuns.nextAttemptAt), asc(pipelineRuns.updatedAt), asc(pipelineRuns.id)).limit(Math.max(1, Math.min(20, Math.floor(limit))))
     return rows.map(({runId, ...actor}) => ({runId, actor}))
+}
+/** Include future-scheduled work: delayed pricing and live leases must keep the runner awake. */
+export async function hasPendingPipelineWorkerWork(db: ReturnType<typeof getDatabase> = getDatabase()): Promise<boolean> {
+    const result = await db.execute<{pending: boolean}>(sql`SELECT EXISTS (
+        SELECT 1 FROM pipeline_run r JOIN app_user u ON u.id = r.user_id AND u.organization_id = r.organization_id
+        WHERE r.status IN ('queued', 'running', 'awaiting-price') AND NOT r.cancel_requested AND u.disabled_at IS NULL
+    ) OR EXISTS (
+        SELECT 1 FROM pipeline_run_step WHERE active AND status = 'running' AND lease_expires_at > CURRENT_TIMESTAMP
+    ) OR EXISTS (SELECT 1 FROM background_removal_job WHERE status IN ('queued', 'running')) AS pending`)
+    return result.rows[0]?.pending === true
 }
 export async function advancePipelineRun(actor: AuthContext, runId: string, options: {runtimeConfig: Record<string, unknown>; signal?: AbortSignal}) {
     return createPipelineExecutor(actor, createPipelineRepository(actor), options).advance(runId)

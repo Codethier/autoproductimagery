@@ -1,4 +1,5 @@
 import type {AccountBalance} from '../../schemas/account-billing'
+import {serverlessFetchOptions} from '../utils/serverlessRequests'
 
 type BalanceState = {identity: string; epoch: number; request: number; balance: AccountBalance | null; pending: boolean; error: string}
 
@@ -24,7 +25,7 @@ export function useAccountBalance() {
     const stillCurrent = () => account.identity.value === identity && account.epoch.value === epoch
       && state.value.identity === identity && state.value.epoch === epoch && state.value.request === request
     try {
-      const response = await requestFetch<AccountBalance>('/api/account/balance', {timeout: 20_000})
+      const response = await requestFetch<AccountBalance>('/api/account/balance', serverlessFetchOptions({}, epoch))
       if (stillCurrent()) { state.value.balance = response; return response }
     } catch {
       if (stillCurrent()) state.value.error = 'Could not load your balance. Try again.'

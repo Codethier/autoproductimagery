@@ -15,6 +15,7 @@ const props = defineProps<{
   run: PipelineRunDTO;
   busy?: boolean;
   error?: string;
+  notice?: string;
   paused?: boolean;
 }>();
 const emit = defineEmits<{
@@ -259,6 +260,8 @@ watch(
         ><UIcon name="i-lucide-loader-circle" />Updating this run…</span
       >
     </div>
+    <p v-if="notice" class="pipeline-run-notice" role="status">{{ notice }}</p>
+    <p v-else-if="run.status === 'queued' && !run.cancelRequested" class="pipeline-run-notice" role="status">Your run is saved in the queue. Processing may take a little longer to start after being idle; you can close this page and check it later.</p>
     <p v-if="error" class="pipeline-run-error" role="alert">{{ error }}</p>
     <p v-if="paused && active" class="pipeline-run-notice" role="status">
       Background work continues. Watch progress to resume updates here. You can

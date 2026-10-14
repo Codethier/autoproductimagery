@@ -200,7 +200,7 @@ async function uploadFiles(chosen: File[]) {
   const body = new FormData(); body.append('path', uploadPath.value); chosen.forEach(file => body.append('files', file)); uploading.value = true
   const epoch = session.epoch.value
   try {
-    const result = await $fetch<{saved: string[]; savedFiles: AssetFile[]; failed: Array<{filename: string; reason: string}>}>('/api/upload', {method: 'POST', body})
+    const result = await $fetch<{saved: string[]; savedFiles: AssetFile[]; failed: Array<{filename: string; reason: string}>}>('/api/upload', {method: 'POST', body, timeout: 240_000, retry: 0})
     if (epoch !== session.epoch.value) return
     if (result.saved.length) toast.add({title: `${result.saved.length} image${result.saved.length === 1 ? '' : 's'} uploaded`, color: 'success'})
     if (result.failed.length) toast.add({title: 'Some images could not be uploaded', description: result.failed.map(file => `${file.filename}: ${file.reason}`).join('\n'), color: 'error'})

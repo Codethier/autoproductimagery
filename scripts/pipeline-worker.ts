@@ -15,9 +15,13 @@ import {
 import {
   listRunnablePipelineRunAccounts,
   advancePipelineRun,
+  hasPendingPipelineWorkerWork,
 } from "../server/utils/pipelineRunner";
 import { createPipelineWorkerLoop } from "../server/utils/pipelineWorkerLoop";
 import { createPipelineNotifications } from "../server/utils/pipelineNotifications";
+import {createPipelineWorkerScheduler} from '../server/utils/pipelineWorkerScheduler';
+import {getPipelineWorkerWakeConfig, pipelineWorkerWakeToken} from '../server/utils/pipelineWorkerWake';
+import {createPipelineWorkerHttpHandler} from '../server/utils/pipelineWorkerHttp';
 import { useRuntimeConfig } from "./pipeline-worker-runtime";
 
 const runtimeConfig = useRuntimeConfig();
@@ -28,18 +32,21 @@ const concurrency = Number.isFinite(requestedConcurrency)
   ? Math.max(1, Math.min(3, Math.floor(requestedConcurrency)))
   : 2;
 const port = Number(
-  process.env.PORT ?? process.env.PIPELINE_WORKER_PORT ?? 3221,
+  process.env.PORT ?? process.env.PIPELINE_WORKER_PORT ?? ((process.env.RAILWAY_ENVIRONMENT_ID || process.env.RAILWAY_PROJECT_ID) ? 8080 : 3221),
 );
 if (!Number.isSafeInteger(port) || port < 1 || port > 65535)
   throw Error("Invalid pipeline worker port");
-const host = process.env.PIPELINE_WORKER_HOST ?? "0.0.0.0";
+// Railway's private DNS is IPv6. Node's unspecified IPv6 listener also accepts
+// IPv4 connections, including Railway's public health proxy.
+const host = process.env.PIPELINE_WORKER_HOST ?? "::";
+const serverless = Boolean(getPipelineWorkerWakeConfig());
+const wakeToken = pipelineWorkerWakeToken();
 const pool = getDatabasePool();
 // LISTEN holds a connection. A one-connection deployment uses durable polling
 // instead, leaving its only connection available for claims and progress.
 const notificationsEnabled = (getDatabasePoolConfig().max ?? 3) > 1;
 let closing = false,
-  ready = false,
-  ticker: ReturnType<typeof setTimeout> | undefined;
+  ready = false;
 const worker = createPipelineWorkerLoop({
   concurrency,
   load: listRunnablePipelineRunAccounts,
@@ -58,25 +65,32 @@ const worker = createPipelineWorkerLoop({
 const notifications = createPipelineNotifications({
   pool,
   notify: () => {
-    if (!closing) void worker.kick();
+    if (!closing && ready) void scheduler.wake();
   },
   unavailable: () =>
     console.error(
-      "Pipeline notifications are temporarily unavailable; durable polling will continue.",
+      "Pipeline notifications are temporarily unavailable; saved work will be checked again while active.",
     ),
 });
 
-const server = createServer((request, response) => {
-  response.setHeader("Cache-Control", "no-store");
-  response.setHeader("Content-Type", "application/json; charset=utf-8");
-  if (request.method !== "GET" || request.url !== "/health") {
-    response.writeHead(404);
-    response.end('{"error":"Not found"}');
-    return;
-  }
-  response.writeHead(ready && !closing ? 200 : 503);
-  response.end(JSON.stringify({ ok: ready && !closing, worker: "pipelines" }));
+const scheduler = createPipelineWorkerScheduler({
+  serverless,
+  connect: () => notificationsEnabled ? notifications.connect() : Promise.resolve(false),
+  // Both bounded runners are awaited; idle inference children are shut down
+  // before releasing LISTEN and allowing the database/service to sleep.
+  drain: async () => {await Promise.all([worker.kick(), kickBackgroundRemovalQueue()]);},
+  pending: hasPendingPipelineWorkerWork,
+  disconnect: async () => {
+    await Promise.all([notifications.disconnect(), closeBackgroundRemovalQueue()]);
+    closeImageStorage();
+  },
+  error: () => console.error('Pipeline worker connection is temporarily unavailable; saved work will be checked again.'),
 });
+const server = createServer(createPipelineWorkerHttpHandler({
+  ready: () => ready && !closing,
+  token: wakeToken,
+  wake: () => {void scheduler.wake();},
+}));
 server.headersTimeout = 5000;
 server.requestTimeout = 5000;
 server.maxHeadersCount = 20;
@@ -85,41 +99,17 @@ server.on("error", () => {
   void close(1);
 });
 
-async function tick() {
-  if (closing) return;
-  try {
-    if (notificationsEnabled) await notifications.connect();
-    if (closing) return;
-    // A lost notification, expired lease or delayed exact price must not leave
-    // a durable run stuck. Only this dedicated worker has a fallback poll.
-    void kickBackgroundRemovalQueue();
-    await worker.kick();
-  } catch {
-    console.error(
-      "Pipeline worker connection is temporarily unavailable; it will reconnect.",
-    );
-  } finally {
-    if (!closing)
-      ticker = setTimeout(
-        () => {
-          void tick();
-        },
-        worker.recentlyActive ? 5000 : 60_000,
-      );
-  }
-}
-
 async function close(code = 0) {
   if (closing) return;
   closing = true;
   ready = false;
-  if (ticker) clearTimeout(ticker);
   // Active Gateway work is aborted and awaited. Its persisted paid-start
   // fence survives a forced shutdown, so a replacement cannot blindly retry.
   const deadline = setTimeout(() => process.exit(code || 1), 45_000);
   try {
     await Promise.all([
       notifications.close(),
+      scheduler.close(),
       worker.close(),
       closeBackgroundRemovalQueue(),
     ]);
@@ -145,9 +135,6 @@ async function startWorker() {
   try {
     if (!runtimeConfig.AiGatewayApiKey)
       throw Error("Pipeline worker Gateway credentials are missing");
-    await verifyBackgroundRemovalRuntime();
-    if (closing) return;
-    console.info("Pipeline worker CPU runtime verified");
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
       server.listen(port, host, () => {
@@ -155,6 +142,9 @@ async function startWorker() {
         resolve();
       });
     });
+    await verifyBackgroundRemovalRuntime();
+    if (closing) return;
+    console.info("Pipeline worker CPU runtime verified");
     if (closing) return;
     const started = Date.now();
     let available = false,
@@ -182,7 +172,6 @@ async function startWorker() {
     }
     if (!closing && !available) throw Error("Pipeline migration is not ready");
     if (!closing) {
-      if (notificationsEnabled) await notifications.connect();
       if (!closing) {
         ready = true;
         console.info(
@@ -191,6 +180,7 @@ async function startWorker() {
             status: "ready",
             concurrency,
             notificationsEnabled,
+            serverless,
             availableMemoryGiB: Number(
               (process.availableMemory() / 1024 ** 3).toFixed(2),
             ),
@@ -199,7 +189,7 @@ async function startWorker() {
             ),
           }),
         );
-        void tick();
+        void scheduler.wake();
       }
     }
   } catch {

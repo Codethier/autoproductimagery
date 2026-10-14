@@ -163,7 +163,7 @@ async function fileFormSubmit() {
   try {
     const result = await $fetch<{ saved: string[]; failed: Array<{ filename: string; reason: string }> }>(
         '/api/upload',
-        { method: 'POST', body: buildUploadBody() }
+        { method: 'POST', body: buildUploadBody(), timeout: 240_000, retry: 0 }
     )
     if (result.saved.length > 0) {
       toast.add({
