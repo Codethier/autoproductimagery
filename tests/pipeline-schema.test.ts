@@ -421,3 +421,19 @@ test("output projection accounts for exact model output counts without unbounded
     2,
   );
 });
+
+test("People Input is a fixed bounded image source with no run-time override or incoming socket", () => {
+  const people = createPipelineNode("people-input", "person");
+  assert.equal(people.label, "People Input");
+  assert.deepEqual(people.config, { images: [] });
+  assert.deepEqual(getPipelineNodePorts(people).inputs, []);
+  assert.deepEqual(getPipelineNodePorts(people).outputs.map(port => [port.id, port.type]), [["image", "image"]]);
+  assert.match(pipelineRunIssues({ version: 1, nodes: [people], edges: [] }, people.id).join(" "), /People picture/);
+  people.config.images = [image, "/images/input/second.png"];
+  assert.deepEqual(pipelineRunIssues({ version: 1, nodes: [people], edges: [] }, people.id), []);
+  assert.equal(pipelineExpectedNodeOutputs(people, 999), 2);
+  for (const images of [Array(17).fill(image), ["https://example.com/portrait.png"], ["/images/people/%2e%2e/private.png"], ["/images/people/a.png?token=secret"]])
+    assert.equal(PipelineNodeSchema.safeParse({ ...people, config: { images } }).success, false);
+  assert.equal(PipelineNodeSchema.safeParse({ ...people, config: { images: [image], personId: "11111111-1111-4111-8111-111111111111" } }).success, false);
+  assert.equal(PipelineDefinitionSchema.safeParse({ version: 1, nodes: [people, createPipelineNode("image-input", "input")], edges: [edge("input", people.id)] }).success, false);
+});

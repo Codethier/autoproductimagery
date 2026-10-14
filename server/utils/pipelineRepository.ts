@@ -7,6 +7,7 @@ import {getDatabase} from './lib/db'
 import {useUserFS} from './useUserFS'
 import type {AssetActor} from './assetAccess'
 import {assertGenerationCredit} from './accountBilling'
+import {createPeopleRepository} from './peopleRepository'
 import {hasConfirmedGenerationPrice} from '../../schemas/generation-billing'
 import {formatUsdUnits} from '../../schemas/account-billing'
 import {SavePipelineSchema, UpdatePipelineSchema, StartPipelineRunSchema, RetryPipelineRunSchema,
@@ -70,6 +71,17 @@ export function createPipelineRepository(actor: PipelineActor, db: Database = ge
     const storage = () => storagePromise ??= options.storage ? Promise.resolve(options.storage) : useUserFS(actor, undefined, db)
     const leaseMs = Math.max(30_000, Math.min(PIPELINE_STEP_LEASE_MS, options.leaseMs ?? PIPELINE_STEP_LEASE_MS))
     const expiry = () => sql`CURRENT_TIMESTAMP + (${leaseMs} * interval '1 millisecond')`
+    const peopleRepository = createPeopleRepository(actor, db)
+    const peopleSources = (nodes: PipelineNode[]) => [...new Set(nodes.flatMap(node => node.type === 'people-input' ? node.config.images : []))]
+    async function assertPeopleSources(nodes: PipelineNode[], executor: Database | PipelineTransaction = db, lockProfiles = false) {
+        const paths = peopleSources(nodes)
+        if (!paths.length) return
+        const visible = await peopleRepository.visiblePhotoUrls(paths, executor, lockProfiles)
+        if (paths.some(path => !visible.has(path))) throw createError({statusCode: 404, statusMessage: 'A selected People picture is no longer available'})
+    }
+    async function assertPeopleNodeSources(graph: PipelineDefinition, nodeId: string) {
+        await assertPeopleSources(getPipelineExecutionNodes(graph, nodeId))
+    }
     const lockQueue = (tx: PipelineTransaction) => tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended('autoproductimagery:pipeline-admission:v1', 0))`)
     async function activeActor(tx: PipelineTransaction) {
         const [user] = await tx.select().from(users).where(and(eq(users.id, actor.userId), eq(users.organizationId, actor.organizationId), isNull(users.disabledAt))).for('update').limit(1)
@@ -128,6 +140,7 @@ export function createPipelineRepository(actor: PipelineActor, db: Database = ge
     }
     async function visibleDefinition(graph: PipelineDefinition, cache = new Map<string, Promise<PipelineImageValue | null>>()) {
         const copy = structuredClone(graph)
+        const visiblePeople = await peopleRepository.visiblePhotoUrls(peopleSources(graph.nodes))
         const accessible = async (url: string) => {
             let result = cache.get(url)
             if (!result) {
@@ -144,6 +157,10 @@ export function createPipelineRepository(actor: PipelineActor, db: Database = ge
             else if (node.type === 'static-image') {
                 const images = []
                 for (const url of node.config.images) if (await accessible(url)) images.push(url)
+                node.config.images = images
+            } else if (node.type === 'people-input') {
+                const images = []
+                for (const url of node.config.images) if (visiblePeople.has(url) && await accessible(url)) images.push(url)
                 node.config.images = images
             } else if (node.type === 'generate-image') {
                 const images = []
@@ -164,9 +181,11 @@ export function createPipelineRepository(actor: PipelineActor, db: Database = ge
     }
     async function create(raw: unknown) {
         const parsed = SavePipelineSchema.safeParse(raw); if (!parsed.success) throw createError({statusCode: 400, statusMessage: 'Invalid pipeline request'})
+        await assertPeopleSources(parsed.data.definition.nodes)
         await (await storage()).assertReadableImages(graphSources(parsed.data.definition, parsed.data.definition.nodes, {}))
         const created = await db.transaction(async tx => {
             await activeActor(tx)
+            await assertPeopleSources(parsed.data.definition.nodes, tx, true)
             const [total] = await tx.select({value: count()}).from(pipelines).where(and(eq(pipelines.organizationId, actor.organizationId), eq(pipelines.userId, actor.userId), isNull(pipelines.deletedAt)))
             if (Number(total?.value ?? 0) >= 100) throw createError({statusCode: 409, statusMessage: 'You may save at most 100 pipelines'})
             const [row] = await tx.insert(pipelines).values({id: randomUUID(), organizationId: actor.organizationId, userId: actor.userId, ...parsed.data}).returning()
@@ -176,9 +195,11 @@ export function createPipelineRepository(actor: PipelineActor, db: Database = ge
     }
     async function update(id: string, raw: unknown) {
         const parsed = UpdatePipelineSchema.safeParse(raw); if (!parsed.success) throw createError({statusCode: 400, statusMessage: 'Invalid pipeline request'})
+        await assertPeopleSources(parsed.data.definition.nodes)
         await (await storage()).assertReadableImages(graphSources(parsed.data.definition, parsed.data.definition.nodes, {}))
         const updated = await db.transaction(async tx => {
             await activeActor(tx)
+            await assertPeopleSources(parsed.data.definition.nodes, tx, true)
             await requirePipeline(id, tx)
             const {revision, ...values} = parsed.data
             const [row] = await tx.update(pipelines).set({...values, revision: revision + 1, updatedAt: sql`CURRENT_TIMESTAMP`})
@@ -196,7 +217,7 @@ export function createPipelineRepository(actor: PipelineActor, db: Database = ge
     function graphSources(graph: PipelineDefinition, nodes: PipelineNode[], inputs: Record<string, string>, batchInputNodeId?: string) {
         return [...new Set(nodes.flatMap(node => {
             if (node.type === 'image-input') return node.id === batchInputNodeId ? [] : [inputs[node.id] || node.config.defaultImage].filter((url): url is string => Boolean(url))
-            if (node.type === 'static-image') return node.config.images
+            if (node.type === 'static-image' || node.type === 'people-input') return node.config.images
             if (node.type === 'generate-image') return [...node.config.referenceImages, ...(node.config.maskImage ? [node.config.maskImage] : [])]
             return []
         }))]
@@ -208,7 +229,7 @@ export function createPipelineRepository(actor: PipelineActor, db: Database = ge
             const sourceCount = connected.reduce((total, edge) => total + (counts.get(edge.source) ?? 0), 0)
             let outputCount = sourceCount
             if (node.type === 'image-input') outputCount = 1
-            else if (node.type === 'static-image') outputCount = node.config.images.length
+            else if (node.type === 'static-image' || node.type === 'people-input') outputCount = node.config.images.length
             else if (['static-text', 'text-input', 'describe-image', 'llm', 'prompt-enhancer', 'prompt-concatenator', 'sticky-note'].includes(node.type)) outputCount = 0
             else outputCount = pipelineExpectedNodeOutputs(node, sourceCount)
             if (['generate-image', 'expand', 'translate'].includes(node.type) || node.type === 'upscale' && node.config.mode === 'ai') {if (sourceCount > 20) invalid('A generation node accepts at most 20 connected images per item')}
@@ -236,6 +257,7 @@ export function createPipelineRepository(actor: PipelineActor, db: Database = ge
         const images = input.inputImages.length ? input.inputImages : [null]
         boundExecution(nodes, definition, images.length)
         const sourceUrls = [...input.inputImages, ...graphSources(definition, nodes, input.inputs, input.batchInputNodeId)]
+        await assertPeopleSources(nodes)
         await (await storage()).assertReadableImages(sourceUrls)
         const runId = randomUUID()
         const existing = await db.select().from(pipelineRuns).where(and(runScope(), eq(pipelineRuns.idempotencyKey, input.idempotencyKey))).limit(1)
@@ -256,6 +278,7 @@ export function createPipelineRepository(actor: PipelineActor, db: Database = ge
             }
             const current = await requirePipeline(id, tx)
             if (current.revision !== input.revision || JSON.stringify(current.definition) !== JSON.stringify(definition)) throw createError({statusCode: 409, statusMessage: 'Save or reload the current pipeline before running it'})
+            await assertPeopleSources(nodes, tx, true)
             const [personal] = await tx.select({value: count()}).from(pipelineRuns).where(and(runScope(), inArray(pipelineRuns.status, liveStatuses)))
             const cap = user.creditBalanceUnits === null || !hasPaidNodes ? MAX_ACTIVE_PIPELINE_RUNS_PER_USER : 1
             if (Number(personal?.value ?? 0) >= cap) throw createError({statusCode: 429, statusMessage: 'Finish or cancel your active pipeline runs first'})
@@ -386,14 +409,20 @@ export function createPipelineRepository(actor: PipelineActor, db: Database = ge
         for (const row of linked) if (row.stepId) generations.set(row.stepId, [...(generations.get(row.stepId) ?? []), row.id])
         const outputItems = []
         const projectionCache = new Map<string, Promise<PipelineImageValue | null>>()
+        const visiblePeople = await peopleRepository.visiblePhotoUrls(peopleSources(run.definition.nodes))
         await preloadOwned([...definitionImagePaths(run.definition), ...items.flatMap(item=>item.inputUrl?[item.inputUrl]:[]),
             ...steps.flatMap(step=>step.value?.images.map(image=>image.url)??[])], projectionCache)
         for (const item of items) {
             const ownSteps = steps.filter(step => step.itemId === item.id), outputSteps: PipelineRunStepDTO[] = []
             for (const node of getPipelineExecutionNodes(run.definition, run.targetNodeId ?? undefined)) {
                 const step = ownSteps.find(value => value.nodeId === node.id); if (!step) continue
+                const value = ['succeeded', 'failed'].includes(step.status) ? await visibleValue(step.value, projectionCache) : null
+                if (value) {
+                    const withdrawn = new Set(peopleSources(getPipelineExecutionNodes(run.definition, node.id)).filter(url => !visiblePeople.has(url)))
+                    value.images = value.images.filter(image => !withdrawn.has(image.url))
+                }
                 outputSteps.push({id: step.id, nodeId: step.nodeId, type: node.type, status: step.status,
-                    value: ['succeeded', 'failed'].includes(step.status) ? await visibleValue(step.value, projectionCache) : null,
+                    value,
                     error: step.error, generationIds: generations.get(step.id) ?? [], backgroundRemovalJobId: step.backgroundRemovalJobId,
                     startedAt: date(step.startedAt), completedAt: date(step.completedAt)})
             }
@@ -495,6 +524,7 @@ export function createPipelineRepository(actor: PipelineActor, db: Database = ge
             if (!step) throw createError({statusCode: 409, statusMessage: 'Pipeline execution ownership expired'})
             const run = await requireRun(step.runId, tx)
             if (run.cancelRequested) throw createError({statusCode: 409, statusMessage: 'Pipeline execution was cancelled'})
+            await assertPeopleSources(getPipelineExecutionNodes(run.definition, step.nodeId), tx, true)
             await tx.update(pipelineRunSteps).set({providerStartedAt: sql`CURRENT_TIMESTAMP`, batchId, updatedAt: sql`CURRENT_TIMESTAMP`}).where(liveClaim(stepId, token))
         })
     }
@@ -523,6 +553,7 @@ export function createPipelineRepository(actor: PipelineActor, db: Database = ge
             }
             const [step] = await tx.select().from(pipelineRunSteps).where(liveClaim(stepId, token)).for('update').limit(1)
             if (!step) return false
+            if (status === 'succeeded' || publish) await assertPeopleSources(getPipelineExecutionNodes(run.definition, step.nodeId), tx, true)
             if (publish) await publish(tx)
             await tx.update(pipelineRunSteps).set({status, value, error, claimToken: null, leaseExpiresAt: null,
                 completedAt: terminalStepStatuses.includes(status) ? sql`CURRENT_TIMESTAMP` : null, updatedAt: sql`CURRENT_TIMESTAMP`}).where(liveClaim(stepId, token))
@@ -575,6 +606,7 @@ export function createPipelineRepository(actor: PipelineActor, db: Database = ge
             const run = await requireRun(known.runId, tx, true)
             const [step] = await tx.select().from(pipelineRunSteps).where(liveClaim(stepId, token)).for('update').limit(1)
             if (!step || run.cancelRequested) throw createError({statusCode: 409, statusMessage: 'Pipeline execution was cancelled'})
+            await assertPeopleSources(getPipelineExecutionNodes(run.definition, step.nodeId), tx, true)
             return publish(tx)
         })
     }
@@ -595,5 +627,5 @@ export function createPipelineRepository(actor: PipelineActor, db: Database = ge
         await tx.insert(pipelineStepOutputs).values({id: randomUUID(), stepId, organizationId: actor.organizationId, userId: actor.userId, ...image})
     }
     return {db, storage, list, get, create, update, remove, start, detail, listRuns, requireRun, claim, heartbeat, providerStarted, finish, setBackgroundJob,
-        cancel, retry, wake, schedule, notify, publishPreparation, imageValue, visibleValue, generationRows, registerProcessed, reconcileSteps, synchronize}
+        cancel, retry, wake, schedule, notify, publishPreparation, imageValue, visibleValue, generationRows, registerProcessed, reconcileSteps, synchronize, assertPeopleNodeSources}
 }

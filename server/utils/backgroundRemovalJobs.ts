@@ -1,9 +1,11 @@
 import {randomUUID} from 'node:crypto'
 import {and, asc, count, desc, eq, gt, inArray, isNull, lte, sql} from 'drizzle-orm'
 import {createError} from 'h3'
-import {assets, backgroundRemovalJobs, users} from '../db/schema'
+import {assets, backgroundRemovalJobs, pipelineRuns, pipelineRunSteps, users} from '../db/schema'
 import {getDatabase} from './lib/db'
 import {canonicalAssetUrl, createAssetRepository, validAssetId, type AssetActor} from './assetAccess'
+import {createPeopleRepository} from './peopleRepository'
+import {getPipelineExecutionNodes} from '../../schemas/pipelines'
 import type {BackgroundRemovalError, BackgroundRemovalJob, BackgroundRemovalModel} from '../../schemas/background-removal'
 
 type Database = ReturnType<typeof getDatabase>
@@ -72,9 +74,53 @@ export function createBackgroundRemovalRepository(db: Database = getDatabase(), 
             .where(and(eq(users.id, actor.userId), eq(users.organizationId, actor.organizationId), isNull(users.disabledAt))).limit(1)
         if (!user || (actor.authVersion !== undefined && actor.authVersion !== user.authVersion)) throw createError({statusCode: 401, statusMessage: 'Unauthorized'})
     }
+    /** A pipeline cutout is admitted and published against its immutable run
+     * ancestry. File permission alone cannot replace a withdrawn People grant.
+     * Standalone cutouts do not acquire any pipeline dependency. */
+    async function assertPipelineSources(job: Pick<BackgroundRemovalRecord, 'id' | 'userId' | 'organizationId' | 'sourceUrl'>,
+        executor: Database | BackgroundRemovalTransaction = db, lock = false, initiating?: {stepId: string; claimToken: string}) {
+        const unavailable = (): never => {throw createError({statusCode:404,statusMessage:'A required pipeline source is no longer available'})}
+        const condition = and(eq(pipelineRunSteps.organizationId, job.organizationId), eq(pipelineRunSteps.userId, job.userId),
+            initiating ? eq(pipelineRunSteps.id, validAssetId(initiating.stepId)) : eq(pipelineRunSteps.backgroundRemovalJobId, job.id))
+        const context = () => executor.select({step: pipelineRunSteps, run: pipelineRuns}).from(pipelineRunSteps)
+            .innerJoin(pipelineRuns, and(eq(pipelineRuns.id, pipelineRunSteps.runId), eq(pipelineRuns.organizationId, job.organizationId), eq(pipelineRuns.userId, job.userId)))
+            .where(condition).limit(2)
+        let rows = await context()
+        if (!rows.length && !initiating) return
+        if (rows.length !== 1) unavailable()
+        let current = rows[0]!
+        const sources = () => [...new Set(getPipelineExecutionNodes(current.run.definition, current.step.nodeId)
+            .flatMap(node => node.type === 'people-input' ? node.config.images : []))]
+        if (lock) {
+            // Publication/administration locks accounts before runs/profiles.
+            // Keep that order even when generic asset registration will repeat
+            // these compatible locks later in the same transaction.
+            const owners = await executor.select({id: assets.ownerUserId}).from(assets).where(and(eq(assets.organizationId,job.organizationId),inArray(assets.url,[job.sourceUrl,...sources()])))
+            const ids = [...new Set([job.userId,...owners.map(owner=>owner.id)])].sort()
+            await executor.select({id:users.id}).from(users).where(and(eq(users.organizationId,job.organizationId),inArray(users.id,ids))).orderBy(asc(users.id)).for('share')
+            await executor.select({id:pipelineRuns.id}).from(pipelineRuns).where(eq(pipelineRuns.id,current.run.id)).for('share')
+            await executor.select({id:pipelineRunSteps.id}).from(pipelineRunSteps).where(eq(pipelineRunSteps.id,current.step.id)).for(initiating?'update':'share')
+            rows = await context()
+            if (rows.length !== 1) unavailable()
+            current = rows[0]!
+        }
+        if (!current.step.active || current.step.type !== 'remove-background' || !['queued','running'].includes(current.step.status) ||
+            current.run.cancelRequested || !['queued','running','awaiting-price'].includes(current.run.status)) unavailable()
+        if (initiating && (current.step.status !== 'running' || current.step.claimToken !== validAssetId(initiating.claimToken) ||
+            !current.step.leaseExpiresAt || Date.parse(current.step.leaseExpiresAt) <= Date.now() ||
+            current.step.backgroundRemovalJobId && current.step.backgroundRemovalJobId !== job.id)) unavailable()
+        const [actor] = await executor.select({userId:users.id,organizationId:users.organizationId,username:users.username,displayName:users.displayName,role:users.role})
+            .from(users).where(and(eq(users.id,job.userId),eq(users.organizationId,job.organizationId),isNull(users.disabledAt))).limit(1)
+        if (!actor) unavailable()
+        const paths = sources(), visible = await createPeopleRepository(actor!,db).visiblePhotoUrls(paths,executor,lock)
+        if (paths.some(path=>!visible.has(path))) unavailable()
+        return current.step.id
+    }
     async function enqueue(actor: AssetActor & {authVersion?: number}, input: {
         sourceAssetId: string; sourceUrl: string; model: BackgroundRemovalModel; modelVersion: string; idempotencyKey: string
+        pipelineStepId?: string; pipelineClaimToken?: string
     }): Promise<BackgroundRemovalJob> {
+        if (Boolean(input.pipelineStepId) !== Boolean(input.pipelineClaimToken)) throw createError({statusCode:400,statusMessage:'Invalid pipeline background removal context'})
         validAssetId(input.idempotencyKey)
         if (!['birefnet-lite', 'birefnet'].includes(input.model) || !input.modelVersion || input.modelVersion.length > 200) {
             throw createError({statusCode: 400, statusMessage: 'Invalid background removal model'})
@@ -92,10 +138,14 @@ export function createBackgroundRemovalRepository(db: Database = getDatabase(), 
             if (!sourceStillPresent) throw createError({statusCode: 404, statusMessage: 'Image not found'})
             const [existing] = await tx.select().from(backgroundRemovalJobs)
                 .where(and(ownerCondition(actor), eq(backgroundRemovalJobs.idempotencyKey, input.idempotencyKey))).limit(1)
+            const jobId = existing?.id ?? randomUUID()
+            const stepId = input.pipelineStepId ? await assertPipelineSources({id:jobId,userId:actor.userId,organizationId:actor.organizationId,sourceUrl:url},tx,true,
+                {stepId:input.pipelineStepId,claimToken:input.pipelineClaimToken!}) : undefined
             if (existing) {
                 if (existing.sourceAssetId !== source.id || existing.sourceUrl !== url || existing.model !== input.model || existing.modelVersion !== input.modelVersion) {
                     throw createError({statusCode: 409, statusMessage: 'This background removal request key was already used'})
                 }
+                if (stepId) await tx.update(pipelineRunSteps).set({backgroundRemovalJobId:existing.id,updatedAt:sql`CURRENT_TIMESTAMP`}).where(eq(pipelineRunSteps.id,stepId))
                 return (await projectJobs([existing], tx))[0]!
             }
             const [personal] = await tx.select({value: count()}).from(backgroundRemovalJobs)
@@ -103,10 +153,11 @@ export function createBackgroundRemovalRepository(db: Database = getDatabase(), 
             if (Number(personal?.value ?? 0) >= MAX_BACKGROUND_REMOVAL_USER_OUTSTANDING) queueOverloaded('Too many background removals are pending for this account')
             const [queued] = await tx.select({value: count()}).from(backgroundRemovalJobs).where(eq(backgroundRemovalJobs.status, 'queued'))
             if (Number(queued?.value ?? 0) >= MAX_BACKGROUND_REMOVAL_QUEUED) queueOverloaded('Background removal is busy; try again later')
-            const [created] = await tx.insert(backgroundRemovalJobs).values({id: randomUUID(), organizationId: actor.organizationId,
+            const [created] = await tx.insert(backgroundRemovalJobs).values({id: jobId, organizationId: actor.organizationId,
                 userId: actor.userId, sourceAssetId: source.id, sourceUrl: url, model: input.model, modelVersion: input.modelVersion,
                 idempotencyKey: input.idempotencyKey}).returning()
             if (!created) throw new Error('Background removal job was not created')
+            if (stepId) await tx.update(pipelineRunSteps).set({backgroundRemovalJobId:created.id,updatedAt:sql`CURRENT_TIMESTAMP`}).where(eq(pipelineRunSteps.id,stepId))
             return publicBackgroundRemovalJob(created)
         })
     }
@@ -152,6 +203,7 @@ export function createBackgroundRemovalRepository(db: Database = getDatabase(), 
             const [job] = await tx.select().from(backgroundRemovalJobs).where(liveClaim(id, owner)).limit(1).for('update')
             if (!job) return false
             await activeActor(tx, {userId: job.userId, organizationId: job.organizationId})
+            await assertPipelineSources(job,tx,true)
             const output = await register(tx, job)
             const [asset] = await tx.select({id: assets.id}).from(assets).where(and(eq(assets.id, validAssetId(output.outputAssetId)),
                 eq(assets.url, canonicalAssetUrl(output.outputUrl)), eq(assets.organizationId, job.organizationId), eq(assets.ownerUserId, job.userId),
@@ -189,7 +241,7 @@ export function createBackgroundRemovalRepository(db: Database = getDatabase(), 
             .orderBy(desc(backgroundRemovalJobs.createdAt), desc(backgroundRemovalJobs.id)).limit(limit).offset(offset)
         return projectJobs(rows)
     }
-    return {enqueue, claim, heartbeat, complete, fail, get, list}
+    return {enqueue, claim, heartbeat, complete, fail, get, list, assertPipelineSources}
 }
 
 export function backgroundRemovalRequestError(error: unknown): never {

@@ -73,16 +73,18 @@ export function createPeopleRepository(actor: AssetActor & {authVersion?: number
         const [row] = await executor.select().from(people).where(and(eq(people.id, validAssetId(id)), readableCondition(actor))).limit(1)
         return row ?? notFound()
     }
-    function visiblePhotos(ids: string[]) {
-        const selected = sql`(${sql.join(ids.map(id => sql`${id}::uuid`), sql`, `)})`
+    function visiblePhotos(ids?: string[], urls?: string[]) {
+        const selected = ids ? sql`(${sql.join(ids.map(id => sql`${id}::uuid`), sql`, `)})` : undefined
         return sql`WITH photo_links AS (
             SELECT ${personPhotos.personId} AS person_id, ${personPhotos.assetId} AS asset_id,
                 ${people.organizationId} AS organization_id, ${people.userId} AS owner_user_id FROM ${personPhotos}
-                JOIN ${people} ON ${people.id} = ${personPhotos.personId} WHERE ${readableCondition(actor)} AND ${people.id} IN ${selected} AND ${personPhotos.excluded} = false
+                JOIN ${people} ON ${people.id} = ${personPhotos.personId} WHERE ${readableCondition(actor)} ${selected ? sql`AND ${people.id} IN ${selected}` : sql``} AND ${personPhotos.excluded} = false
+                    ${urls ? sql`AND EXISTS (SELECT 1 FROM ${assets} WHERE ${assets.id} = ${personPhotos.assetId} AND ${inArray(assets.url, urls)})` : sql``}
             UNION SELECT ${systemPrompt.personId}, ${assets.id}, ${people.organizationId}, ${people.userId} FROM ${systemPrompt}
                 JOIN ${people} ON ${people.id} = ${systemPrompt.personId}
                 JOIN ${assets} ON ${assets.url} = ${systemPrompt.outputImage}
-                WHERE ${readableCondition(actor)} AND ${people.id} IN ${selected}
+                WHERE ${readableCondition(actor)} ${selected ? sql`AND ${people.id} IN ${selected}` : sql``}
+                    ${urls ? sql`AND ${inArray(systemPrompt.outputImage, urls)}` : sql``}
                     AND ${systemPrompt.organizationId} = ${people.organizationId} AND ${systemPrompt.userId} = ${people.userId}
                     AND NOT EXISTS (SELECT 1 FROM ${personPhotos} WHERE ${personPhotos.personId} = ${people.id}
                         AND ${personPhotos.assetId} = ${assets.id} AND ${personPhotos.excluded} = true)
@@ -101,8 +103,28 @@ export function createPeopleRepository(actor: AssetActor & {authVersion?: number
                 ORDER BY ${systemPrompt.id} DESC LIMIT 1) settled ON true
             WHERE ${assets.organizationId} = photo_links.organization_id AND ${assets.ownerUserId} = photo_links.owner_user_id
                 AND ${assets.kind} = 'file' AND ${assets.deletedAt} IS NULL
+                ${urls ? sql`AND ${inArray(assets.url, urls)}` : sql``}
                 AND (${assets.category} <> 'generated' OR settled.generation_id IS NOT NULL)
         )`
+    }
+    /** Resolve only requested immutable photos using the same live profile,
+     * sharing, exclusion and exact-price rules as the People picker. General
+     * file/folder permission alone must not establish People provenance. */
+    async function visiblePhotoUrls(input: string[], executor: Executor = db, lockProfiles = false): Promise<Set<string>> {
+        if (input.length > 384) throw createError({statusCode: 400, statusMessage: 'Too many selected People pictures'})
+        const urls = [...new Set(input.map(canonicalAssetUrl))]
+        if (!urls.length) return new Set()
+        const read = () => executor.execute<{person_id: string; url: string}>(sql`${visiblePhotos(undefined, urls)} SELECT DISTINCT person_id, url FROM visible_photos`)
+        let rows = (await read()).rows
+        if (lockProfiles && rows.length) {
+            // Profile mutations take UPDATE locks, including unlinking and
+            // grant revocation. Hold compatible profile locks through a paid
+            // start/publication fence, then re-read after any earlier writer.
+            await executor.select({id: people.id}).from(people).where(inArray(people.id, [...new Set(rows.map(row => row.person_id))]))
+                .orderBy(asc(people.id)).for('share')
+            rows = (await read()).rows
+        }
+        return new Set(rows.map(row => row.url))
     }
     type PhotoRow = {person_id: string; id: string; url: string; name: string; price_usd: string | null; price_source: string | null; generation_id: number | null; photo_count?: number}
     const photoDto = (row: PhotoRow): PersonPhoto => ({id: row.id, url: row.url, name: row.name, priceUsd: row.price_usd, priceSource: row.price_source, generationId: row.generation_id})
@@ -286,7 +308,7 @@ export function createPeopleRepository(actor: AssetActor & {authVersion?: number
         })
         return {ok: true as const}
     }
-    return {list, get, create, update, remove, addPhotos, removePhoto, requirePerson, requireOwnedPerson, sharedSources, shareTargets, sharesFor, share, revoke}
+    return {list, get, create, update, remove, addPhotos, removePhoto, requirePerson, requireOwnedPerson, visiblePhotoUrls, sharedSources, shareTargets, sharesFor, share, revoke}
 }
 
 export function peopleRequestError(error: unknown): never {

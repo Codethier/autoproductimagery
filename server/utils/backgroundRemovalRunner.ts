@@ -41,6 +41,7 @@ export function createBackgroundRemovalRunner(deps: Dependencies) {
             if (profile.version !== job.modelVersion) throw {code: 'MODEL_UNAVAILABLE'}
             const actor = await deps.actor(job)
             const storage = await deps.storage(actor)
+            await deps.repository.assertPipelineSources(job)
             const source = await storage.assetByUrl(job.sourceUrl)
             if (source.id !== job.sourceAssetId || source.kind !== 'file') throw {code: 'SOURCE_UNAVAILABLE'}
             const image = await storage.getImageFile(job.sourceUrl)
@@ -48,6 +49,7 @@ export function createBackgroundRemovalRunner(deps: Dependencies) {
             if (controller.signal.aborted) throw {code: 'PROCESSING_INTERRUPTED'}
             // Disabled users and revoked shares cannot publish a cutout after a long inference.
             await deps.actor(job)
+            await deps.repository.assertPipelineSources(job)
             await storage.assertReadableImages([job.sourceUrl])
             staged = await storage.prepareProcessedImage(result.buffer)
             if (controller.signal.aborted) throw {code: 'PROCESSING_INTERRUPTED'}

@@ -19,6 +19,7 @@ export const PIPELINE_LIMITS = {
 } as const;
 export const PIPELINE_NODE_TYPES = [
   "image-input",
+  "people-input",
   "text-input",
   "static-image",
   "static-text",
@@ -117,6 +118,12 @@ export const PipelineNodeSchema = z.discriminatedUnion("type", [
         defaultImage: PipelineImagePathSchema.optional(),
         required: z.boolean().default(true),
       })
+      .strict(),
+  ),
+  node(
+    "people-input",
+    z
+      .object({ images: z.array(PipelineImagePathSchema).max(16).default([]) })
       .strict(),
   ),
   node(
@@ -254,6 +261,7 @@ export type PipelinePort = {
 };
 export const PIPELINE_NODE_LABELS: Record<PipelineNodeType, string> = {
   "image-input": "Image Input",
+  "people-input": "People Input",
   "text-input": "Text Input",
   "static-image": "Static Image",
   "static-text": "Static Text",
@@ -300,7 +308,7 @@ export function getPipelineNodePorts(value: PipelineNode): {
     required: false,
   };
   if (value.type === "sticky-note") return { inputs: [], outputs: [] };
-  if (value.type === "image-input" || value.type === "static-image")
+  if (value.type === "image-input" || value.type === "people-input" || value.type === "static-image")
     return { inputs: [], outputs: [imageOut] };
   if (value.type === "text-input" || value.type === "static-text")
     return { inputs: [], outputs: [textOut] };
@@ -394,6 +402,7 @@ export function createPipelineNode<T extends PipelineNodeType>(
   };
   const configs: Record<PipelineNodeType, unknown> = {
     "image-input": {},
+    "people-input": {},
     "text-input": {},
     "static-image": {},
     "static-text": {},
@@ -571,6 +580,8 @@ export function pipelineRunIssues(
         issues.push(`${n.label}: connect ${p.label}.`);
     if (n.type === "static-image" && !n.config.images.length)
       issues.push(`${n.label}: choose an image.`);
+    if (n.type === "people-input" && !n.config.images.length)
+      issues.push(`${n.label}: choose at least one People picture.`);
     if (n.type === "static-text" && !n.config.text.trim())
       issues.push(`${n.label}: enter text.`);
     if (
@@ -720,6 +731,8 @@ export function pipelineExpectedNodeOutputs(
   node: PipelineNode,
   inputCount = 1,
 ): number {
+  if (node.type === "people-input" || node.type === "static-image")
+    return node.config.images.length;
   if (
     node.type === "generate-image" ||
     node.type === "expand" ||

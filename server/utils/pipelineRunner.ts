@@ -71,12 +71,16 @@ export function createPipelineExecutor(actor: PipelineActor, repository = create
     async function reauthorize(claim: Claim, storage: Storage, inputs: Record<string, PipelineValue>) {
         const paths = Object.values(inputs).flatMap(value => value.images.map(image => image.url))
         const node = claim.node
-        if (node.type === 'static-image') paths.push(...node.config.images)
+        if (node.type === 'static-image' || node.type === 'people-input') paths.push(...node.config.images)
         if (node.type === 'image-input') {
             const url = node.id === claim.run.batchInputNodeId ? claim.item.inputUrl : claim.run.inputs[node.id] || node.config.defaultImage
             if (url) paths.push(url)
         }
         if (node.type === 'generate-image') paths.push(...node.config.referenceImages, ...(node.config.maskImage ? [node.config.maskImage] : []))
+        // General asset access may survive an independent file share. People
+        // sources still require a live photo association and profile grant,
+        // even after an intermediate image has become owned by this runner.
+        await repository.assertPeopleNodeSources(claim.run.definition, node.id)
         await storage.assertReadableImages([...new Set(paths)])
     }
     async function imageValues(urls: string[]) {
@@ -242,8 +246,7 @@ export function createPipelineExecutor(actor: PipelineActor, repository = create
         if (!job) {
             const profile = getBackgroundRemovalModel(claim.node.config.model)
             job = await background.enqueue(actor, {sourceAssetId: source.id, sourceUrl: source.url, model: profile.id,
-                modelVersion: profile.version, idempotencyKey: randomUUID()})
-            await repository.setBackgroundJob(claim.step.id, claim.token, job.id)
+                modelVersion: profile.version, idempotencyKey: randomUUID(), pipelineStepId:claim.step.id, pipelineClaimToken:claim.token})
         }
         void (options.kickBackground ?? kickBackgroundRemovalQueue)()
         const until = Date.now() + Math.max(0, Math.min(120_000, options.backgroundWaitMs ?? 20_000))
@@ -272,7 +275,7 @@ export function createPipelineExecutor(actor: PipelineActor, repository = create
             if (!text.trim() && node.config.required) invalid('Enter required text')
             await repository.finish(claim.step.id, claim.token, 'succeeded', {images: [], text}); return
         }
-        if (node.type === 'static-image') {await repository.finish(claim.step.id, claim.token, 'succeeded', {images: await imageValues(node.config.images), text: null}); return}
+        if (node.type === 'static-image' || node.type === 'people-input') {await repository.finish(claim.step.id, claim.token, 'succeeded', {images: await imageValues(node.config.images), text: null}); return}
         if (node.type === 'static-text') {await repository.finish(claim.step.id, claim.token, 'succeeded', {images: [], text: node.config.text}); return}
         if (node.type === 'prompt-concatenator') {
             const texts = claim.run.definition.edges.filter(edge => edge.target === node.id && edge.sourcePort === 'text')

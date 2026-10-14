@@ -14,6 +14,7 @@ import {createS3ImageStorage, type ImageStorageCommand} from '../server/utils/us
 import {useUserFS} from '../server/utils/useUserFS.ts'
 import {createPipelineRepository} from '../server/utils/pipelineRepository.ts'
 import {createPipelineExecutor} from '../server/utils/pipelineRunner.ts'
+import {createPeopleRepository} from '../server/utils/peopleRepository.ts'
 import {useDB} from '../server/utils/useDB.ts'
 import {createAccountBilling} from '../server/utils/accountBilling.ts'
 import {createBackgroundRemovalRepository} from '../server/utils/backgroundRemovalJobs.ts'
@@ -381,4 +382,179 @@ test('worker shutdown during claim cleans its owned step claim before any paid c
     assert.ok(result.run.items[0]!.steps.every(step=>step.status!=='running'))
     const records=await f.db.select().from(pipelineRunSteps).where(eq(pipelineRunSteps.runId,run.id));assert.ok(records.every(step=>step.claimToken===null&&step.leaseExpiresAt===null))
     assert.equal((await f.db.select().from(systemPrompt)).length,0)
+}))
+
+test('People Input freezes chosen own/shared photos across independent batch items, branches and later profile edits',integration,async()=>fixture(async f=>{
+    const fs=await useUserFS(f.a,f.raw,f.db),otherFS=await useUserFS(f.b,f.raw,f.db),repo=createPipelineRepository(f.a,f.db,{storage:fs})
+    const owned=createPeopleRepository(f.a,f.db),shared=createPeopleRepository(f.b,f.db)
+    const ownPerson=(await owned.create({name:'Own person'})).person,sharedPerson=(await shared.create({name:'Shared person'})).person
+    const ownPhoto=await fs.saveUpload('/',upload(f.bytes)),sharedPhoto=await otherFS.saveUpload('/',upload(f.bytes))
+    await owned.addPhotos(ownPerson.id,{urls:[ownPhoto.url]});await shared.addPhotos(sharedPerson.id,{urls:[sharedPhoto.url]});await shared.share(sharedPerson.id,{recipientUserId:f.a.userId})
+    const people=createPipelineNode('people-input','people');people.config.images=[ownPhoto.url,sharedPhoto.url]
+    const products=await Promise.all([fs.saveUpload('/',upload(f.bytes)),fs.saveUpload('/',upload(f.bytes))])
+    const definition=graph([createPipelineNode('image-input','input'),people,generateNode('generate'),createPipelineNode('output','result'),createPipelineNode('output','photos')],
+        [['input','generate'],['people','generate','references'],['generate','result'],['people','photos']])
+    const {pipeline,run}=await saveStart(repo,definition,products.map(image=>image.url))
+    const newer=await fs.saveUpload('/',upload(f.bytes));await owned.addPhotos(ownPerson.id,{urls:[newer.url]})
+    await repo.update(pipeline.id,{revision:1,name:'Changed selection',definition:{...definition,nodes:definition.nodes.map(node=>node.type==='people-input'?{...node,config:{images:[newer.url]}}:node)}})
+    const calls={value:0,batches:[] as string[]},generate=fakeGeneration(f,fs,'gateway',calls),references:string[][]=[]
+    const done=await drain(createPipelineExecutor(f.a,repo,{gateway:noGateway,runtimeConfig,generate:async(...args)=>{references.push(args[1].modelImages);return generate(...args)}}),run.id)
+    assert.equal(done.status,'succeeded');assert.equal(done.summary.succeeded,2);assert.equal(calls.value,2)
+    assert.deepEqual(references,[[ownPhoto.url,sharedPhoto.url],[ownPhoto.url,sharedPhoto.url]])
+    for(const item of done.items){
+        assert.deepEqual(item.steps.find(step=>step.nodeId==='people')!.value!.images.map(image=>image.url),[ownPhoto.url,sharedPhoto.url])
+        assert.equal(item.steps.find(step=>step.nodeId==='result')!.value!.images.length,1)
+        assert.deepEqual(item.steps.find(step=>step.nodeId==='photos')!.value!.images.map(image=>image.url),[ownPhoto.url,sharedPhoto.url])
+    }
+    assert.deepEqual(done.definition.nodes.find(node=>node.type==='people-input')!.config.images,[ownPhoto.url,sharedPhoto.url])
+    assert.deepEqual((await repo.get(pipeline.id)).pipeline.definition.nodes.find(node=>node.type==='people-input')!.config.images,[newer.url])
+    assert.deepEqual((await fs.getImageFile(ownPhoto.url)).buffer,f.bytes);assert.deepEqual((await otherFS.getImageFile(sharedPhoto.url)).buffer,f.bytes)
+}))
+
+test('People Input rejects Library forgery, private/cross-organization photos, empty runs and batch overrides',integration,async()=>fixture(async f=>{
+    const fs=await useUserFS(f.a,f.raw,f.db),repo=createPipelineRepository(f.a,f.db,{storage:fs})
+    const library=await fs.saveUpload('/',upload(f.bytes)),photos:string[]=[library.url]
+    for(const actor of [f.b,f.stranger]){
+        const otherFS=await useUserFS(actor,f.raw,f.db),people=createPeopleRepository(actor,f.db),person=(await people.create({name:'Private person'})).person,image=await otherFS.saveUpload('/',upload(f.bytes))
+        await people.addPhotos(person.id,{urls:[image.url]});photos.push(image.url)
+    }
+    for(const url of photos){
+        const people=createPipelineNode('people-input','people');people.config.images=[url]
+        await assert.rejects(repo.create({name:'Forged People',definition:graph([people,createPipelineNode('output','out')],[['people','out']])}),(e:{statusCode:number})=>e.statusCode===404)
+    }
+    const empty=createPipelineNode('people-input','people'),draft=(await repo.create({name:'Incomplete',definition:graph([empty,createPipelineNode('output','out')],[['people','out']])})).pipeline
+    await assert.rejects(repo.start(draft.id,{revision:1,idempotencyKey:randomUUID(),inputs:{}}),(e:{statusCode:number})=>e.statusCode===400)
+    const owned=createPeopleRepository(f.a,f.db),person=(await owned.create({name:'Valid'})).person;await owned.addPhotos(person.id,{urls:[library.url]})
+    empty.config.images=[library.url];const {pipeline}=await repo.create({name:'Fixed People',definition:graph([empty,createPipelineNode('output','out')],[['people','out']])})
+    await assert.rejects(repo.start(pipeline.id,{revision:1,idempotencyKey:randomUUID(),batchInputNodeId:'people',inputImages:[library.url],inputs:{}}),(e:{statusCode:number})=>e.statusCode===400)
+    await assert.rejects(repo.start(pipeline.id,{revision:1,idempotencyKey:randomUUID(),inputs:{people:library.url}}),(e:{statusCode:number})=>e.statusCode===400)
+    assert.equal((await f.db.select().from(pipelineRuns)).length,0)
+}))
+
+test('People provenance keeps exact-price gating including zero charges, deleted outputs and unlinked photos',integration,async()=>fixture(async f=>{
+    const fs=await useUserFS(f.a,f.raw,f.db),repo=createPipelineRepository(f.a,f.db,{storage:fs}),people=createPeopleRepository(f.a,f.db)
+    const person=(await people.create({name:'Generated person'})).person,database=await useDB(f.db,f.a),profile=getImageModelProfile('google/gemini-3.1-flash-image')!
+    const row=await database.createPendingGeneration({prompt:'Fixture portrait',personId:person.id,inputImages:[],modelImages:[],requestedModel:profile.id,effectiveModel:profile.id,batchId:randomUUID(),
+        generationConfig:{schemaVersion:1,profileVersion:profile.profileVersion,requestedModel:profile.id,effectiveModel:profile.id,settings:createDefaultSettings(profile.id),storeInputImages:true}})
+    const output=await fs.saveGeneratedImage(f.bytes,'image/png');await database.completeGeneration(row.id,{outputImage:output.url,outputMetadata:{mimeType:'image/png',width:24,height:16,bytes:f.bytes.length,warnings:[]},
+        billing:{priceSource:'estimate',priceUsd:'0.01',gatewayGenerationId:'gen_people_input',usageJson:{gatewayBilling:{isByok:false}}},log:{status:'success',model:profile.id,prompt:'Fixture'}})
+    const input=createPipelineNode('people-input','people');input.config.images=[output.url];const definition=graph([input,createPipelineNode('output','out')],[['people','out']])
+    await assert.rejects(repo.create({name:'Unpriced',definition}),(e:{statusCode:number})=>e.statusCode===404)
+    await database.updateSystemPromptBilling(row.id,{priceSource:'gateway',priceUsd:'0',gatewayGenerationId:'gen_people_input',usageJson:{gatewayBilling:{isByok:false}}})
+    const {pipeline,run}=await saveStart(repo,definition),done=await drain(createPipelineExecutor(f.a,repo,{gateway:noGateway,runtimeConfig}),run.id)
+    assert.equal(done.status,'succeeded');assert.equal(done.items[0]!.steps.at(-1)!.value!.images[0]!.priceUsd,'0')
+    const outputAsset=await fs.assetByUrl(output.url)
+    await people.removePhoto(person.id,outputAsset.id!)
+    assert.equal((await fs.assetByUrl(output.url)).id,outputAsset.id,'owned Library access survives unlinking')
+    assert.ok(!JSON.stringify((await repo.get(pipeline.id)).pipeline).includes(output.url))
+    assert.ok(!JSON.stringify(await repo.detail(run.id)).includes(output.url),'People and pass-through output values also redact withdrawn photo paths')
+    await assert.rejects(repo.start(pipeline.id,{revision:1,idempotencyKey:randomUUID(),inputs:{}}),(e:{statusCode:number})=>e.statusCode===404)
+    await people.addPhotos(person.id,{urls:[output.url]});await f.db.update(systemPrompt).set({outputImageDeletedAt:sql`CURRENT_TIMESTAMP`}).where(eq(systemPrompt.id,row.id))
+    assert.ok(!JSON.stringify((await repo.get(pipeline.id)).pipeline).includes(output.url))
+    assert.equal((await f.db.select().from(systemPrompt)).length,1,'source withdrawal preserves charge and generation history')
+}))
+
+test('revoked People grants stop descendant paid work after an owned local intermediate while independent file grants survive',integration,async()=>fixture(async f=>{
+    const sourceFS=await useUserFS(f.a,f.raw,f.db),fs=await useUserFS(f.b,f.raw,f.db),people=createPeopleRepository(f.a,f.db),repo=createPipelineRepository(f.b,f.db,{storage:fs})
+    const person=(await people.create({name:'Shared portrait'})).person,photo=await sourceFS.saveUpload('/',upload(f.bytes));await people.addPhotos(person.id,{urls:[photo.url]});await people.share(person.id,{recipientUserId:f.b.userId});await sourceFS.share(photo.id!,f.b.userId,'view')
+    const input=createPipelineNode('people-input','people');input.config.images=[photo.url];const resize=createPipelineNode('resize','resize');resize.config={width:24,height:16,fit:'contain',background:'transparent'}
+    const {pipeline,run}=await saveStart(repo,graph([input,resize,generateNode('generate'),createPipelineNode('output','out')],[['people','resize'],['resize','generate'],['generate','out']]))
+    const calls={value:0,batches:[] as string[]},executor=createPipelineExecutor(f.b,repo,{gateway:noGateway,runtimeConfig,generate:fakeGeneration(f,fs,'gateway',calls)})
+    await executor.advance(run.id);const intermediate=(await executor.advance(run.id)).run.items[0]!.steps.find(step=>step.nodeId==='resize')!.value!.images[0]!
+    await people.revoke(person.id,f.b.userId)
+    assert.equal((await fs.assetByUrl(photo.url)).id,photo.id);assert.equal((await fs.assetByUrl(intermediate.url)).id,intermediate.id)
+    const done=await drain(executor,run.id)
+    assert.equal(calls.value,0);assert.equal(done.items[0]!.steps.find(step=>step.nodeId==='generate')!.error?.code,'SOURCE_UNAVAILABLE');assert.equal((await f.db.select().from(systemPrompt)).length,0)
+    assert.ok(!JSON.stringify(done).includes(photo.url));assert.ok(!JSON.stringify((await repo.get(pipeline.id)).pipeline).includes(photo.url))
+    assert.ok(JSON.stringify(done).includes(intermediate.url),'independently owned completed output remains available')
+}))
+
+test('a People share revoked between provider preparation and its committed start fence prevents the paid call',integration,async()=>fixture(async f=>{
+    const sourceFS=await useUserFS(f.a,f.raw,f.db),fs=await useUserFS(f.b,f.raw,f.db),people=createPeopleRepository(f.a,f.db),repo=createPipelineRepository(f.b,f.db,{storage:fs})
+    const person=(await people.create({name:'Shared portrait'})).person,photo=await sourceFS.saveUpload('/',upload(f.bytes));await people.addPhotos(person.id,{urls:[photo.url]});await people.share(person.id,{recipientUserId:f.b.userId});await sourceFS.share(photo.id!,f.b.userId,'view')
+    const input=createPipelineNode('people-input','people');input.config.images=[photo.url]
+    const {run}=await saveStart(repo,graph([input,generateNode('generate'),createPipelineNode('output','out')],[['people','generate','references'],['generate','out']]))
+    let calls=0,providerFences=0;const actualFence=repo.providerStarted.bind(repo)
+    repo.providerStarted=async(...args)=>{providerFences++;await people.revoke(person.id,f.b.userId);return actualFence(...args)}
+    const generate=(async(_actor,_request,options={})=>{await options.beforeProviderCall?.({batchId:randomUUID(),generationIds:[],inputImage:null,signal:new AbortController().signal});calls++;throw new Error('Provider must not run')}) as typeof runAccountImageGeneration
+    const done=await drain(createPipelineExecutor(f.b,repo,{gateway:noGateway,runtimeConfig,generate}),run.id)
+    assert.equal(providerFences,1);assert.equal(calls,0);assert.equal(done.items[0]!.steps.find(step=>step.nodeId==='generate')!.error?.code,'SOURCE_UNAVAILABLE')
+    const steps=await f.db.select().from(pipelineRunSteps).where(eq(pipelineRunSteps.runId,run.id));assert.ok(steps.every(step=>step.providerStartedAt===null))
+}))
+
+test('People unlink during local processing discards staged bytes instead of publishing a new owned result',integration,async()=>fixture(async f=>{
+    const fs=await useUserFS(f.a,f.raw,f.db),people=createPeopleRepository(f.a,f.db),repo=createPipelineRepository(f.a,f.db,{storage:fs}),person=(await people.create({name:'Own portrait'})).person,photo=await fs.saveUpload('/',upload(f.bytes))
+    await people.addPhotos(person.id,{urls:[photo.url]});const input=createPipelineNode('people-input','people');input.config.images=[photo.url]
+    const {run}=await saveStart(repo,graph([input,createPipelineNode('resize','resize'),createPipelineNode('output','out')],[['people','resize'],['resize','out']]))
+    const imageKeys=()=>new Set([...f.objects.keys()].filter(key=>!key.endsWith('/')))
+    const initialKeys=imageKeys(),executor=createPipelineExecutor(f.a,repo,{gateway:noGateway,runtimeConfig,processImage:async(...args)=>{const result=await processLocalPipelineImage(...args);await people.removePhoto(person.id,photo.id!);return result}})
+    const done=await drain(executor,run.id)
+    assert.equal(done.items[0]!.steps.find(step=>step.nodeId==='resize')!.error?.code,'SOURCE_UNAVAILABLE');assert.equal((await f.db.select().from(pipelineStepOutputs)).length,0)
+    assert.deepEqual(imageKeys(),initialKeys);assert.ok(!JSON.stringify(done).includes(photo.url));assert.deepEqual((await fs.getImageFile(photo.url)).buffer,f.bytes)
+}))
+
+test('People source fanout participates in aggregate output limits before a run can be queued',integration,async()=>fixture(async f=>{
+    const fs=await useUserFS(f.a,f.raw,f.db),people=createPeopleRepository(f.a,f.db),repo=createPipelineRepository(f.a,f.db,{storage:fs}),person=(await people.create({name:'Many pictures'})).person
+    const photos=await Promise.all(Array.from({length:16},()=>fs.saveUpload('/',upload(f.bytes))));await people.addPhotos(person.id,{urls:photos.map(photo=>photo.url)})
+    const sources=Array.from({length:4},(_,index)=>{const node=createPipelineNode('people-input',`people${index}`);node.config.images=photos.map(photo=>photo.url);return node})
+    const {pipeline}=await repo.create({name:'Bounded references',definition:graph([...sources,createPipelineNode('output','out')],sources.map(node=>[node.id,'out']))})
+    await assert.rejects(repo.start(pipeline.id,{revision:1,idempotencyKey:randomUUID(),inputs:{}}),(e:{statusCode:number})=>e.statusCode===400)
+    assert.equal((await f.db.select().from(pipelineRuns)).length,0);assert.equal((await f.db.select().from(systemPrompt)).length,0)
+    const {run}=await saveStart(repo,graph([sources[0]!,generateNode('generate'),createPipelineNode('output','result')],[['people0','generate','references'],['generate','result']]))
+    let calls=0
+    const generate=(async()=>{calls++;throw new Error('Over-limit references must not reach provider')}) as typeof runAccountImageGeneration
+    const done=await drain(createPipelineExecutor(f.a,repo,{gateway:noGateway,runtimeConfig,generate}),run.id)
+    assert.equal(calls,0);assert.equal(done.items[0]!.steps.find(step=>step.nodeId==='generate')!.error?.code,'INVALID_STEP_INPUT')
+    assert.equal((await f.db.select().from(systemPrompt)).length,0,'exact model reference limits still precede paid admission')
+}))
+
+for(const withdrawal of ['revoke','unlink','remove'] as const) test(`People ${withdrawal} during durable cutout inference cannot publish an owned asset through an independent file grant`,integration,async()=>fixture(async f=>{
+    const sourceFS=await useUserFS(f.a,f.raw,f.db),fs=await useUserFS(f.b,f.raw,f.db),people=createPeopleRepository(f.a,f.db),repo=createPipelineRepository(f.b,f.db,{storage:fs})
+    const person=(await people.create({name:'Shared portrait'})).person,photo=await sourceFS.saveUpload('/',upload(f.bytes));await people.addPhotos(person.id,{urls:[photo.url]});await people.share(person.id,{recipientUserId:f.b.userId});await sourceFS.share(photo.id!,f.b.userId,'view')
+    const input=createPipelineNode('people-input','people');input.config.images=[photo.url]
+    const {run}=await saveStart(repo,graph([input,createPipelineNode('remove-background','cutout'),createPipelineNode('output','out')],[['people','cutout'],['cutout','out']]))
+    const background=createBackgroundRemovalRepository(f.db),before=new Set(f.objects.keys());let inference=0
+    const worker=createBackgroundRemovalRunner({repository:background,actor:async()=>f.b,storage:async()=>fs,infer:async value=>{
+        inference++
+        if(withdrawal==='revoke')await people.revoke(person.id,f.b.userId)
+        else if(withdrawal==='unlink')await people.removePhoto(person.id,photo.id!)
+        else await people.remove(person.id)
+        return{buffer:value.buffer,mimeType:'image/png',width:24,height:16,byteSize:value.buffer.length,modelVersion:getBackgroundRemovalModel(value.model).version}
+    }})
+    let done
+    try{done=await drain(createPipelineExecutor(f.b,repo,{gateway:noGateway,runtimeConfig,background,kickBackground:()=>worker.kick(),backgroundWaitMs:5000}),run.id)}finally{await worker.close()}
+    assert.equal(inference,1);assert.equal((await fs.assetByUrl(photo.url)).id,photo.id,'the separate file grant remains usable')
+    const jobs=await background.list(f.b);assert.equal(jobs.length,1);assert.equal(jobs[0]!.status,'failed');assert.equal(jobs[0]!.error?.code,'SOURCE_UNAVAILABLE');assert.equal(jobs[0]!.outputUrl,null)
+    assert.equal(done.items[0]!.steps.find(step=>step.nodeId==='cutout')!.error?.code,'SOURCE_UNAVAILABLE')
+    assert.equal((await f.db.select().from(assets).where(eq(assets.category,'processed'))).length,0)
+    assert.deepEqual(new Set(f.objects.keys()),before);assert.ok(!JSON.stringify(done).includes(photo.url));assert.equal((await f.db.select().from(systemPrompt)).length,0)
+}))
+
+test('durable People cutouts are atomically linked before queue consumption and recheck provenance before reading bytes',integration,async()=>fixture(async f=>{
+    const sourceFS=await useUserFS(f.a,f.raw,f.db),fs=await useUserFS(f.b,f.raw,f.db),people=createPeopleRepository(f.a,f.db),repo=createPipelineRepository(f.b,f.db,{storage:fs})
+    const person=(await people.create({name:'Shared portrait'})).person,photo=await sourceFS.saveUpload('/',upload(f.bytes));await people.addPhotos(person.id,{urls:[photo.url]});await people.share(person.id,{recipientUserId:f.b.userId});await sourceFS.share(photo.id!,f.b.userId,'view')
+    const input=createPipelineNode('people-input','people');input.config.images=[photo.url]
+    const {run}=await saveStart(repo,graph([input,createPipelineNode('remove-background','cutout'),createPipelineNode('output','out')],[['people','cutout'],['cutout','out']]))
+    const background=createBackgroundRemovalRepository(f.db),executor=createPipelineExecutor(f.b,repo,{gateway:noGateway,runtimeConfig,background,kickBackground:async()=>{},backgroundWaitMs:0})
+    await executor.advance(run.id);await executor.advance(run.id)
+    const [job]=await background.list(f.b),[step]=await f.db.select().from(pipelineRunSteps).where(and(eq(pipelineRunSteps.runId,run.id),eq(pipelineRunSteps.nodeId,'cutout')))
+    assert.ok(job);assert.equal(step!.backgroundRemovalJobId,job.id);assert.equal(step!.status,'queued')
+    await people.revoke(person.id,f.b.userId);let inference=0,reads=0
+    const counted={...fs,getImageFile:async(...args:Parameters<typeof fs.getImageFile>)=>{reads++;return fs.getImageFile(...args)}}
+    const worker=createBackgroundRemovalRunner({repository:background,actor:async()=>f.b,storage:async()=>counted,infer:async()=>{inference++;throw new Error('Withdrawn photo must not reach inference')}})
+    await worker.kick();await worker.close()
+    assert.equal(inference,0);assert.equal(reads,0);assert.equal((await background.get(f.b,job.id)).error?.code,'SOURCE_UNAVAILABLE')
+}))
+
+test('durable People cutout publication rechecks a grant withdrawn after inference and removes only staged bytes',integration,async()=>fixture(async f=>{
+    const sourceFS=await useUserFS(f.a,f.raw,f.db),fs=await useUserFS(f.b,f.raw,f.db),people=createPeopleRepository(f.a,f.db),repo=createPipelineRepository(f.b,f.db,{storage:fs})
+    const person=(await people.create({name:'Shared portrait'})).person,photo=await sourceFS.saveUpload('/',upload(f.bytes));await people.addPhotos(person.id,{urls:[photo.url]});await people.share(person.id,{recipientUserId:f.b.userId});await sourceFS.share(photo.id!,f.b.userId,'view')
+    const input=createPipelineNode('people-input','people');input.config.images=[photo.url]
+    const {run}=await saveStart(repo,graph([input,createPipelineNode('remove-background','cutout'),createPipelineNode('output','out')],[['people','cutout'],['cutout','out']]))
+    const background=createBackgroundRemovalRepository(f.db),complete=background.complete.bind(background),imageKeys=()=>new Set([...f.objects.keys()].filter(key=>!key.endsWith('/'))),before=imageKeys();let inference=0,publication=0
+    background.complete=async(...args)=>{publication++;await people.revoke(person.id,f.b.userId);return complete(...args)}
+    const worker=createBackgroundRemovalRunner({repository:background,actor:async()=>f.b,storage:async()=>fs,infer:async value=>{inference++;return{buffer:value.buffer,mimeType:'image/png',width:24,height:16,byteSize:value.buffer.length,modelVersion:getBackgroundRemovalModel(value.model).version}}})
+    try{await drain(createPipelineExecutor(f.b,repo,{gateway:noGateway,runtimeConfig,background,kickBackground:()=>worker.kick(),backgroundWaitMs:5000}),run.id)}finally{await worker.close()}
+    const [job]=await background.list(f.b);assert.equal(inference,1);assert.equal(publication,1);assert.equal(job!.status,'failed');assert.equal(job!.outputUrl,null);assert.equal(job!.error?.code,'SOURCE_UNAVAILABLE')
+    assert.deepEqual(imageKeys(),before);assert.equal((await f.db.select().from(assets).where(eq(assets.category,'processed'))).length,0)
 }))
