@@ -12,10 +12,13 @@ defineEmits<{refresh: []}>()
       <div><span>Actual balance</span><strong>{{ balance.unlimited ? 'Unlimited' : formatBalanceUsd(balance.actualBalanceUsd) }}</strong><small>Available credit · USD</small></div>
       <div><span>Outstanding balance</span><strong>{{ formatUsd(balance.outstandingEstimateUsd) }}<span v-if="balance.outstandingUnknownCount"> + unpriced</span></strong><small>{{ balance.outstandingCount }} generation{{ balance.outstandingCount === 1 ? '' : 's' }} awaiting final cost<span v-if="balance.outstandingUnknownCount"> · {{ balance.outstandingUnknownCount }} without an estimate</span></small></div>
       <div><span>Confirmed spend</span><strong>{{ formatUsd(balance.confirmedSpendUsd) }}</strong><small>Final Gateway charges · USD</small></div>
+      <div><span>Total paid</span><strong>{{ formatUsd(balance.totalPaidUsd) }}</strong><small>Payments recorded by organization owners · USD</small></div>
+      <div><span>Unpaid bills</span><strong>{{ formatUsd(balance.unpaidUsd) }}</strong><small>Confirmed spend minus received payments · USD</small></div>
+      <div v-if="balance.overpaidUsd && balance.overpaidUsd !== '0.000000000000'"><span>Paid ahead</span><strong>{{ formatUsd(balance.overpaidUsd) }}</strong><small>Payments above confirmed spend · USD</small></div>
     </div>
     <p v-else role="status">{{ pending ? 'Loading your balance…' : 'Balance unavailable' }}</p>
     <p v-if="error" role="alert" class="account-balance-error">{{ error }}</p>
-    <p class="account-balance-note">Outstanding amounts are estimates. Images are released once the final Gateway price is confirmed. New accounts have unlimited credit unless an organization owner sets a balance.</p>
+    <p class="account-balance-note">Outstanding amounts are estimates and are separate from unpaid bills. Payments settle confirmed bills without changing generation credit. Images are released once the final Gateway price is confirmed. New accounts have unlimited credit unless an organization owner sets a balance.</p>
   </section>
 </template>
 

@@ -66,7 +66,7 @@ async function post(db: ReturnType<typeof drizzle>, row: typeof systemPrompt.$in
 
 test('each user has an exact private balance, separating estimates and unknown outstanding jobs from confirmed costs', integration, async () => fixture(async f => {
     const billing = createAccountBilling(f.db)
-    assert.deepEqual(await billing.balanceFor(f.alice), {currency: 'USD', confirmedSpendUsd: '0.000000000000', outstandingEstimateUsd: '0.000000000000', outstandingCount: 0,
+    assert.deepEqual(await billing.balanceFor(f.alice), {currency: 'USD', confirmedSpendUsd: '0.000000000000', totalPaidUsd: '0.000000000000', unpaidUsd: '0.000000000000', overpaidUsd: '0.000000000000', outstandingEstimateUsd: '0.000000000000', outstandingCount: 0,
         outstandingUnknownCount: 0, actualBalanceUsd: null, unlimited: true, generationBlockedByOutstanding: false})
     const pending = await generation(f.db, f.alice)
     const estimated = await generation(f.db, f.alice, {status: 'succeeded', billingState: 'awaiting', priceSource: 'estimate', priceUsd: '0.12', gatewayGenerationId: 'gen_local_estimate'})

@@ -316,6 +316,7 @@ test('owner balance controls preserve exact USD input, support Unlimited and dis
   const app = createSSRApp({render: () => h(component)})
   app.component('UIcon', {render: () => h('span')})
   app.component('AccountBalanceSummary', {render: () => h('div')})
+  app.component('AccountPaymentHistory', {render: () => h('div')})
   await renderToString(app)
   const member = {id: 'member', username: 'member', displayName: 'Mira', role: 'user', disabled: false, createdAt: '2026-10-13T00:00:00Z'}
   await exposed.openBalance(member)

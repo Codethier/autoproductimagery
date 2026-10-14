@@ -1,7 +1,7 @@
 import {randomUUID} from 'node:crypto'
 import {and, asc, eq, inArray, isNotNull, isNull, lte, ne, or, sql} from 'drizzle-orm'
 import {createError} from 'h3'
-import {accountBalanceAdjustments, accountGenerationCharges as charges, organizations, systemPrompt, users, type SystemPrompt} from '../db/schema'
+import {accountBalanceAdjustments, accountPayments, accountGenerationCharges as charges, organizations, systemPrompt, users, type SystemPrompt} from '../db/schema'
 import {getDatabase} from './lib/db'
 import type {AuthContext} from './accountSession'
 import type {GenerationBilling, GenerationOwner} from './useDB'
@@ -25,7 +25,9 @@ export async function recordGenerationCharge(tx: Transaction, row: ChargeRow, op
     const estimatedUnits = row.priceSource === 'estimate' && units !== undefined ? units.toString() : null
     await tx.insert(charges).values({generationId: row.id, ...actor, estimatedUnits, gatewayGenerationId: row.gatewayGenerationId}).onConflictDoNothing()
     // Different paid jobs and owner balance resets serialize on the account.
-    const [user] = await tx.select({id: users.id}).from(users).where(and(eq(users.id, row.userId), eq(users.organizationId, row.organizationId))).for('update').limit(1)
+    // Credit updates do not modify account keys. Avoid FOR UPDATE: concurrent
+    // charge inserts already hold FK KEY SHARE locks on this same account.
+    const [user] = await tx.select({id: users.id}).from(users).where(and(eq(users.id, row.userId), eq(users.organizationId, row.organizationId))).for('no key update').limit(1)
     if (!user) throw new Error('Generation charge account is unavailable')
     if (confirmed) {
         const posted = await tx.update(charges).set({state: 'confirmed', confirmedUnits: units.toString(), confirmedAt: sql`CURRENT_TIMESTAMP`,
@@ -44,7 +46,7 @@ export async function recordGenerationCharge(tx: Transaction, row: ChargeRow, op
  * are estimates and cannot provide a trustworthy upper-bound reservation. */
 export async function assertGenerationCredit(tx: Transaction, actor: GenerationOwner, batchId: string) {
     const [user] = await tx.select({creditBalanceUnits: users.creditBalanceUnits, disabledAt: users.disabledAt}).from(users)
-        .where(and(eq(users.id, actor.userId), eq(users.organizationId, actor.organizationId))).for('update').limit(1)
+        .where(and(eq(users.id, actor.userId), eq(users.organizationId, actor.organizationId))).for('no key update').limit(1)
     if (!user || user.disabledAt) throw createError({statusCode: 401, statusMessage: 'Unauthorized'})
     if (user.creditBalanceUnits === null) return
     const [existingBatch] = await tx.select({id: systemPrompt.id}).from(systemPrompt)
@@ -121,6 +123,8 @@ export function createAccountBilling(db: Database = getDatabase()) {
                   AND NOT EXISTS (SELECT 1 FROM ${charges} c WHERE c.generation_id = p.id)
             )
             SELECT summary.*, u.credit_balance_units::text AS credit,
+                   (SELECT COALESCE(SUM(p.amount_units), 0)::text FROM ${accountPayments} p
+                    WHERE p.organization_id = ${actor.organizationId}::uuid AND p.user_id = ${actor.userId}::uuid) AS paid,
                    EXISTS (SELECT 1 FROM ${charges} c JOIN ${systemPrompt} p ON p.id = c.generation_id
                            WHERE c.organization_id = ${actor.organizationId}::uuid AND c.user_id = ${actor.userId}::uuid
                              AND c.state = 'outstanding' AND p."billingState" IS NOT NULL) AS blocked
@@ -131,9 +135,12 @@ export function createAccountBilling(db: Database = getDatabase()) {
             JOIN ${users} u ON u.id = ${actor.userId}::uuid AND u.organization_id = ${actor.organizationId}::uuid`)
         // Credit and spending use one PostgreSQL statement snapshot, including
         // concurrent settlement or an owner's available-credit adjustment.
-        const total = result.rows[0] as {confirmed: string; estimated: string; outstanding: number; unknown: number; credit: string | null; blocked: boolean} | undefined
+        const total = result.rows[0] as {confirmed: string; estimated: string; outstanding: number; unknown: number; credit: string | null; blocked: boolean; paid: string} | undefined
         if (!total) throw createError({statusCode: 404, statusMessage: 'User not found'})
-        return {currency: 'USD', confirmedSpendUsd: formatUsdUnits(BigInt(total.confirmed.split('.')[0]!)),
+        const confirmedUnits = BigInt(total.confirmed.split('.')[0]!), paidUnits = BigInt(total.paid)
+        return {currency: 'USD', confirmedSpendUsd: formatUsdUnits(confirmedUnits), totalPaidUsd: formatUsdUnits(paidUnits),
+            unpaidUsd: formatUsdUnits(confirmedUnits > paidUnits ? confirmedUnits - paidUnits : 0n),
+            overpaidUsd: formatUsdUnits(paidUnits > confirmedUnits ? paidUnits - confirmedUnits : 0n),
             outstandingEstimateUsd: formatUsdUnits(BigInt(total.estimated.split('.')[0]!)), outstandingCount: total.outstanding,
             outstandingUnknownCount: total.unknown, actualBalanceUsd: total.credit === null ? null : formatUsdUnits(BigInt(total.credit)),
             unlimited: total.credit === null, generationBlockedByOutstanding: total.blocked}
@@ -142,12 +149,12 @@ export function createAccountBilling(db: Database = getDatabase()) {
     async function assertOwner(tx: Transaction, actor: AuthContext, userId: string) {
         // Use the same organization lock as role administration so an owner
         // cannot complete a balance change after a concurrent demotion.
-        await tx.select({id: organizations.id}).from(organizations).where(eq(organizations.id, actor.organizationId)).for('update').limit(1)
+        await tx.select({id: organizations.id}).from(organizations).where(eq(organizations.id, actor.organizationId)).for('no key update').limit(1)
         const [owner] = await tx.select({role: users.role, disabledAt: users.disabledAt, authVersion: users.authVersion}).from(users)
             .where(and(eq(users.id, actor.userId), eq(users.organizationId, actor.organizationId))).limit(1)
         if (!owner || owner.role !== 'owner' || owner.disabledAt || owner.authVersion !== actor.authVersion) throw createError({statusCode: 403, statusMessage: 'Organization owner access required'})
         const [target] = await tx.select({creditBalanceUnits: users.creditBalanceUnits}).from(users)
-            .where(and(eq(users.id, userId), eq(users.organizationId, actor.organizationId))).for('update').limit(1)
+            .where(and(eq(users.id, userId), eq(users.organizationId, actor.organizationId))).for('no key update').limit(1)
         if (!target) throw createError({statusCode: 404, statusMessage: 'User not found'})
         return target
     }

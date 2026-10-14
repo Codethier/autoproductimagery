@@ -376,6 +376,26 @@ export const accountBalanceAdjustments = pgTable('account_balance_adjustment', {
     createdAt: timestamp('created_at', {mode: 'string', withTimezone: true}).defaultNow().notNull(),
 }, table => [index('account_balance_adjustment_owner_idx').on(table.organizationId, table.userId, table.createdAt)]);
 
+// Immutable received-payment events. These never change generation prices or
+// remaining credit. Names are snapshots; recorded identity remains a live FK.
+export const accountPayments = pgTable('account_payment', {
+    id: uuid('id').primaryKey(),
+    organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+    userId: uuid('user_id').notNull().references(() => users.id),
+    recordedByUserId: uuid('recorded_by_user_id').notNull().references(() => users.id),
+    recordedByDisplayName: text('recorded_by_display_name').notNull(),
+    recordedByUsername: text('recorded_by_username').notNull(),
+    idempotencyKey: uuid('idempotency_key').notNull(),
+    amountUnits: numeric('amount_units', {precision: 30, scale: 0}).notNull(),
+    note: text('note').default('').notNull(),
+    createdAt: timestamp('created_at', {mode: 'string', withTimezone: true}).defaultNow().notNull(),
+}, table => [
+    uniqueIndex('account_payment_idempotency_unique').on(table.organizationId, table.userId, table.idempotencyKey),
+    index('account_payment_user_history_idx').on(table.organizationId, table.userId, table.createdAt, table.id),
+    check('account_payment_amount_check', sql`${table.amountUnits} > 0 AND ${table.amountUnits} <= 1000000000000000000 AND mod(${table.amountUnits}, 10000000000) = 0`),
+    check('account_payment_note_check', sql`length(${table.note}) <= 500`),
+]);
+
 // Shared capacity and credential-attempt accounting must survive warm-worker
 // eviction and coordinate across independently scaled serverless instances.
 export const runtimeLease = pgTable("runtime_lease", {

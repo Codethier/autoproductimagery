@@ -32,6 +32,9 @@ export const SetAccountBalanceSchema = z.object({actualBalanceUsd: UsdAmountSche
 export type AccountBalance = {
     currency: 'USD'
     confirmedSpendUsd: string
+    totalPaidUsd: string
+    unpaidUsd: string
+    overpaidUsd: string
     outstandingEstimateUsd: string
     outstandingCount: number
     outstandingUnknownCount: number
