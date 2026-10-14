@@ -10,6 +10,7 @@ import {
     GenerationQueueFullError,
     GenerationRequestTimeoutError,
     reserveGenerationBatch,
+    getGenerationRuntimeSettings,
     type GenerationRuntimeSettings,
 } from '../server/utils/generationLimiter.ts'
 import {
@@ -40,6 +41,25 @@ async function fixture() {
         },
     }
 }
+
+test('default distributed capacity admits a 50-picture batch while enforcing concurrency and rejecting excess work', { skip: !url }, async () => {
+    const {first, second, close} = await fixture()
+    try {
+        const runtime = getGenerationRuntimeSettings()
+        const firstStore = new DurableGenerationStore(first), secondStore = new DurableGenerationStore(second)
+        const owner = randomUUID(), otherOwner = randomUUID()
+        const ids = await firstStore.reserve(owner, 50, runtime)
+        assert.equal(ids.length, 50)
+        const claimed = await Promise.all(ids.slice(0, 4).map((id, index) => (index % 2 ? secondStore : firstStore).claim(owner, id, runtime)))
+        assert.equal(claimed.filter(Boolean).length, 3)
+        await assert.rejects(secondStore.reserve(otherOwner, 4, runtime), GenerationQueueFullError)
+        assert.equal(Number((await first.query('SELECT COUNT(*) AS count FROM runtime_lease')).rows[0].count), 50)
+        await firstStore.release(owner)
+        const smaller = {...runtime, maxQueue: 8}
+        await assert.rejects(secondStore.reserve(otherOwner, 50, smaller), GenerationQueueFullError)
+        assert.equal(Number((await first.query('SELECT COUNT(*) AS count FROM runtime_lease')).rows[0].count), 0)
+    } finally { await close() }
+})
 
 test('independent workers share atomic generation admission, running capacity, and stale ownership', { skip: !url }, async () => {
     const { first, second, close } = await fixture()

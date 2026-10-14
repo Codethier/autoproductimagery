@@ -1,11 +1,9 @@
 import Busboy, { type BusboyFileStream } from "@fastify/busboy"
 import type { H3Event } from "h3"
 import { createError, getHeader } from "h3"
+import {MAX_UPLOAD_FILE_BYTES, MAX_UPLOAD_FILES, MAX_UPLOAD_AGGREGATE_BYTES, MAX_UPLOAD_REQUEST_BYTES} from '../../schemas/upload-limits'
 
-export const MAX_UPLOAD_FILE_BYTES = 25 * 1024 * 1024
-export const MAX_UPLOAD_FILES = 20
-export const MAX_UPLOAD_AGGREGATE_BYTES = 100 * 1024 * 1024
-export const MAX_UPLOAD_REQUEST_BYTES = MAX_UPLOAD_AGGREGATE_BYTES + 1024 * 1024
+export {MAX_UPLOAD_FILE_BYTES, MAX_UPLOAD_FILES, MAX_UPLOAD_AGGREGATE_BYTES, MAX_UPLOAD_REQUEST_BYTES}
 export const MAX_UPLOAD_PATH_BYTES = 4096
 export const MAX_CONCURRENT_UPLOADS = 2
 export const MAX_QUEUED_UPLOADS = 4

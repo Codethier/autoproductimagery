@@ -122,6 +122,22 @@ test("streaming multipart parser rejects excess file count and per-file bytes", 
     assert.ok(MAX_UPLOAD_AGGREGATE_BYTES < 101 * 1024 * 1024)
 })
 
+test('streaming multipart accepts exactly fifty files and rejects fifty-one in chunked requests', async () => {
+    assert.equal(MAX_UPLOAD_FILES, 50)
+    const boundary = 'fifty-image-upload-boundary'
+    const imageFiles = Array.from({length: 50}, (_, index) => ({filename: `${index}.png`, type: 'image/png', data: Buffer.from(`photo-${index}`)}))
+    const body = multipartBody(boundary, imageFiles)
+    const event = multipartEvent(body, boundary, 251)
+    delete event.node.req.headers['content-length']
+    event.node.req.headers['transfer-encoding'] = 'chunked'
+    const result = await parseStreamingUpload(event)
+    assert.equal(result.files.length, 50)
+    assert.deepEqual(result.files.map(file => file.data.toString()), imageFiles.map(file => file.data.toString()))
+    const extra = multipartEvent(multipartBody(boundary, [...imageFiles, {...imageFiles[0]!, filename: 'extra.png'}]), boundary, 253)
+    delete extra.node.req.headers['content-length']
+    await assert.rejects(parseStreamingUpload(extra), (error: any) => error.statusCode === 413)
+})
+
 test("upload concurrency and queue depth are both bounded", async () => {
     const gate = new BoundedUploadGate(1, 1)
     let releaseFirst!: () => void

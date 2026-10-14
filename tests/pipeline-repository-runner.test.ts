@@ -22,10 +22,11 @@ import {createBackgroundRemovalRunner} from '../server/utils/backgroundRemovalRu
 import {getBackgroundRemovalModel} from '../schemas/background-removal-models.ts'
 import {createPipelineNode, type PipelineDefinition, type PipelineNode} from '../schemas/pipelines.ts'
 import {getImageModelProfile, createDefaultSettings, generationOutputCount} from '../schemas/image-generation.ts'
+import {PromptEnhancerConfigSchema} from '../schemas/pipeline-text-models.ts'
 import {processLocalPipelineImage} from '../server/utils/pipelineImageProcessing.ts'
 import {publicGeneration} from '../server/utils/generationVisibility.ts'
 import type {AuthContext} from '../server/utils/accountSession.ts'
-import type {useGateway} from '../server/utils/useGateway.ts'
+import type {useGateway, PipelineTextRequest} from '../server/utils/useGateway.ts'
 import type {runAccountImageGeneration} from '../server/utils/imageGenerationService.ts'
 
 const integration = {skip: !process.env.TEST_DATABASE_URL, timeout: 60_000}
@@ -202,6 +203,47 @@ test('default text utility settings persist the actual model, confirm its charge
     assert.equal(starts,1);assert.equal(done.status,'succeeded');assert.equal(done.items[0]!.steps.at(-1)!.value!.text,'A studio photograph of a red handbag')
     const rows=await f.db.select().from(systemPrompt);assert.equal(rows[0]!.generationConfig,null);assert.equal(rows[0]!.pipelineTextConfig!.model,'google/gemini-2.5-flash')
     assert.equal(await (await useDB(f.db,f.a)).countSystemPrompts(),0);assert.equal(done.summary.confirmedCostUsd,'0.012000000000')
+}))
+
+for (const model of ['zai/glm-5.3-flash', 'openai/gpt-6-luna'] as const)
+test(`the ${model} enhancer preserves immutable model, effort and actual billing when the saved graph changes`, integration, async () => fixture(async f => {
+    const fs = await useUserFS(f.a, f.raw, f.db), repo = createPipelineRepository(f.a, f.db, {storage: fs})
+    const source = await fs.saveUpload('/', upload(f.bytes))
+    const text = createPipelineNode('static-text', 'text'); text.config.text = 'A red bag with a green label'
+    const image = createPipelineNode('static-image', 'image'); image.config.images = [source.url]
+    const enhancer = createPipelineNode('prompt-enhancer', 'enhance')
+    enhancer.config = PromptEnhancerConfigSchema.parse({model, reasoningEffort: 'max', systemPrompt: 'Return only the improved prompt.',
+        prompt: 'Preserve the label text.', maxOutputTokens: 8192, ...(model === 'zai/glm-5.3-flash' ? {temperature: 0.3} : {})})
+    const definition = graph([text, image, enhancer, createPipelineNode('output', 'out')],
+        [['text', 'enhance', 'text'], ['image', 'enhance', 'image'], ['enhance', 'out']])
+    const {pipeline, run} = await saveStart(repo, definition)
+    const updated = structuredClone(definition), replacement = updated.nodes.find(value => value.id === 'enhance')!
+    if (replacement.type === 'prompt-enhancer') replacement.config = PromptEnhancerConfigSchema.parse({model: 'google/gemini-2.5-flash'})
+    await repo.update(pipeline.id, {revision: pipeline.revision, name: pipeline.name, description: '', definition: updated})
+    let captured: PipelineTextRequest | undefined, starts = 0
+    const gateway = {async getGenerationBilling() {return undefined},
+        async generatePipelineText(request: PipelineTextRequest, _signal: AbortSignal, start: () => Promise<void>) {
+            captured = request; await start(); starts++
+            return {text: 'A studio photograph of the red bag with a crisp green label.', warnings: [], billing: {
+                model, priceSource: 'gateway', priceUsd: '0.034567890123', gatewayGenerationId: 'gen_enhancer_snapshot',
+                reasoningTokens: 6, usageJson: {gatewayBilling: {isByok: false}},
+            }}
+        }} as unknown as Awaited<ReturnType<typeof useGateway>>
+    const done = await drain(createPipelineExecutor(f.a, repo, {gateway, runtimeConfig, coordinationPool: f.pool}), run.id)
+    assert.equal(starts, 1); assert.equal(done.status, 'succeeded')
+    assert.equal(captured!.model, model); assert.equal(captured!.reasoningEffort, 'max')
+    assert.equal(captured!.maxOutputTokens, 8192); assert.equal(captured!.system, 'Return only the improved prompt.')
+    assert.deepEqual(captured!.imageUrls, [source.url])
+    assert.equal(captured!.temperature, model === 'zai/glm-5.3-flash' ? 0.3 : undefined)
+    assert.equal(done.definition.nodes.find(value => value.id === 'enhance')!.config.model, model)
+    const rows = await f.db.select().from(systemPrompt), stored = rows[0]!.pipelineTextConfig!
+    assert.equal(stored.model, model); assert.equal('reasoningEffort' in stored && stored.reasoningEffort, 'max')
+    assert.equal(stored.maxOutputTokens, 8192); assert.deepEqual(stored.imageUrls, [source.url])
+    assert.equal(stored.temperature, model === 'zai/glm-5.3-flash' ? 0.3 : undefined)
+    assert.equal(rows[0]!.generationModel, model); assert.equal(rows[0]!.reasoningTokens, 6)
+    assert.equal(rows[0]!.generationConfig, null)
+    assert.equal(done.summary.confirmedCostUsd, '0.034567890123')
+    assert.equal(await (await useDB(f.db, f.a)).countSystemPrompts(), 0)
 }))
 
 test('cancellation during local work prevents publication and deletes only the staged object',integration,async()=>fixture(async f=>{

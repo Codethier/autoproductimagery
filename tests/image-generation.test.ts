@@ -33,6 +33,29 @@ test('every curated model has defaults that validate against its own profile', (
   }
 })
 
+test('fifty independent product inputs are accepted while per-job references and total outputs stay bounded', () => {
+  const model = 'openai/gpt-image-2.5-sunburst', settings = createDefaultSettings(model)
+  const images = Array.from({length: 51}, (_, index) => `/images/product-${index}.png`)
+  const request = {prompt: 'Preserve the product', model, settings, inputImages: images.slice(0, 50)}
+  assert.equal(ImageGenerationRequestSchema.safeParse(request).success, true)
+  assert.equal(ImageGenerationRequestSchema.safeParse({...request, inputImages: images}).success, false)
+  assert.equal(ImageGenerationRequestSchema.safeParse({...request, modelImages: images.slice(0, 15)}).success, true)
+  assert.equal(ImageGenerationRequestSchema.safeParse({...request, modelImages: images.slice(0, 16)}).success, false)
+  assert.ok('numberOfImages' in settings); settings.numberOfImages = 2
+  assert.equal(ImageGenerationRequestSchema.safeParse({...request, inputImages: images.slice(0, 25)}).success, true)
+  const overflow = ImageGenerationRequestSchema.safeParse({...request, inputImages: images.slice(0, 26)})
+  assert.equal(overflow.success, false)
+  if (!overflow.success) assert.ok(overflow.error.issues.some(issue => issue.message.includes('at most 50 output images')))
+})
+
+test('every masked profile declares its edit-region semantics explicitly', () => {
+  for (const id of SUPPORTED_IMAGE_MODEL_IDS) {
+    const profile = IMAGE_MODEL_PROFILES[id]
+    if (profile.supportsMask) assert.equal(profile.maskMode, id === 'bfl/flux-pro-1.0-fill' ? 'luminance' : 'alpha', id)
+    else assert.equal(profile.maskMode, undefined, id)
+  }
+})
+
 test('settings cannot be reused across model families', () => {
   const parsed = ImageGenerationRequestSchema.safeParse({
     prompt: 'Create a product photograph',

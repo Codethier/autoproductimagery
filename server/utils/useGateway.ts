@@ -23,6 +23,7 @@ import { toBufferView } from './imageBuffer'
 import {extractConfirmedGatewayPrice} from '../../schemas/generation-billing'
 import {createBillingMetadataFetch} from './billingMetadataFetch'
 import {extractGatewayErrorGenerationId} from './billingGatewayError'
+import {LEGACY_PIPELINE_TEXT_MODEL_ID, PipelineTextModelIdSchema, PromptEnhancerConfigSchema, pipelineTextProviderOptions} from '../../schemas/pipeline-text-models'
 
 // Supported model types reported by the gateway /config endpoint.
 export type GatewayModelType = 'language' | 'image' | 'embedding' | 'reranking' | 'video'
@@ -105,17 +106,29 @@ export type GeneratedImage = {
 
 export type ProviderCallStarted = () => void | Promise<void>
 
-// Utility nodes do not expand the curated image-generator catalogue. This
-// exact language model accepts text and validated images and returns text.
-export const PIPELINE_TEXT_MODEL_ID = 'google/gemini-2.5-flash' as const
+// Utility nodes use a separate exact-ID language-model allowlist. They accept
+// text and validated images and return text, without expanding image generators.
+export const PIPELINE_TEXT_MODEL_ID = LEGACY_PIPELINE_TEXT_MODEL_ID
 const PipelineTextRequestSchema = z.object({
-    model: z.literal(PIPELINE_TEXT_MODEL_ID),
+    model: PipelineTextModelIdSchema,
     prompt: z.string().trim().min(1).max(20_000),
     system: z.string().trim().min(1).max(20_000).optional(),
     imageUrls: z.array(ImagePathSchema).max(8).default([]),
-    maxOutputTokens: z.number().int().min(64).max(4096).default(1024),
-    temperature: z.number().min(0).max(2).default(0.5),
-}).strict()
+    maxOutputTokens: z.number().int().min(64).max(16384).optional(),
+    temperature: z.number().min(0).max(2).optional(),
+    reasoningEffort: z.enum(['none', 'low', 'medium', 'high', 'xhigh', 'max']).optional(),
+}).strict().transform((request, context) => {
+    const parsed = PromptEnhancerConfigSchema.safeParse({model: request.model,
+        ...(request.temperature === undefined ? {} : {temperature: request.temperature}),
+        ...(request.maxOutputTokens === undefined ? {} : {maxOutputTokens: request.maxOutputTokens}),
+        ...(request.reasoningEffort === undefined ? {} : {reasoningEffort: request.reasoningEffort})})
+    if (!parsed.success) {
+        for (const issue of parsed.error.issues) context.addIssue({...issue, code: 'custom'})
+        return z.NEVER
+    }
+    return {...parsed.data, prompt: request.prompt, imageUrls: request.imageUrls,
+        ...(request.system ? {system: request.system} : {})}
+})
 export type PipelineTextRequest = z.input<typeof PipelineTextRequestSchema>
 export type PipelineGeneratedText = {text: string; billing: ImageGenerationBilling; warnings: string[]}
 
@@ -1136,14 +1149,14 @@ export async function useGateway(imageStorage?: GenerationImageStorage) {
         if (request.imageUrls.length) await fs.assertReadableImages?.([...new Set(request.imageUrls)])
         abortSignal.throwIfAborted()
         const callGateway = () => generateText({
-            model: gateway.languageModel(PIPELINE_TEXT_MODEL_ID),
+            model: gateway.languageModel(request.model),
             maxRetries: 0,
             abortSignal,
             timeout: {totalMs: timeoutMs},
             maxOutputTokens: request.maxOutputTokens,
-            temperature: request.temperature,
+            ...(request.temperature === undefined ? {} : {temperature: request.temperature}),
             ...(request.system ? {system: request.system} : {}),
-            providerOptions: {google: {thinkingConfig: {thinkingBudget: 0}, responseModalities: ['TEXT']}},
+            providerOptions: pipelineTextProviderOptions(request),
             ...(files.length ? {messages: [{role: 'user' as const, content: [
                 {type: 'text' as const, text: request.prompt},
                 ...files.map(file => ({type: 'file' as const, data: file.buffer, mediaType: file.mediaType})),
@@ -1162,7 +1175,7 @@ export async function useGateway(imageStorage?: GenerationImageStorage) {
             // Stop retaining references when the provider has consumed its input.
             for (const file of files) file.buffer = Buffer.alloc(0)
         }
-        const billing = await buildBilling(PIPELINE_TEXT_MODEL_ID, response.totalUsage, response.providerMetadata, 0)
+        const billing = await buildBilling(request.model, response.totalUsage, response.providerMetadata, 0)
         const text = response.text.trim()
         if (!text || text.length > 20_000 || response.files.length) {
             throwGatewayError('Gateway pipeline text request returned an invalid result',

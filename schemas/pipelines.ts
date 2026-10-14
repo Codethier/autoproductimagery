@@ -1,4 +1,5 @@
 import { z } from "zod";
+import {LegacyPipelineTextConfigSchema, PromptEnhancerConfigSchema} from "./pipeline-text-models";
 import {
   ImageModelIdSchema,
   ImageGenerationSettingsSchema,
@@ -85,17 +86,7 @@ const generationConfig = z
   })
   .strict();
 const localPosition = z.enum(["centre", "north", "south", "east", "west"]);
-const utilityConfig = z
-  .object({
-    model: z
-      .literal("google/gemini-2.5-flash")
-      .default("google/gemini-2.5-flash"),
-    systemPrompt: text.default(""),
-    prompt: text.default(""),
-    temperature: z.number().min(0).max(2).default(0.5),
-    maxOutputTokens: z.number().int().min(64).max(4096).default(1024),
-  })
-  .strict();
+const utilityConfig = LegacyPipelineTextConfigSchema;
 const base = {
   id: NodeId,
   label: z.string().trim().min(1).max(100),
@@ -226,7 +217,7 @@ export const PipelineNodeSchema = z.discriminatedUnion("type", [
       .strict(),
   ),
   node("describe-image", utilityConfig),
-  node("prompt-enhancer", utilityConfig),
+  node("prompt-enhancer", PromptEnhancerConfigSchema),
   node("llm", utilityConfig),
   node(
     "prompt-concatenator",

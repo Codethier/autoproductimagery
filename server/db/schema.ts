@@ -7,6 +7,7 @@ import type {
 } from "~~/schemas/image-generation";
 import type {BackgroundRemovalModel, BackgroundRemovalStatus, BackgroundRemovalError} from '../../schemas/background-removal';
 import type {PipelineDefinition, PipelineValue} from '../../schemas/pipelines';
+import type {StoredPipelineTextConfig} from '../../schemas/pipeline-text-models';
 
 export const organizations = pgTable('organization', {
     id: uuid('id').primaryKey(),
@@ -267,7 +268,7 @@ export const systemPrompt = pgTable("systemPrompt", {
     userId: uuid('userId').references(() => users.id),
     personId: uuid('personId').references(() => people.id, {onDelete: 'set null'}),
     pipelineStepId: uuid('pipelineStepId').references(() => pipelineRunSteps.id, {onDelete: 'set null'}),
-    pipelineTextConfig: jsonb('pipelineTextConfig').$type<{model: 'google/gemini-2.5-flash'; prompt: string; systemPrompt: string; temperature: number; maxOutputTokens: number; imageUrls: string[]}>(),
+    pipelineTextConfig: jsonb('pipelineTextConfig').$type<StoredPipelineTextConfig>(),
     TextPrompt: text("TextPrompt").notNull(),
     serverImages: jsonb("serverImages").$type<string[]>(),
     modelImages: jsonb("modelImages").$type<string[]>(),

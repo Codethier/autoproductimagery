@@ -197,7 +197,7 @@ export function createPipelineExecutor(actor: PipelineActor, repository = create
         let row: Awaited<ReturnType<typeof database.createPendingGeneration>> | undefined, providerStarted = false
         let providerBilling: GenerationBilling | undefined
         const startedAt = Date.now()
-        const pipelineTextConfig = {model: node.config.model, prompt, systemPrompt: node.config.systemPrompt, temperature: node.config.temperature, maxOutputTokens: node.config.maxOutputTokens, imageUrls}
+        const pipelineTextConfig = {...node.config, prompt, imageUrls}
         const logBase = {batchId, attemptNumber: claim.step.attempt, model: node.config.model, prompt, inputImages: imageUrls, modelImages: [],
             requestJson: pipelineTextConfig, resolvedConfigJson: null}
         try {
@@ -208,7 +208,9 @@ export function createPipelineExecutor(actor: PipelineActor, repository = create
                 signal.throwIfAborted()
                 const combined = AbortSignal.any([signal, requestSignal])
                 const generated = await (await gateway(storage)).generatePipelineText({model: node.config.model, prompt, system: node.config.systemPrompt.trim() || undefined,
-                    temperature: node.config.temperature, maxOutputTokens: node.config.maxOutputTokens, imageUrls}, combined, async () => {
+                    ...(node.config.temperature === undefined ? {} : {temperature: node.config.temperature}),
+                    ...('reasoningEffort' in node.config ? {reasoningEffort: node.config.reasoningEffort} : {}),
+                    maxOutputTokens: node.config.maxOutputTokens, imageUrls}, combined, async () => {
                     await reauthorize(claim, storage, inputs)
                     await repository.providerStarted(claim.step.id, claim.token, batchId)
                     combined.throwIfAborted(); providerStarted = true
