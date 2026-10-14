@@ -125,7 +125,7 @@ function fmtPerMillion(perTokenUsd?: string) {
   return v < 1 ? `$${v.toFixed(3)}` : `$${v.toFixed(2)}`
 }
 
-type ModelOption = { label: string; value: ImageModelId; icon: string; disabled: boolean; isNew: boolean; isFavourite: boolean }
+type ModelOption = { label: string; value: ImageModelId; icon: string; disabled: boolean; isNew: boolean; isFavourite: boolean; supportsTransparentBackground: boolean }
 const modelOptions = computed<ModelOption[]>(() => orderImageModels(SUPPORTED_IMAGE_MODEL_IDS, favouriteModelIds.value).map((id) => {
   const item = modelsFetch.data.value?.items.find(model => model.id === id)
   const profile = item?.profile ?? IMAGE_MODEL_PROFILES[id]
@@ -142,6 +142,7 @@ const modelOptions = computed<ModelOption[]>(() => orderImageModels(SUPPORTED_IM
     disabled: !usable,
     isNew: isNewImageModel(id),
     isFavourite: favouriteSet.value.has(id),
+    supportsTransparentBackground: profile.supportsTransparentBackground,
   }
 }))
 
@@ -804,13 +805,14 @@ async function submit() {
             <div class="studio-model-row">
               <USelect id="image-model-select" v-model="selectedModelValue" :items="modelOptions" placeholder="Select model" class="min-w-0 flex-1" :content="{ align: 'end', sideOffset: 6 }" :ui="{ content: 'min-w-[min(560px,calc(100vw-2rem))]' }">
                 <template #item-leading="{ item }"><UIcon :name="item.isFavourite ? 'i-lucide-heart' : item.icon" class="size-4 shrink-0" :class="{ 'text-rose-400': item.isFavourite }" /></template>
-                <template #item-trailing="{ item }"><span v-if="item.isFavourite" class="sr-only">Favourite</span><UBadge v-if="item.isNew" size="xs" color="primary" variant="subtle">New</UBadge></template>
+                <template #item-trailing="{ item }"><span v-if="item.isFavourite" class="sr-only">Favourite</span><span class="studio-model-tags"><UBadge v-if="item.supportsTransparentBackground" class="model-transparent-badge" size="xs" color="neutral" variant="subtle" title="Supports transparent image output; enable it in model settings." aria-label="Supports transparent image output">Transparent</UBadge><UBadge v-if="item.isNew" size="xs" color="primary" variant="subtle">New</UBadge></span></template>
               </USelect>
               <UButton type="button" variant="ghost" :color="selectedIsFavourite ? 'error' : 'neutral'" :disabled="!favouritesReady" :aria-pressed="selectedIsFavourite" :aria-label="`${selectedIsFavourite ? 'Remove' : 'Add'} ${selectedProfile.shortName} ${selectedIsFavourite ? 'from' : 'to'} favourites`" @click="toggleFavourite(data.selectedModel)">
                 <svg aria-hidden="true" viewBox="0 0 24 24" class="size-4" :fill="selectedIsFavourite ? 'currentColor' : 'none'" stroke="currentColor" stroke-width="2"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78L12 21.23l8.84-8.84a5.5 5.5 0 0 0 0-7.78Z" /></svg>
               </UButton>
             </div>
-            <div class="studio-model-meta"><UBadge v-if="isNewImageModel(data.selectedModel)" size="xs" color="primary" variant="subtle">New</UBadge><span v-if="selectedProfile.lifecycle === 'recommended'">Recommended</span><span v-if="selectedIsFavourite">Favourite</span></div>
+            <div class="studio-model-meta"><UBadge v-if="selectedProfile.supportsTransparentBackground" class="model-transparent-badge" size="xs" color="neutral" variant="subtle" title="Supports transparent image output; enable it in model settings." aria-label="Supports transparent image output">Transparent</UBadge><UBadge v-if="isNewImageModel(data.selectedModel)" size="xs" color="primary" variant="subtle">New</UBadge><span v-if="selectedProfile.lifecycle === 'recommended'">Recommended</span><span v-if="selectedIsFavourite">Favourite</span></div>
+            <p v-if="selectedProfile.supportsTransparentBackground" class="studio-help">For a transparent image, choose Background → Transparent in Model settings and use PNG or WebP.</p>
             <p v-if="!favouritesPersistent" role="status" class="studio-notice">Browser storage is unavailable. Favourites last for this visit.</p>
           </div>
           <details class="studio-settings">
@@ -954,7 +956,8 @@ async function submit() {
 .studio-control-group { margin-bottom: 20px; }
 .studio-control-group label, .studio-prompt-composer > label { display: block; font-size: 12px; font-weight: 500; margin-bottom: 9px; color: #e2d8c9; }
 .studio-model-row { display: flex; align-items: center; gap: 3px; }
-.studio-model-meta { display: flex; gap: 8px; margin-top: 7px; color: var(--workspace-muted); font-size: 10px; align-items: center; }
+.studio-model-meta { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 7px; color: var(--workspace-muted); font-size: 10px; align-items: center; }
+.studio-model-tags { display: inline-flex; align-items: center; gap: 6px; }
 .studio-optional { color: #8c8273; margin-left: 4px; font-weight: 400; font-size: 11px; }
 .studio-settings { border-top: 1px solid var(--workspace-border); border-bottom: 1px solid var(--workspace-border); margin-bottom: 20px; }
 .studio-settings summary, .studio-model-details summary { display: flex; justify-content: space-between; align-items: center; padding: 14px 0; cursor: pointer; font-size: 12px; list-style: none; color: #c7bcaa; }

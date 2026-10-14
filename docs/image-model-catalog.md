@@ -42,6 +42,23 @@ OpenAI and Grok allow 1–10 outputs per product, subject to the application's 5
 
 Sources: [OpenAI image guide](https://developers.openai.com/api/docs/guides/image-generation), [Google image generation](https://ai.google.dev/gemini-api/docs/image-generation), [AI SDK Black Forest Labs](https://ai-sdk.dev/providers/ai-sdk-providers/black-forest-labs), [BFL live OpenAPI schemas](https://api.bfl.ai/openapi.json), [FLUX.2 reference limits](https://docs.bfl.ai/flux_2/flux2_overview), [FLUX Ultra image prompting](https://docs.bfl.ai/flux_models/flux_1_1_pro_ultra_raw), [AI SDK ByteDance](https://ai-sdk.dev/providers/ai-sdk-providers/bytedance), [AI SDK xAI](https://ai-sdk.dev/providers/ai-sdk-providers/xai), [Grok multi-image editing](https://docs.x.ai/developers/model-capabilities/images/multi-image-editing), and [Muse's Gateway reference-image controls](https://vercel.com/ai-gateway/models/muse-image-1.0).
 
+## Transparent-background capability
+
+Checked October 14, 2026 against the current [OpenAI image reference](https://developers.openai.com/api/reference/cli/resources/images/methods/generate) and the application's exact-ID settings and Gateway adapters. Every profile and native catalog definition must explicitly declare `supportsTransparentBackground`. The visible **Transparent** tag describes available alpha-channel output through this application; it does not enable the background setting automatically and is independent of favourites, lifecycle, and the latest model-addition pass.
+
+| Profile | Capability in this application |
+| --- | --- |
+| `openai/gpt-image-2.5-sunburst` | Transparent PNG/WebP through `background: transparent` |
+| `openai/gpt-image-2.5-flare` | Transparent PNG/WebP through `background: transparent` |
+| `openai/gpt-image-1.5` | Transparent PNG/WebP through `background: transparent` |
+| `openai/gpt-image-1` | Transparent PNG/WebP through `background: transparent` |
+| `openai/gpt-image-1-mini` | Transparent PNG/WebP through `background: transparent` |
+| `openai/gpt-image-2` | Untagged: this integration permits only auto/opaque backgrounds. Official OpenAI documentation now describes transparency as preview support; verify and integrate that capability end to end before enabling it here. |
+| All current Gemini, FLUX, Seedream, Muse, and Grok profiles | Untagged: no verified alpha-output control implemented in this application's Gateway route. PNG output and background-editing prompts do not establish transparency support. |
+| `birefnet-lite`, `birefnet` | Transparent PNG from the dedicated local cutout processor; these are separate from Gateway image generators. |
+
+The OpenAI settings schema rejects transparent JPEG requests and the Gateway adapter forwards the normalized background and output format. Local BiRefNet processing modifies alpha while preserving source RGB pixels and validates decoded PNG dimensions and its alpha channel. Processor sources: [BiRefNet](https://github.com/ZhengPeng7/BiRefNet) and [rembg](https://github.com/danielgatis/rembg).
+
 ## Aliases and exclusions
 
 `google/gemini-3.1-flash-image-preview` is an existing alias for `google/gemini-3.1-flash-image`; it does not need a duplicate selector entry. Earlier 2.5 Flash and 3 Pro preview aliases remain supported for stored history as well.
@@ -64,3 +81,5 @@ The Recraft exclusions describe the verified Gateway integration, not every capa
 ## Next refresh
 
 “Add new models” means repeat this audit across the entire live catalog, update these decisions, and integrate each eligible missing model end to end. Profiles are in `schemas/image-generation.ts`; the additional native-provider schemas and controls are in `schemas/catalog-image-models.ts`. Use exact IDs and strict settings; never infer editing support from a model name or description. Do not enable a model with an unverified reference-image path. Routine verification uses mocked Gateway HTTP calls and never purchases generations.
+
+Every addition or refresh must also audit alpha-channel output, declare the explicit transparency capability, maintain the **Transparent** tags across selectors, and update capability/settings/UI regression coverage. Leave unverified or unavailable integration capabilities untagged until they are implemented and verified.

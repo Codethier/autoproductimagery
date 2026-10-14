@@ -154,6 +154,7 @@ type CatalogImageDefinition = {
   provider: 'bfl' | 'bytedance' | 'meta' | 'spacexai'
   maxReferenceImages: number
   requiresMask: boolean
+  supportsTransparentBackground: boolean
   referenceMode: 'images' | 'image-prompt'
   warnings: readonly string[]
   controls: readonly CatalogImageControl[]
@@ -163,103 +164,103 @@ const seedControl: CatalogImageControl = {key: 'seed', label: 'Seed', type: 'num
 export const CATALOG_IMAGE_DEFINITIONS: Record<CatalogImageModelId, CatalogImageDefinition> = {
   'bfl/flux-2-flex': {
     name: 'FLUX.2 Flex', provider: 'bfl', maxReferenceImages: 8,
-    requiresMask: false, referenceMode: 'images',
+    requiresMask: false, supportsTransparentBackground: false, referenceMode: 'images',
     warnings: ["Reference inputs are image files only; use PNG or JPEG.","Edits are described in the prompt. A separate mask is not supported."],
     controls: [{key: 'size', label: 'Output size', type: 'select', options: FLUX_SIZES, optional: true}, formatControl, seedControl],
   },
   'bfl/flux-2-klein-4b': {
     name: 'FLUX.2 Klein 4B', provider: 'bfl', maxReferenceImages: 4,
-    requiresMask: false, referenceMode: 'images',
+    requiresMask: false, supportsTransparentBackground: false, referenceMode: 'images',
     warnings: ["Reference inputs are image files only; use PNG or JPEG.","Edits are described in the prompt. A separate mask is not supported."],
     controls: [{key: 'size', label: 'Output size', type: 'select', options: FLUX_SIZES, optional: true}, formatControl, seedControl],
   },
   'bfl/flux-2-klein-9b': {
     name: 'FLUX.2 Klein 9B', provider: 'bfl', maxReferenceImages: 4,
-    requiresMask: false, referenceMode: 'images',
+    requiresMask: false, supportsTransparentBackground: false, referenceMode: 'images',
     warnings: ["Reference inputs are image files only; use PNG or JPEG.","Edits are described in the prompt. A separate mask is not supported."],
     controls: [{key: 'size', label: 'Output size', type: 'select', options: FLUX_SIZES, optional: true}, formatControl, seedControl],
   },
   'bfl/flux-2-max': {
     name: 'FLUX.2 Max', provider: 'bfl', maxReferenceImages: 8,
-    requiresMask: false, referenceMode: 'images',
+    requiresMask: false, supportsTransparentBackground: false, referenceMode: 'images',
     warnings: ["Reference inputs are image files only; use PNG or JPEG.","Edits are described in the prompt. A separate mask is not supported."],
     controls: [{key: 'size', label: 'Output size', type: 'select', options: FLUX_SIZES, optional: true}, formatControl, seedControl],
   },
   'bfl/flux-2-pro': {
     name: 'FLUX.2 Pro', provider: 'bfl', maxReferenceImages: 8,
-    requiresMask: false, referenceMode: 'images',
+    requiresMask: false, supportsTransparentBackground: false, referenceMode: 'images',
     warnings: ["Reference inputs are image files only; use PNG or JPEG.","Edits are described in the prompt. A separate mask is not supported."],
     controls: [{key: 'size', label: 'Output size', type: 'select', options: FLUX_SIZES, optional: true}, formatControl, seedControl],
   },
   'bfl/flux-kontext-max': {
     name: 'FLUX Kontext Max', provider: 'bfl', maxReferenceImages: 1,
-    requiresMask: false, referenceMode: 'images',
+    requiresMask: false, supportsTransparentBackground: false, referenceMode: 'images',
     warnings: ["Reference inputs are image files only; use PNG or JPEG.","Edits are described in the prompt. A separate mask is not supported."],
     controls: [{key: 'aspectRatio', label: 'Aspect ratio', type: 'select', options: FLUX_RATIOS, optional: true}, formatControl, seedControl],
   },
   'bfl/flux-kontext-pro': {
     name: 'FLUX Kontext Pro', provider: 'bfl', maxReferenceImages: 1,
-    requiresMask: false, referenceMode: 'images',
+    requiresMask: false, supportsTransparentBackground: false, referenceMode: 'images',
     warnings: ["Reference inputs are image files only; use PNG or JPEG.","Edits are described in the prompt. A separate mask is not supported."],
     controls: [{key: 'aspectRatio', label: 'Aspect ratio', type: 'select', options: FLUX_RATIOS, optional: true}, formatControl, seedControl],
   },
   'bfl/flux-pro-1.0-fill': {
     name: 'FLUX Fill Pro', provider: 'bfl', maxReferenceImages: 1,
-    requiresMask: true, referenceMode: 'images',
+    requiresMask: true, supportsTransparentBackground: false, referenceMode: 'images',
     warnings: ["Reference inputs are image files only; use PNG or JPEG.","Requires a source and a same-size PNG mask. White areas are replaced; black areas are preserved."],
     controls: [formatControl, seedControl],
   },
   'bfl/flux-pro-1.1': {
     name: 'FLUX 1.1 Pro', provider: 'bfl', maxReferenceImages: 1,
-    requiresMask: false, referenceMode: 'image-prompt',
+    requiresMask: false, supportsTransparentBackground: false, referenceMode: 'image-prompt',
     warnings: ["Reference inputs are image files only; use PNG or JPEG.","Uses the picture as visual guidance; use FLUX Kontext or FLUX.2 for targeted edits."],
     controls: [{key: 'size', label: 'Output size', type: 'select', options: FLUX_11_SIZES, optional: true}, formatControl, seedControl],
   },
   'bfl/flux-pro-1.1-ultra': {
     name: 'FLUX 1.1 Pro Ultra', provider: 'bfl', maxReferenceImages: 1,
-    requiresMask: false, referenceMode: 'image-prompt',
+    requiresMask: false, supportsTransparentBackground: false, referenceMode: 'image-prompt',
     warnings: ["Reference inputs are image files only; use PNG or JPEG.","Uses the picture as visual guidance; use FLUX Kontext or FLUX.2 for targeted edits."],
     controls: [{key: 'aspectRatio', label: 'Aspect ratio', type: 'select', options: FLUX_RATIOS, optional: true}, formatControl, seedControl, {key: 'imagePromptStrength', label: 'Reference influence', type: 'number', min: 0, max: 1, step: 0.05}],
   },
   'bytedance/seedream-4.0': {
     name: 'Seedream 4.0', provider: 'bytedance', maxReferenceImages: 14,
-    requiresMask: false, referenceMode: 'images',
+    requiresMask: false, supportsTransparentBackground: false, referenceMode: 'images',
     warnings: ["Reference inputs are image files only; use PNG or JPEG.","Edits are described in the prompt. A separate mask is not supported."],
     controls: [{key: 'resolution', label: 'Resolution', type: 'select', options: ["1K","2K","4K"]}, {key: 'outputFormat', label: 'Output format', type: 'select', options: ["jpeg"]}, {key: 'watermark', label: 'AI-generated watermark', type: 'checkbox'}],
   },
   'bytedance/seedream-4.5': {
     name: 'Seedream 4.5', provider: 'bytedance', maxReferenceImages: 14,
-    requiresMask: false, referenceMode: 'images',
+    requiresMask: false, supportsTransparentBackground: false, referenceMode: 'images',
     warnings: ["Reference inputs are image files only; use PNG or JPEG.","Edits are described in the prompt. A separate mask is not supported."],
     controls: [{key: 'resolution', label: 'Resolution', type: 'select', options: ["2K","4K"]}, {key: 'outputFormat', label: 'Output format', type: 'select', options: ["jpeg"]}, {key: 'watermark', label: 'AI-generated watermark', type: 'checkbox'}],
   },
   'bytedance/seedream-5.0-lite': {
     name: 'Seedream 5.0 Lite', provider: 'bytedance', maxReferenceImages: 14,
-    requiresMask: false, referenceMode: 'images',
+    requiresMask: false, supportsTransparentBackground: false, referenceMode: 'images',
     warnings: ["Reference inputs are image files only; use PNG or JPEG.","Edits are described in the prompt. A separate mask is not supported."],
     controls: [{key: 'resolution', label: 'Resolution', type: 'select', options: ["2K","3K","4K"]}, {key: 'outputFormat', label: 'Output format', type: 'select', options: ["png","jpeg"]}, {key: 'watermark', label: 'AI-generated watermark', type: 'checkbox'}],
   },
   'bytedance/seedream-5.0-pro': {
     name: 'Seedream 5.0 Pro', provider: 'bytedance', maxReferenceImages: 10,
-    requiresMask: false, referenceMode: 'images',
+    requiresMask: false, supportsTransparentBackground: false, referenceMode: 'images',
     warnings: ["Reference inputs are image files only; use PNG or JPEG.","Edits are described in the prompt. A separate mask is not supported."],
     controls: [{key: 'resolution', label: 'Resolution', type: 'select', options: ["1K","2K"]}, {key: 'outputFormat', label: 'Output format', type: 'select', options: ["png","jpeg"]}, {key: 'watermark', label: 'AI-generated watermark', type: 'checkbox'}],
   },
   'meta/muse-image-1.0': {
     name: 'Muse Image 1.0', provider: 'meta', maxReferenceImages: 4,
-    requiresMask: false, referenceMode: 'images',
+    requiresMask: false, supportsTransparentBackground: false, referenceMode: 'images',
     warnings: ["Reference inputs are image files only; use PNG or JPEG.","Output dimensions are chosen by the model. One output per product."],
     controls: [],
   },
   'spacexai/grok-imagine-image': {
     name: 'Grok Imagine Image', provider: 'spacexai', maxReferenceImages: 3,
-    requiresMask: false, referenceMode: 'images',
+    requiresMask: false, supportsTransparentBackground: false, referenceMode: 'images',
     warnings: ["Reference inputs are image files only; use PNG or JPEG.","Edits are described in the prompt. A separate mask is not supported."],
     controls: [{key: 'aspectRatio', label: 'Aspect ratio', type: 'select', options: GROK_RATIOS, optional: true}, {key: 'numberOfImages', label: 'Images per product', type: 'number', min: 1, max: 10, step: 1}],
   },
   'spacexai/grok-imagine-image-2.0': {
     name: 'Grok Imagine Image 2.0', provider: 'spacexai', maxReferenceImages: 5,
-    requiresMask: false, referenceMode: 'images',
+    requiresMask: false, supportsTransparentBackground: false, referenceMode: 'images',
     warnings: ["Reference inputs are image files only; use PNG or JPEG.","Edits are described in the prompt. A separate mask is not supported."],
     controls: [{key: 'aspectRatio', label: 'Aspect ratio', type: 'select', options: GROK_RATIOS, optional: true}, {key: 'numberOfImages', label: 'Images per product', type: 'number', min: 1, max: 10, step: 1}, {key: 'resolution', label: 'Resolution', type: 'select', options: ['1k', '2k']}],
   },

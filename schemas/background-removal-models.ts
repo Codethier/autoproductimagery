@@ -3,6 +3,7 @@ export const BACKGROUND_REMOVAL_MODELS = [
     {
         id: 'birefnet-lite',
         label: 'BiRefNet Lite',
+        supportsTransparentBackground: true,
         description: 'Faster CPU cutouts for product photos and clothing.',
         version: 'rembg-birefnet-general-lite-232',
         filename: 'birefnet-lite.onnx',
@@ -17,6 +18,7 @@ export const BACKGROUND_REMOVAL_MODELS = [
     {
         id: 'birefnet',
         label: 'BiRefNet (Full)',
+        supportsTransparentBackground: true,
         description: 'More detail for complex edges; slower and uses more memory.',
         version: 'rembg-birefnet-general-244',
         filename: 'birefnet.onnx',

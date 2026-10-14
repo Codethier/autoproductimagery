@@ -440,6 +440,7 @@ watch(
                 {{ favouriteSet.has(item.id) ? "♥ " : ""
                 }}{{ item.profile.shortName
                 }}{{ isNewImageModel(item.id) ? " · New" : ""
+                }}{{ item.profile.supportsTransparentBackground ? " · Transparent" : ""
                 }}{{ !item.available ? " · unavailable" : "" }}
               </option></select
             ><button
@@ -461,8 +462,11 @@ watch(
           </p>
           <details class="pipeline-model-settings">
             <summary>
-              Model settings <small v-if="isNewImageModel(ai.model)">New</small>
+              Model settings
+              <small v-if="imageProfile.supportsTransparentBackground" class="pipeline-transparency-badge model-transparent-badge" title="Supports transparent image output; enable it in model settings." aria-label="Supports transparent image output">Transparent</small>
+              <small v-if="isNewImageModel(ai.model)">New</small>
             </summary>
+            <p v-if="imageProfile.supportsTransparentBackground" class="pipeline-help pipeline-transparency-help">For a transparent image, choose Background → Transparent and use PNG or WebP.</p>
             <NuxtErrorBoundary :key="ai.model"
               ><component
                 :is="settingsComponent"
@@ -567,7 +571,7 @@ watch(
               :key="profile.id"
               :value="profile.id"
             >
-              {{ profile.label }}
+              {{ profile.label }}{{ profile.supportsTransparentBackground ? " · Transparent" : "" }}
             </option>
           </select>
           <p class="pipeline-help">
@@ -1218,6 +1222,18 @@ textarea.pipeline-input {
 .pipeline-model-settings summary small {
   color: var(--workspace-accent);
   margin-left: 7px;
+}
+.pipeline-model-settings summary .pipeline-transparency-badge {
+  display: inline-block;
+  border: 1px solid var(--workspace-border);
+  border-radius: 999px;
+  padding: 2px 6px;
+  background: var(--workspace-surface-raised);
+  color: var(--workspace-text);
+  font-size: 9px;
+}
+.pipeline-transparency-help {
+  margin-bottom: 14px;
 }
 .pipeline-model-settings[open] summary {
   margin-bottom: 16px;
