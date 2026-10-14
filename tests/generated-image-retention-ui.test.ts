@@ -6,6 +6,7 @@ import {renderToString} from '@vue/server-renderer'
 import {createRenderer, createSSRApp, computed, h, nextTick, reactive, ref, watch} from 'vue'
 import {transpileModule, ModuleKind, ScriptTarget} from 'typescript'
 import {createDefaultSettings} from '../schemas/image-generation.ts'
+import {createGenerationCreditController, initialGenerationCreditState} from '../app/utils/generationCredit.ts'
 
 // Render the actual history card with Nuxt composables and image/API components
 // stubbed. The image URL remains in expired records, so a DOM assertion catches
@@ -79,12 +80,15 @@ function descendants(node: MemoryNode): MemoryNode[] { return [node, ...node.chi
 async function renderCard(data: Record<string, unknown>, history: Record<string, unknown>[] = [], fetcher?: (url: string, options?: unknown) => Promise<unknown>, client = false) {
   const notifications: Record<string, unknown>[] = []
   const account = {identity: ref('studio.alice'), epoch: ref(1)}
+  const balance = {balance: ref<any>({unlimited: true, actualBalanceUsd: null, outstandingCount: 0}), refresh: async function () {return this.balance.value}}
+  const credit = createGenerationCreditController(account, balance, ref(initialGenerationCreditState()))
   const historyKeys: string[] = []
   const refreshedKeys: string[] = []
   let bindings: any
   const injected: Record<string, unknown> = {
     computed, ref, watch,
     useAccount: () => account,
+    useGenerationCredit: () => credit,
     useNuxtData: (key: string) => { historyKeys.push(key); return {data: ref({items: history})} },
     refreshNuxtData: async (key: string) => { refreshedKeys.push(key) },
     useToast: () => ({add: (notification: Record<string, unknown>) => notifications.push(notification)}),
@@ -106,7 +110,7 @@ async function renderCard(data: Record<string, unknown>, history: Record<string,
     let html = ''
     if (client) { app.mount(rootNode); await nextTick() }
     else html = await renderToString(app)
-    return {html, rootNode, bindings, notifications, account, historyKeys, refreshedKeys,
+    return {html, rootNode, bindings, notifications, account, balance, credit, historyKeys, refreshedKeys,
       setData: (nextData: Record<string, unknown>) => {cardData.value = nextData}, restore: () => {
       if (client) app.unmount()
       for (const [key, descriptor] of previous) {
@@ -367,6 +371,39 @@ test('late output details never populate a new account or refresh its cache', as
   }
 })
 
+test('refine and regenerate refuse zero credit before prompts or paid requests and preserve input on a raced 402', async () => {
+  for (const action of ['sendRefine', 'regenerate'] as const) {
+    const calls: string[] = []; const card = await renderCard(original, [], async url => {calls.push(url); return {ok: true, obj: [original]}})
+    try {
+      card.balance.balance.value = {unlimited: false, actualBalanceUsd: '0', outstandingCount: 0}
+      card.bindings.chatInput.value = 'Use a warmer light'
+      await card.bindings[action]()
+      assert.deepEqual(calls, []); assert.equal(card.credit.open.value, true); assert.deepEqual(card.notifications, [])
+      assert.equal(card.bindings.chatInput.value, 'Use a warmer light')
+    } finally {card.restore()}
+  }
+  const card = await renderCard(original, [], async () => {throw {statusCode: 402, data: {code: 'CREDIT_EXHAUSTED'}}})
+  try {
+    card.bindings.chatInput.value = 'Keep this refinement'
+    await card.bindings.sendRefine()
+    assert.equal(card.credit.open.value, true); assert.deepEqual(card.notifications, [])
+    assert.equal(card.bindings.chatInput.value, 'Keep this refinement')
+  } finally {card.restore()}
+})
+
+test('repeated regeneration stops before a second paid request when exact usage uses up the credit', async () => {
+  const calls: string[] = []
+  const card = await renderCard(original, [], async url => {
+    calls.push(url); card.balance.balance.value = {unlimited: false, actualBalanceUsd: '0', outstandingCount: 0}
+    return {ok: true, obj: [original]}
+  })
+  try {
+    card.balance.balance.value = {unlimited: false, actualBalanceUsd: '1', outstandingCount: 0}; card.bindings.regenCount.value = 3
+    await card.bindings.regenerate()
+    assert.equal(calls.length, 1); assert.equal(card.credit.open.value, true); assert.deepEqual(card.notifications, [])
+  } finally {card.restore()}
+})
+
 test('late refinement results are ignored and repeated regeneration stops before another paid request on account change', async () => {
   for (const action of ['sendRefine', 'regenerate'] as const) {
     let finish!: (value: unknown) => void
@@ -376,6 +413,7 @@ test('late refinement results are ignored and repeated regeneration stops before
       card.bindings.chatInput.value = 'Use a warmer light'
       card.bindings.regenCount.value = 3
       const pending = card.bindings[action]()
+      await new Promise(resolve => setImmediate(resolve))
       assert.deepEqual(calls, ['/api/image-generate'])
       card.account.identity.value = 'studio.bea'
       card.account.epoch.value += 1

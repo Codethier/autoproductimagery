@@ -64,6 +64,7 @@ async function signOut() {
       </div>
     </header>
     <main id="workspace-content" class="workspace-main" tabindex="-1"><slot /></main>
+    <GenerationCreditDialog />
   </div>
 </template>
 

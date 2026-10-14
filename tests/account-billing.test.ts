@@ -6,7 +6,7 @@ import {Pool} from 'pg'
 import {drizzle} from 'drizzle-orm/node-postgres'
 import {migrate} from 'drizzle-orm/node-postgres/migrator'
 import {eq} from 'drizzle-orm'
-import {allocateUsdUnits, formatUsdUnits, MAX_USD_UNITS, parseUsdUnits, UsdAmountSchema} from '../schemas/account-billing.ts'
+import {allocateUsdUnits, CREDIT_EXHAUSTED_CODE, CREDIT_EXHAUSTED_MESSAGE, formatUsdUnits, MAX_USD_UNITS, parseUsdUnits, UsdAmountSchema} from '../schemas/account-billing.ts'
 import {accountBalanceAdjustments, accountGenerationCharges, organizations, systemPrompt, users} from '../server/db/schema.ts'
 import {assertGenerationCredit, createAccountBilling, recordGenerationCharge} from '../server/utils/accountBilling.ts'
 import type {AuthContext} from '../server/utils/accountSession.ts'
@@ -191,6 +191,25 @@ test('finite credit admission serializes new batches while allowing the current 
     })
     await f.db.transaction(tx => assertGenerationCredit(tx, f.alice, batchId))
     await assert.rejects(f.db.transaction(tx => assertGenerationCredit(tx, f.alice, randomUUID())), status(409))
+    await billing.setOrganizationUserBalance(f.owner, f.alice.userId, null)
+    await f.db.transaction(tx => assertGenerationCredit(tx, f.alice, randomUUID()))
+}))
+
+test('zero and negative finite balances reject new batches with the public credit code, while unlimited and any positive credit admit', integration, async () => fixture(async f => {
+    const billing = createAccountBilling(f.db)
+    for (const creditBalanceUnits of ['0', '-1', '-650000000000']) {
+        await f.db.update(users).set({creditBalanceUnits}).where(eq(users.id, f.alice.userId))
+        await assert.rejects(f.db.transaction(tx => assertGenerationCredit(tx, f.alice, randomUUID())), (error: any) => {
+            assert.equal(error.statusCode, 402)
+            assert.equal(error.statusMessage, CREDIT_EXHAUSTED_MESSAGE)
+            assert.deepEqual(error.data, {code: CREDIT_EXHAUSTED_CODE})
+            return true
+        })
+        assert.equal((await f.db.select().from(systemPrompt)).length, 0)
+        assert.equal((await f.db.select().from(accountGenerationCharges)).length, 0)
+    }
+    await f.db.update(users).set({creditBalanceUnits: '1'}).where(eq(users.id, f.alice.userId))
+    await f.db.transaction(tx => assertGenerationCredit(tx, f.alice, randomUUID()))
     await billing.setOrganizationUserBalance(f.owner, f.alice.userId, null)
     await f.db.transaction(tx => assertGenerationCredit(tx, f.alice, randomUUID()))
 }))

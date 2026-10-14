@@ -32,6 +32,7 @@ const props = withDefaults(defineProps<{ mode?: GenerationComposerMode }>(), { m
 const data = useDataStore()
 const account = useAccount()
 const accountBalance = useAccountBalance()
+const generationCredit = useGenerationCredit()
 function accountSnapshot() { return {epoch: account.epoch.value, identity: account.identity.value} }
 function isCurrentAccount(snapshot: ReturnType<typeof accountSnapshot>) {
   return snapshot.epoch === account.epoch.value && snapshot.identity === account.identity.value
@@ -594,7 +595,7 @@ const canSubmit = computed(() => hasSources.value && !!prompt.value.trim()
   && !referenceOverflow.value && !missingRequiredMask.value && !maskWithoutReference.value
   && !maskFileNotPng.value && !maskSourceNotPng.value && selectedModelAvailable.value
   && estimatedOutputCount.value <= 50 && !sourceUnavailable.value
-  && !activeGenerationCount.value && !uploading.value && !creditBlockReason.value)
+  && !activeGenerationCount.value && !uploading.value && !generationCredit.checking.value && !generationCredit.outstandingBlocked.value)
 
 function elapsedLabel(startedAt: number) {
   const totalSeconds = Math.max(0, Math.floor((pendingTick.value - startedAt) / 1000))
@@ -618,8 +619,7 @@ onBeforeUnmount(() => {
 })
 
 async function submit() {
-  if (activeGenerationCount.value) return
-  if (creditBlockReason.value) { errorMsg.value = creditBlockReason.value; return }
+  if (activeGenerationCount.value || generationCredit.checking.value) return
   if (!selectedModelAvailable.value) {
     errorMsg.value = selectedModelInfo.value?.availabilityNote || 'This model is not currently available through AI Gateway.'
     return
@@ -641,9 +641,14 @@ async function submit() {
     return
   }
 
-  errorMsg.value = null
-  billingPollAttempts = 0
   const snapshot = accountSnapshot()
+  errorMsg.value = null
+  if (!await generationCredit.ensureCredit()) {
+    if (isCurrentAccount(snapshot) && !generationCredit.open.value) errorMsg.value = generationCredit.blockedReason.value || null
+    return
+  }
+  if (!isCurrentAccount(snapshot)) return
+  billingPollAttempts = 0
   const jobs = requestBody.inputImages.map((source, index): PendingGeneration => ({
     id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${index}`,
     prompt: requestBody.prompt,
@@ -677,6 +682,11 @@ async function submit() {
     }
     historyOpen.value = true
   } catch (error: any) {
+    if (!isCurrentAccount(snapshot)) return
+    if (await generationCredit.handleError(error)) {
+      if (isCurrentAccount(snapshot)) { for (const job of jobs) removePendingJob(job.id); errorMsg.value = null }
+      return
+    }
     if (!isCurrentAccount(snapshot)) return
     const message = error?.data?.statusMessage || error?.statusMessage || 'Generation failed. Please try again.'
     for (const job of jobs) {

@@ -8,6 +8,7 @@ import { renderToString } from '@vue/server-renderer'
 import { createRenderer, createSSRApp, h, nextTick, reactive, ref } from 'vue'
 import { IMAGE_MODEL_PROFILES, createDefaultSettings } from '../schemas/image-generation.ts'
 import type { PendingGeneration } from '../app/utils/generationComposer.ts'
+import {createGenerationCreditController, initialGenerationCreditState} from '../app/utils/generationCredit.ts'
 
 const root = new URL('../', import.meta.url)
 const formUrl = new URL('app/components/GeminiForm.vue', root).href
@@ -32,6 +33,7 @@ registerHooks({
         const useDataStore = () => globalThis.${environmentKey}.store;
         const useAccount = () => globalThis.${environmentKey}.account;
         const useAccountBalance = () => globalThis.${environmentKey}.accountBalance;
+        const useGenerationCredit = () => globalThis.${environmentKey}.credit ??= globalThis.${environmentKey}.createCredit();
         const useFetch = (...args) => globalThis.${environmentKey}.useFetch(...args);
         const useRoute = () => globalThis.${environmentKey}.route;
         const $fetch = (...args) => globalThis.${environmentKey}.fetch(...args);
@@ -65,7 +67,7 @@ async function renderWorkspace(mode: 'edit' | 'batch', overrides: Partial<Store>
   const environment: any = {
     store, route: reactive({ query: {} }), exposed: null,
     account: {epoch: ref(1), identity: ref('org.alice')}, refreshes: [], fetchKeys: [], history: ref({ok: true, count: 0, items: []}),
-    accountBalance: {balance: ref(null), refresh: async () => {}},
+    accountBalance: {balance: ref({unlimited: true, actualBalanceUsd: null, outstandingCount: 0}), refresh: async function () {return this.balance.value}},
     useFetch(url: string, options: {key?: unknown}) {
       this.fetchKeys.push({url, key: options.key})
       const data = url === '/api/image-models'
@@ -78,6 +80,7 @@ async function renderWorkspace(mode: 'edit' | 'batch', overrides: Partial<Store>
       return { ok: true, obj: [{id: 1, status: 'succeeded', outputImage: '/images/output/result.png', errors: null, priceUsd: '0.04500000', priceSource: 'gateway', billingState: 'confirmed'}] }
     },
   }
+  environment.createCredit = () => createGenerationCreditController(environment.account, environment.accountBalance, ref(initialGenerationCreditState()))
   ;(globalThis as any)[environmentKey] = environment
   const { default: Form } = await import(formUrl)
   const originalSetup = Form.setup
@@ -434,7 +437,7 @@ test('price polling is bounded and finite-credit accounts wait for outstanding p
     assert.equal(mounted.exposed.canSubmit.value, true, 'historical unpriced entries without a retryable charge do not block new finite-credit generations')
     workspace.environment.accountBalance.balance.value = {unlimited: false, actualBalanceUsd: '-0.005000000001', outstandingCount: 0}
     await nextTick()
-    assert.equal(mounted.exposed.canSubmit.value, false)
+    assert.equal(mounted.exposed.canSubmit.value, true, 'exhausted credit keeps the valid button clickable so it can explain the refusal')
     workspace.environment.accountBalance.balance.value = {unlimited: true, actualBalanceUsd: null, outstandingCount: 1}
     await nextTick()
     assert.equal(mounted.exposed.canSubmit.value, true)
@@ -444,6 +447,56 @@ test('price polling is bounded and finite-credit accounts wait for outstanding p
     ;(globalThis as any).document = originalDocument
     ;(globalThis as any).window = previousWindow
   }
+})
+
+test('Edit and batch refuse fresh zero or overdrawn credit with a balance popup before a paid POST', async () => {
+  for (const mode of ['edit', 'batch'] as const) for (const amount of ['0', '0.000000000000', '-0.000000000001']) {
+    const value = await renderWorkspace(mode, {editSource: '/images/edit.png', inputImages: ['/images/batch.png']})
+    let checks = 0
+    value.environment.accountBalance.balance.value = {unlimited: false, actualBalanceUsd: '4', outstandingCount: 0}
+    value.environment.accountBalance.refresh = async (options: {force?: boolean}) => {
+      assert.equal(options.force, true); checks++
+      const fresh = {unlimited: false, actualBalanceUsd: amount, outstandingCount: 0}
+      value.environment.accountBalance.balance.value = fresh
+      return fresh
+    }
+    assert.equal(value.exposed.canSubmit.value, true)
+    await value.exposed.submit()
+    assert.equal(checks, 1); assert.equal(value.requests.length, 0)
+    assert.equal(value.environment.credit.open.value, true)
+    assert.equal(value.exposed.errorMsg.value, null)
+    assert.equal(value.store.composerPrompt, 'Place on a clean studio background')
+    assert.deepEqual(value.store.pendingGenerations, [])
+  }
+})
+
+test('fresh positive or unlimited credit admits generation; an authoritative 402 opens only the credit popup', async () => {
+  for (const fresh of [{unlimited: false, actualBalanceUsd: '0.000000000001', outstandingCount: 0}, {unlimited: true, actualBalanceUsd: null, outstandingCount: 7}]) {
+    const value = await renderWorkspace('edit', {editSource: '/images/edit.png'})
+    value.environment.accountBalance.balance.value = {unlimited: false, actualBalanceUsd: '0', outstandingCount: 0}
+    value.environment.accountBalance.refresh = async () => {value.environment.accountBalance.balance.value = fresh; return fresh}
+    await value.exposed.submit(); assert.equal(value.requests.length, 1); assert.equal(value.environment.credit.open.value, false)
+  }
+  const refused = await renderWorkspace('edit', {editSource: '/images/edit.png'})
+  refused.environment.fetch = async () => {throw {statusCode: 402, data: {data: {code: 'CREDIT_EXHAUSTED'}}}}
+  await refused.exposed.submit()
+  assert.equal(refused.environment.credit.open.value, true)
+  assert.equal(refused.exposed.errorMsg.value, null)
+  assert.deepEqual(refused.store.pendingGenerations, [], 'refused admission must not leave a false failed generation card')
+})
+
+test('failed balance refresh and outstanding-price errors refuse work without showing an exhausted-credit popup', async () => {
+  const unavailable = await renderWorkspace('edit', {editSource: '/images/edit.png'})
+  unavailable.environment.accountBalance.balance.value = {unlimited: false, actualBalanceUsd: '0', outstandingCount: 0}
+  unavailable.environment.accountBalance.refresh = async () => null
+  await unavailable.exposed.submit()
+  assert.equal(unavailable.requests.length, 0); assert.equal(unavailable.environment.credit.open.value, false)
+  assert.match(unavailable.exposed.errorMsg.value, /Could not confirm your available credit/)
+  const outstanding = await renderWorkspace('edit', {editSource: '/images/edit.png'})
+  outstanding.environment.fetch = async () => {throw {statusCode: 409, data: {statusMessage: 'Previous prices must settle'}}}
+  await outstanding.exposed.submit()
+  assert.equal(outstanding.environment.credit.open.value, false)
+  assert.match(outstanding.exposed.errorMsg.value, /Previous prices must settle/)
 })
 
 test('navigation unmounts and remounts the editor without losing an in-flight request or permitting a duplicate', async () => {
@@ -461,7 +514,7 @@ test('navigation unmounts and remounts the editor without losing an in-flight re
   try {
     first = await mountWorkspace('edit', workspace.environment)
     request = first.exposed.submit()
-    await nextTick()
+    await new Promise(resolve => setImmediate(resolve)); await nextTick()
     assert.equal(workspace.requests.length, 1)
     assert.equal(first.exposed.activeGenerationCount.value, 1)
     first.app.unmount()
@@ -540,6 +593,7 @@ for (const outcome of ['success', 'failure'] as const) {
     const previousWindow = (globalThis as any).window
     const mounted = await mountWorkspace('edit', workspace.environment)
     const request = mounted.exposed.submit()
+    await new Promise(resolve => setImmediate(resolve))
     try {
       assert.equal(workspace.store.pendingGenerations.length, 1)
       workspace.environment.account.epoch.value += 1

@@ -12,7 +12,7 @@ import {PutObjectCommand, GetObjectCommand, HeadObjectCommand, DeleteObjectComma
 import {organizations, users, assets, pipelines, pipelineRuns, pipelineRunSteps, pipelineStepOutputs, systemPrompt} from '../server/db/schema.ts'
 import {createS3ImageStorage, type ImageStorageCommand} from '../server/utils/useFS.ts'
 import {useUserFS} from '../server/utils/useUserFS.ts'
-import {createPipelineRepository} from '../server/utils/pipelineRepository.ts'
+import {createPipelineRepository, pipelineRequestError, safePipelineError} from '../server/utils/pipelineRepository.ts'
 import {createPipelineExecutor} from '../server/utils/pipelineRunner.ts'
 import {createPeopleRepository} from '../server/utils/peopleRepository.ts'
 import {useDB} from '../server/utils/useDB.ts'
@@ -23,6 +23,7 @@ import {getBackgroundRemovalModel} from '../schemas/background-removal-models.ts
 import {createPipelineNode, type PipelineDefinition, type PipelineNode} from '../schemas/pipelines.ts'
 import {getImageModelProfile, createDefaultSettings, generationOutputCount} from '../schemas/image-generation.ts'
 import {PromptEnhancerConfigSchema} from '../schemas/pipeline-text-models.ts'
+import {CREDIT_EXHAUSTED_CODE, CREDIT_EXHAUSTED_MESSAGE} from '../schemas/account-billing.ts'
 import {processLocalPipelineImage} from '../server/utils/pipelineImageProcessing.ts'
 import {publicGeneration} from '../server/utils/generationVisibility.ts'
 import type {AuthContext} from '../server/utils/accountSession.ts'
@@ -78,6 +79,59 @@ async function drain(executor:ReturnType<typeof createPipelineExecutor>, runId:s
     for(let i=0;i<limit&&['queued','running','awaiting-price'].includes(value.run.status);i++)value=await executor.advance(runId)
     return value.run
 }
+
+test('pipeline credit refusals keep only the canonical public discriminator across HTTP and persisted step errors',()=>{
+    const privateError={statusCode:402,statusMessage:'private provider detail',data:{code:CREDIT_EXHAUSTED_CODE,credential:'private-test-diagnostic'}}
+    assert.throws(()=>pipelineRequestError(privateError),(error:any)=>{
+        assert.equal(error.statusCode,402);assert.equal(error.statusMessage,CREDIT_EXHAUSTED_MESSAGE)
+        assert.deepEqual(error.data,{code:CREDIT_EXHAUSTED_CODE});return true
+    })
+    assert.deepEqual(safePipelineError(privateError),{code:CREDIT_EXHAUSTED_CODE,message:CREDIT_EXHAUSTED_MESSAGE,retryable:true})
+    assert.throws(()=>pipelineRequestError({statusCode:409,statusMessage:'Wait for current prices',data:{code:'private'}}),(error:any)=>error.statusCode===409&&error.data===undefined)
+})
+
+test('zero and overdrawn finite accounts cannot start any paid pipeline type and create no run or pending charge',integration,async()=>fixture(async f=>{
+    const fs=await useUserFS(f.a,f.raw,f.db),repo=createPipelineRepository(f.a,f.db,{storage:fs}),original=await fs.saveUpload('/',upload(f.bytes))
+    for(const type of ['generate-image','expand','translate','upscale','describe-image','prompt-enhancer','llm'] as const){
+        const node=createPipelineNode(type,'paid')
+        if(node.type==='generate-image')node.config.prompt='Keep this product'
+        if(node.type==='upscale')node.config.mode='ai'
+        if(node.type==='prompt-enhancer'||node.type==='llm')node.config.prompt='Improve this product image prompt'
+        const needsImage=!['prompt-enhancer','llm'].includes(type)
+        const definition=graph([...(needsImage?[createPipelineNode('image-input','input')]:[]),node,createPipelineNode('output','out')],
+            [...(needsImage?[['input','paid'] as [string,string]]:[]),['paid','out']])
+        const {pipeline}=await repo.create({name:`Paid ${type}`,definition})
+        for(const creditBalanceUnits of ['0','-1']){
+            await f.db.update(users).set({creditBalanceUnits}).where(eq(users.id,f.a.userId))
+            await assert.rejects(repo.start(pipeline.id,{revision:1,idempotencyKey:randomUUID(),inputs:{},...(needsImage?{inputImages:[original.url],batchInputNodeId:'input'}:{})}),(error:any)=>{
+                assert.equal(error.statusCode,402);assert.deepEqual(error.data,{code:CREDIT_EXHAUSTED_CODE});return true
+            })
+        }
+    }
+    assert.equal((await f.db.select().from(pipelineRuns)).length,0)
+    assert.equal((await f.db.select().from(pipelineRunSteps)).length,0)
+    assert.equal((await f.db.select().from(systemPrompt)).length,0)
+}))
+
+test('a fresh image or text worker wave rechecks depleted credit after run admission without starting a paid call',integration,async()=>fixture(async f=>{
+    const fs=await useUserFS(f.a,f.raw,f.db),repo=createPipelineRepository(f.a,f.db,{storage:fs}),original=await fs.saveUpload('/',upload(f.bytes))
+    const calls={value:0,batches:[] as string[]}
+    let textCalls=0
+    const gateway={async getGenerationBilling(){return undefined},async generatePipelineText(){textCalls++;throw new Error('No paid text call may start')}} as unknown as Awaited<ReturnType<typeof useGateway>>
+    for(const type of ['generate-image','prompt-enhancer'] as const){
+        await f.db.update(users).set({creditBalanceUnits:'1000000000000'}).where(eq(users.id,f.a.userId))
+        const node=type==='generate-image'?generateNode('paid'):createPipelineNode('prompt-enhancer','paid')
+        if(node.type==='prompt-enhancer')node.config.prompt='Improve this product prompt'
+        const {run}=await saveStart(repo,graph([...(type==='generate-image'?[createPipelineNode('image-input','input')]:[]),node,createPipelineNode('output','out')],
+            [...(type==='generate-image'?[['input','paid'] as [string,string]]:[]),['paid','out']]),type==='generate-image'?[original.url]:[])
+        await f.db.update(users).set({creditBalanceUnits:'0'}).where(eq(users.id,f.a.userId))
+        const done=await drain(createPipelineExecutor(f.a,repo,{gateway,runtimeConfig,coordinationPool:f.pool,generate:fakeGeneration(f,fs,'gateway',calls)}),run.id)
+        assert.equal(done.items[0]!.steps.find(step=>step.nodeId==='paid')!.error?.code,CREDIT_EXHAUSTED_CODE)
+    }
+    assert.equal(calls.value,0);assert.equal(textCalls,0)
+    assert.equal((await f.db.select().from(systemPrompt)).length,0)
+    assert.ok((await f.db.select().from(pipelineRunSteps)).every(step=>step.providerStartedAt===null))
+}))
 
 test('saved pipelines enforce private account scope, revision checks, immutable snapshots and scoped SQL cursors',integration,async()=>fixture(async f=>{
     const fs=await useUserFS(f.a,f.raw,f.db),repo=createPipelineRepository(f.a,f.db,{storage:fs})
@@ -286,6 +340,36 @@ test('known-zero local pipelines remain usable at exhausted finite credit',integ
     const {run}=await saveStart(repo,graph([createPipelineNode('image-input','input'),createPipelineNode('resize','resize'),createPipelineNode('output','out')],[['input','resize'],['resize','out']]),[original.url])
     const done=await drain(createPipelineExecutor(f.a,repo,{gateway:noGateway,runtimeConfig}),run.id)
     assert.equal(done.status,'succeeded');assert.equal((await createAccountBilling(f.db).balanceFor(f.a)).actualBalanceUsd,'0.000000000000')
+}))
+
+test('zero-credit retry refuses paid descendants atomically while a local execution slice can retry',integration,async()=>fixture(async f=>{
+    const fs=await useUserFS(f.a,f.raw,f.db),repo=createPipelineRepository(f.a,f.db,{storage:fs}),original=await fs.saveUpload('/',upload(f.bytes))
+    const definition=graph([createPipelineNode('image-input','input'),generateNode('paid'),createPipelineNode('output','out')],[['input','paid'],['paid','out']])
+    const {pipeline,run}=await saveStart(repo,definition,[original.url])
+    const executor=createPipelineExecutor(f.a,repo,{gateway:noGateway,runtimeConfig})
+    const claim=await repo.claim(run.id);assert.ok(claim);assert.equal(claim.node.type,'image-input')
+    await repo.finish(claim.step.id,claim.token,'failed',null,{code:'LOCAL_TEST_FAILURE',message:'Fixture local input failed',retryable:true})
+    const failed=await drain(executor,run.id);assert.equal(failed.status,'failed')
+    await f.db.update(users).set({creditBalanceUnits:'0'}).where(eq(users.id,f.a.userId))
+    const before=await f.db.select().from(pipelineRunSteps).where(eq(pipelineRunSteps.runId,run.id))
+    await assert.rejects(repo.retry(run.id,{stepIds:[claim.step.id]}),(error:any)=>{
+        assert.equal(error.statusCode,402);assert.deepEqual(error.data,{code:CREDIT_EXHAUSTED_CODE});return true
+    })
+    assert.deepEqual(await f.db.select().from(pipelineRunSteps).where(eq(pipelineRunSteps.runId,run.id)),before,'refusal must not replace steps or change attempt history')
+    assert.equal((await repo.detail(run.id)).status,'failed')
+    // Running only the input excludes the paid descendant. The same exhausted
+    // account may retry this local execution slice without a provider charge.
+    const local=(await repo.start(pipeline.id,{revision:1,idempotencyKey:randomUUID(),inputs:{},inputImages:[original.url],batchInputNodeId:'input',targetNodeId:'input'})).run
+    const localClaim=await repo.claim(local.id);assert.ok(localClaim)
+    await repo.finish(localClaim.step.id,localClaim.token,'failed',null,{code:'LOCAL_TEST_FAILURE',message:'Fixture local input failed',retryable:true})
+    const localDone=await drain(executor,local.id);assert.equal(localDone.status,'failed')
+    const retried=(await repo.retry(local.id,{stepIds:[localClaim.step.id]})).run
+    assert.equal(retried.status,'queued');assert.equal(retried.items[0]!.steps.length,1)
+    const retryRows=await f.db.select().from(pipelineRunSteps).where(eq(pipelineRunSteps.runId,local.id))
+    assert.equal(retryRows.find(step=>step.active)!.attempt,2)
+    assert.equal((await drain(executor,local.id)).status,'succeeded')
+    assert.equal((await createAccountBilling(f.db).balanceFor(f.a)).actualBalanceUsd,'0.000000000000')
+    assert.equal((await f.db.select().from(systemPrompt)).length,0)
 }))
 
 function gate(){let resolve!:()=>void;const promise=new Promise<void>(done=>{resolve=done});return{promise,resolve}}

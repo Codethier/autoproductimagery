@@ -5,7 +5,7 @@ import {registerHooks} from 'node:module'
 import test from 'node:test'
 import {createError, createEvent, defineEventHandler} from 'h3'
 import {createDefaultSettings} from '../schemas/image-generation.ts'
-import {parseUsdUnits} from '../schemas/account-billing.ts'
+import {CREDIT_EXHAUSTED_CODE, CREDIT_EXHAUSTED_MESSAGE, parseUsdUnits} from '../schemas/account-billing.ts'
 
 // Exercise the real generation handler, schema parsing, billing allocation,
 // error extraction and public projection. Storage/DB/reservation/Gateway are
@@ -131,6 +131,30 @@ test('credit admission preserves 402 and 409 before any paid provider call or ou
     assert.equal(env.providerCalls, 0)
     assert.equal(env.saves.length, 0)
     assert.equal(env.rows.size, 0)
+    assert.equal(env.closeCount, 1)
+  }
+})
+
+test('zero-credit refusals retain their public discriminator for single, batch, People and replay requests without paid work', async () => {
+  for (const changed of [
+    {},
+    {inputImages: ['/images/input/one.png', '/images/input/two.png']},
+    {inputImages: [], personId: '8687c1db-3ca9-411c-a89b-e4c70c67f632', personPictureCount: 2},
+    {parentSystemPromptId: 99},
+  ]) {
+    const env = setup()
+    Object.assign(env.body, changed)
+    if ('parentSystemPromptId' in changed) env.rows.set(99, {id: 99, status: 'succeeded', ...actor})
+    env.admissionError = createError({statusCode: 402, statusMessage: CREDIT_EXHAUSTED_MESSAGE, data: {code: CREDIT_EXHAUSTED_CODE}})
+    await assert.rejects(() => handler(event()), (error: any) => {
+      assert.equal(error.statusCode, 402)
+      assert.deepEqual(error.data, {code: CREDIT_EXHAUSTED_CODE})
+      return true
+    })
+    assert.equal(env.providerCalls, 0)
+    assert.equal(env.gatewayRequests.length, 0)
+    assert.equal(env.saves.length, 0)
+    assert.equal(env.pendingData.length, 0)
     assert.equal(env.closeCount, 1)
   }
 })

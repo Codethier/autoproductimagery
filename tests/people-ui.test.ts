@@ -8,6 +8,7 @@ import {renderToString} from '@vue/server-renderer'
 import {computed, createRenderer, createSSRApp, h, nextTick, ref} from 'vue'
 import {IMAGE_MODEL_PROFILES, SUPPORTED_IMAGE_MODEL_IDS, createDefaultSettings, type ImageModelId} from '../schemas/image-generation.ts'
 import type {Person, PersonPhoto} from '../schemas/people.ts'
+import {createGenerationCreditController, initialGenerationCreditState} from '../app/utils/generationCredit.ts'
 
 const root = new URL('../', import.meta.url)
 const browserUrl = new URL('app/components/PeopleBrowser.vue', root).href
@@ -38,7 +39,8 @@ registerHooks({
         const useAccount = () => globalThis.${key}.account;
         const useRequestFetch = () => (...args) => globalThis.${key}.fetch(...args);
         const useAccountBalance = () => globalThis.${key}.balance;
-        ${compiled.content}`)}
+        const useGenerationCredit = () => globalThis.${key}.credit ??= createGenerationCreditController(globalThis.${key}.account, globalThis.${key}.balance, globalThis.${key}.state('generation-credit', initialGenerationCreditState));
+        ${compiled.content}`.replace("import {usePeopleGenerationProgress}", `import {createGenerationCreditController, initialGenerationCreditState} from '${new URL('app/utils/generationCredit.ts', root).href}'; import {usePeopleGenerationProgress}`))}
     }
     return nextLoad(url, context)
   },
@@ -58,7 +60,7 @@ function environment(fetch?: (url: string, options: any) => unknown) {
   return {account, calls, models, states,
     state(name: string, initial: () => unknown) { if (!states.has(name)) states.set(name, ref(initial())); return states.get(name)! },
     favourites: {favouriteModelIds: favouriteIds, favouriteSet: computed(() => new Set(favouriteIds.value)), persistent: ref(true), ready: ref(true), toggleFavourite(id: ImageModelId) { favouriteIds.value = favouriteIds.value.includes(id) ? favouriteIds.value.filter(value => value !== id) : [...favouriteIds.value, id] }},
-    balance: {balance: ref({unlimited: true, actualBalanceUsd: null, outstandingCount: 0}), pending: ref(false), error: ref(''), refresh: async () => {}},
+    balance: {balance: ref({unlimited: true, actualBalanceUsd: null as string | null, outstandingCount: 0}), pending: ref(false), error: ref(''), refresh: async function () {return this.balance.value}},
     fetch: async (url: string, options: any = {}) => { calls.push({url, options}); if (fetch) return fetch(url, options); if (url === '/api/image-models') return {items: models}; if (url === '/api/people') return {people: [person()], nextCursor: null}; return detail() },
   }
 }
@@ -240,11 +242,27 @@ test('person batches enforce output count, reference caps, availability and fini
   value.exposed.model.value = 'openai/gpt-image-2'; value.exposed.settings.value = {...createDefaultSettings('openai/gpt-image-2'), numberOfImages: 3}; value.exposed.pictureCount.value = 2
   assert.equal(value.exposed.canGenerate.value, false); await value.exposed.generate()
   value.exposed.pictureCount.value = 1; assert.equal(value.exposed.canGenerate.value, true)
-  env.balance.balance.value = {unlimited: false, actualBalanceUsd: '0', outstandingCount: 0}; assert.equal(value.exposed.canGenerate.value, false)
+  env.balance.balance.value = {unlimited: false, actualBalanceUsd: '0', outstandingCount: 0}; assert.equal(value.exposed.canGenerate.value, true)
   env.balance.balance.value = {unlimited: false, actualBalanceUsd: '3', outstandingCount: 1}; assert.equal(value.exposed.canGenerate.value, false)
   env.balance.balance.value = {unlimited: true, actualBalanceUsd: null, outstandingCount: 0}; value.exposed.models.value = []; assert.equal(value.exposed.canGenerate.value, false)
   assert.equal(env.calls.some(call => call.url === '/api/image-generate'), false)
 })
+test('People generation checks fresh credit, refuses zero with a popup, and handles a raced 402 without a generic error', async () => {
+  for (const amount of ['0', '-0.000000000001']) {
+    const env = environment(); env.balance.balance.value = {unlimited: false, actualBalanceUsd: amount, outstandingCount: 0}
+    const value = await renderComponent(generatorUrl, {env, initialize: state => {state.models.value = env.models}})
+    assert.equal(value.exposed.canGenerate.value, true)
+    await value.exposed.generate()
+    assert.equal(env.calls.some(call => call.url === '/api/image-generate'), false)
+    assert.equal((env as any).credit.open.value, true); assert.equal(value.exposed.errorMessage.value, '')
+  }
+  const raced = environment(url => {if (url === '/api/image-generate') throw {statusCode: 402}; return {items: SUPPORTED_IMAGE_MODEL_IDS.map(id => ({id, catalogStatus: 'available'}))}})
+  const value = await renderComponent(generatorUrl, {env: raced, initialize: state => {state.models.value = raced.models}})
+  await value.exposed.generate()
+  assert.equal((raced as any).credit.open.value, true); assert.equal(value.exposed.errorMessage.value, '')
+  assert.equal(value.exposed.generating.value, false)
+})
+
 test('closing a generator keeps its paid request alive and another instance cannot submit the same person', async () => {
   let finish!: (value: unknown) => void
   const env = environment(url => url === '/api/image-generate' ? new Promise(resolve => {finish = resolve}) : {items: SUPPORTED_IMAGE_MODEL_IDS.map(id => ({id, catalogStatus: 'available'}))})

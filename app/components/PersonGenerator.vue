@@ -22,6 +22,7 @@ const props = defineProps<{person: Person; photos: PersonPhoto[]; selectedUrls?:
 const emit = defineEmits<{close: []; generated: []}>()
 const account = useAccount()
 const balance = useAccountBalance()
+const generationCredit = useGenerationCredit()
 const generationProgress = usePeopleGenerationProgress()
 const requestFetch = useRequestFetch()
 const initialAccount = {epoch: account.epoch.value, identity: account.identity.value}
@@ -53,7 +54,7 @@ const creditBlockReason = computed(() => {
   if (value.generationBlockedByOutstanding ?? value.outstandingCount > 0) return 'Your previous image prices must settle before another generation can use your credit.'
   return ''
 })
-const canGenerate = computed(() => currentAccount.value && modelAvailable.value && !profile.value.requiresMask && !running.value && !!scene.value.trim() && selectedReferences.value.length <= profile.value.maxReferenceImages && totalPictures.value <= 4 && !creditBlockReason.value)
+const canGenerate = computed(() => currentAccount.value && modelAvailable.value && !profile.value.requiresMask && !running.value && !generationCredit.checking.value && !!scene.value.trim() && selectedReferences.value.length <= profile.value.maxReferenceImages && totalPictures.value <= 4 && !generationCredit.outstandingBlocked.value)
 const settingsComponents: Record<ImageModelProfile['settingsComponent'], Component> = {Gemini31FlashImageSettings, Gemini3ProImageSettings, Gemini31FlashLiteImageSettings, Gemini25FlashImageSettings, OpenAiGptImage2Settings, OpenAiGptImage25Settings, OpenAiGptImageLegacySettings, CatalogImageSettings}
 const component = computed(() => settingsComponents[profile.value.settingsComponent])
 let revision = 0
@@ -90,9 +91,15 @@ async function generate() {
   let body: ReturnType<typeof ImageGenerationRequestSchema.parse>
   try { body = ImageGenerationRequestSchema.parse({personId: props.person.id, personPictureCount: pictureCount.value, prompt: generationPrompt(), model: model.value, settings: structuredClone(toRaw(settings.value)), inputImages: [], modelImages: [...selectedReferences.value], storeInputImages: true}) }
   catch { errorMessage.value = 'Check the model settings and reference limit before generating.'; return }
+  const value = snapshot(); errorMessage.value = ''
+  if (!await generationCredit.ensureCredit()) {
+    if (current(value) && !generationCredit.open.value) errorMessage.value = generationCredit.blockedReason.value
+    return
+  }
+  if (!current(value)) return
   const token = generationProgress.claim(props.person.id)
   if (!token) return
-  const value = snapshot(); generating.value = true; errorMessage.value = ''
+  generating.value = true
   const controller = new AbortController(); generationRequests.add(controller)
   try {
     const response = await requestFetch<{ok: boolean; obj?: Array<{errors?: string | null}>}>('/api/image-generate', {method: 'POST', body, timeout: 600_000, signal: controller.signal})
@@ -102,6 +109,8 @@ async function generate() {
     await balance.refresh()
   } catch (error) {
     if (!current(value)) return
+    if (await generationCredit.handleError(error)) return
+    if (!current(value)) return
     const status = (error as {statusCode?: number; status?: number})?.statusCode ?? (error as {status?: number})?.status
     errorMessage.value = status === 429 ? 'The generation queue is busy. Try again after the current work finishes.' : 'Could not finish this generation. Refresh the person’s pictures before trying again; accepted work stays in your history.'
     emit('generated'); await balance.refresh()
@@ -110,6 +119,7 @@ async function generate() {
 function cancelRequests() { revision += 1; for (const controller of requests) controller.abort(); requests.clear() }
 function close() { emit('close') }
 function keydown(event: KeyboardEvent) {
+  if (generationCredit.open.value) return
   if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); close() }
   if (event.key === 'Tab') {
     const elements = [...(panel.value?.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href], [tabindex="0"]') ?? [])]
@@ -144,7 +154,7 @@ onBeforeUnmount(() => { cancelRequests(); document.removeEventListener('keydown'
     <p v-if="!favouritesPersistent" class="person-muted" role="status">Favourites last for this visit because browser storage is unavailable.</p><p v-if="profile.requiresMask" class="person-error" role="alert">This model requires a mask and cannot create person portraits here.</p>
     <details class="person-settings"><summary>Model settings <span>{{ profile.shortName }}<small v-if="profile.supportsTransparentBackground" class="person-transparency-badge model-transparent-badge" title="Supports transparent image output; enable it in model settings." aria-label="Supports transparent image output">Transparent</small><small v-if="isNewImageModel(model)">New</small></span></summary><div><p v-if="profile.supportsTransparentBackground" class="person-transparency-help">For a transparent image, choose Background → Transparent and use PNG or WebP.</p><NuxtErrorBoundary :key="model"><component :is="component" v-model="settings" /><template #error><p class="person-error">Settings could not load. <button type="button" @click="settings = createDefaultSettings(model)">Restore defaults</button></p></template></NuxtErrorBoundary></div></details>
     <p v-if="totalPictures > 4" class="person-error" role="alert">Choose fewer variations or reduce the model’s number of images. A person batch can contain up to 4 pictures.</p><p v-if="selectedReferences.length > profile.maxReferenceImages" class="person-error" role="alert">This model accepts up to {{ profile.maxReferenceImages }} reference pictures. Remove some selections.</p>
-    <p v-if="creditBlockReason || errorMessage" class="person-error" role="alert">{{ creditBlockReason || errorMessage }} <button v-if="!models.length" type="button" :disabled="loadingModels" @click="loadModels">Reload models</button></p>
+    <p v-if="creditBlockReason || errorMessage" class="person-error" role="alert">{{ errorMessage || creditBlockReason }} <button v-if="!models.length" type="button" :disabled="loadingModels" @click="loadModels">Reload models</button></p>
     <footer><div><strong>{{ totalPictures }} picture{{ totalPictures === 1 ? '' : 's' }}</strong><span>Available credit: {{ balance.balance.value ? balance.balance.value.unlimited ? 'Unlimited' : formatBalanceUsd(balance.balance.value.actualBalanceUsd) : 'loading…' }}</span><small>Final price appears with each picture.</small></div><button type="button" class="person-primary" :disabled="!canGenerate" @click="generate"><UIcon :name="generating ? 'i-lucide-loader-circle' : 'i-lucide-sparkles'" :class="{'person-spin': generating}" />{{ generating ? 'Generating…' : 'Generate pictures' }}</button></footer>
     <p v-if="running" class="person-muted" role="status">This person’s generation is running. You can close the panel; accepted pictures are saved to this profile after price confirmation.</p>
   </section>

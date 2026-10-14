@@ -25,6 +25,7 @@ import type { SelectableFile } from "../../schemas/main.dto";
 import { parseUsdUnits } from "../../schemas/account-billing";
 import { formatBalanceUsd, formatUsd } from "../utils/generationPrice";
 import { imagePreviewUrl } from "../utils/imageDelivery";
+import {pipelineNodeUsesCredit, pipelineRetryUsesCredit} from '../utils/pipelineCredit';
 import {
   PIPELINE_TEMPLATES,
   pipelineNodeIcon,
@@ -44,6 +45,7 @@ import PipelineRunResults from "./PipelineRunResults.vue";
 
 const account = useAccount(),
   balance = useAccountBalance(),
+  generationCredit = useGenerationCredit(),
   requestFetch = useRequestFetch(),
   route = useRoute();
 const pipelines = ref<PipelineDTO[]>([]),
@@ -184,18 +186,7 @@ const runIssues = computed(() => [
   }),
 ]);
 const paidWork = computed(() =>
-  executionNodes.value.some(
-    (node) =>
-      [
-        "generate-image",
-        "expand",
-        "translate",
-        "describe-image",
-        "prompt-enhancer",
-        "llm",
-      ].includes(node.type) ||
-      (node.type === "upscale" && node.config.mode === "ai"),
-  ),
+  executionNodes.value.some(pipelineNodeUsesCredit),
 );
 const creditBlockReason = computed(() => {
   const value = balance.balance.value;
@@ -216,7 +207,8 @@ const canStart = computed(
     !saving.value &&
     !conflict.value &&
     !runIssues.value.length &&
-    !creditBlockReason.value &&
+    !generationCredit.checking.value &&
+    !(paidWork.value && generationCredit.outstandingBlocked.value) &&
     inputNodes.value.every((node) => {
       if (node.type === "image-input")
         return (
@@ -901,6 +893,13 @@ async function startRun() {
     )
       return;
     const requestBody = { revision: saved.revision, ...draftRun };
+    if (getPipelineExecutionNodes(saved.definition, draftRun.targetNodeId).some(pipelineNodeUsesCredit)) {
+      if (!await generationCredit.ensureCredit()) {
+        if (current(value) && !generationCredit.open.value) runError.value = generationCredit.blockedReason.value;
+        return;
+      }
+      if (!current(value) || editor !== editorVersion || prepared !== prepareVersion) return;
+    }
     const fingerprint = JSON.stringify({ id: saved.id, ...requestBody });
     let key = runAttemptKeys.get(fingerprint);
     if (!key) {
@@ -925,6 +924,8 @@ async function startRun() {
     schedulePoll();
     await balance.refresh();
   } catch (error) {
+    if (!current(value)) return;
+    if (await generationCredit.handleError(error)) { if (current(value)) runError.value = ''; return; }
     if (current(value))
       runError.value = message(
         error,
@@ -1018,11 +1019,18 @@ async function cancelRun() {
   }
 }
 async function retryRun(stepIds: string[]) {
-  if (!activeRun.value || runMutating.value) return;
+  if (!activeRun.value || runMutating.value || generationCredit.checking.value) return;
   const value = snapshot(),
-    id = activeRun.value.id;
+    id = activeRun.value.id,
+    usesCredit = pipelineRetryUsesCredit(activeRun.value, stepIds);
   runMutating.value = true;
+  runError.value = '';
   try {
+    if (usesCredit && !await generationCredit.ensureCredit()) {
+      if (current(value) && !generationCredit.open.value) runError.value = generationCredit.blockedReason.value;
+      return;
+    }
+    if (!current(value) || activeRun.value?.id !== id) return;
     const response = await request<{ run: PipelineRunDTO }>(
       `/api/pipeline-runs/${id}/retry`,
       { method: "POST", body: { stepIds, confirmPossibleCharge: true } },
@@ -1035,6 +1043,8 @@ async function retryRun(stepIds: string[]) {
       await balance.refresh();
     }
   } catch (error) {
+    if (!current(value)) return;
+    if (await generationCredit.handleError(error)) { if (current(value)) runError.value = ''; return; }
     if (current(value))
       runError.value = message(
         error,
@@ -1047,6 +1057,16 @@ async function retryRun(stepIds: string[]) {
     }
   }
 }
+const shownCreditFailures = new Set<string>();
+watch([account.identity, account.epoch], () => shownCreditFailures.clear(), {flush: 'sync'});
+watch(() => activeRun.value?.items.flatMap(item => item.steps.filter(step => step.error?.code === 'CREDIT_EXHAUSTED').map(step => `${activeRun.value!.id}:${step.id}`)) ?? [], failures => {
+  const unseen = failures.filter(key => !shownCreditFailures.has(key));
+  if (!unseen.length) return;
+  for (const key of unseen) shownCreditFailures.add(key);
+  // A saved failure describes the credit at execution time. Recheck the live
+  // balance so an old run does not ask for credit after a top-up or Unlimited.
+  void generationCredit.ensureCredit();
+}, {flush: 'post'});
 async function loadRuns(more = false) {
   if (historyLoading.value || (more && !runCursor.value)) return;
   const value = snapshot();

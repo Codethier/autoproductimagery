@@ -188,6 +188,7 @@ test('organization owner sees Team navigation while a member does not', async ()
   for (const isOwner of [false, true]) {
     ;(globalThis as any)[environmentKey] = {session: {account: ref({displayName: 'Cora', username: 'cora', organizationName: 'Studio'}), identity: ref('org.cora'), epoch: ref(1), isOwner: ref(isOwner)}}
     const app = createSSRApp({render: () => h(Layout)})
+    app.component('GenerationCreditDialog', {render: () => null})
     app.component('UIcon', {render: () => h('span')})
     app.component('NuxtLink', {props: ['to'], setup: (props: any, {slots}: any) => () => h('a', {href: props.to}, slots.default?.())})
     const html = await renderToString(app)

@@ -4,6 +4,8 @@ import {z} from 'zod'
 // directly to integer units: binary floating-point must never sum a balance.
 export const USD_SCALE = 1_000_000_000_000n
 export const MAX_USD_UNITS = 999_999_999_999_999_999_999_999n
+export const CREDIT_EXHAUSTED_CODE = 'CREDIT_EXHAUSTED'
+export const CREDIT_EXHAUSTED_MESSAGE = 'Your available credit is exhausted. Ask your organization owner to update your balance.'
 const unsignedAmount = /^(?:0|[1-9]\d{0,11})(?:\.\d{1,12})?$/
 
 export function parseUsdUnits(value: unknown): bigint | undefined {

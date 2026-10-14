@@ -84,6 +84,7 @@ registerHooks({
         const useDataStore=()=>globalThis.${key}.store;
         const useAccount=()=>globalThis.${key}.account;
         const useAccountBalance=()=>globalThis.${key}.balance;
+        const useGenerationCredit=()=>({checking:ref(false),outstandingBlocked:ref(false),open:ref(false)});
         const usePeopleGenerationProgress=()=>({running:()=>false});
         const useRequestFetch=()=>globalThis.${key}.fetch;
         const useFetch=(...args)=>globalThis.${key}.useFetch(...args);

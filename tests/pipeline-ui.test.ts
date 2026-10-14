@@ -22,6 +22,7 @@ import {
   PIPELINE_PALETTE,
   PIPELINE_TEMPLATES,
 } from "../app/utils/pipelineTemplates.ts";
+import {createGenerationCreditController, initialGenerationCreditState} from '../app/utils/generationCredit.ts';
 
 const root = new URL("../", import.meta.url),
   key = "__pipelineUi";
@@ -77,7 +78,7 @@ registerHooks({
         format: "module",
         shortCircuit: true,
         source: stripTypeScriptTypes(
-          `import {computed,ref,watch,onMounted,onBeforeUnmount,onServerPrefetch,nextTick,toRaw} from 'vue';const useAccount=()=>globalThis.${key}.account;const useAccountBalance=()=>globalThis.${key}.balance;const useRequestFetch=()=>(...args)=>globalThis.${key}.fetch(...args);const useRoute=()=>globalThis.${key}.route;const navigateTo=(...args)=>globalThis.${key}.navigate(...args);${compiled.content}`,
+          `import {computed,ref,watch,onMounted,onBeforeUnmount,onServerPrefetch,nextTick,toRaw} from 'vue';const useAccount=()=>globalThis.${key}.account;const useAccountBalance=()=>globalThis.${key}.balance;const useGenerationCredit=()=>globalThis.${key}.credit ??= globalThis.${key}.createCredit();const useRequestFetch=()=>(...args)=>globalThis.${key}.fetch(...args);const useRoute=()=>globalThis.${key}.route;const navigateTo=(...args)=>globalThis.${key}.navigate(...args);${compiled.content}`,
         ),
       };
     }
@@ -161,7 +162,7 @@ function environment(fetch?: (url: string, options: any) => unknown) {
     id,
     catalogStatus: "available",
   }));
-  return {
+  const env: any = {
     calls,
     navigations,
     models,
@@ -177,7 +178,7 @@ function environment(fetch?: (url: string, options: any) => unknown) {
         actualBalanceUsd: null as string | null,
         outstandingCount: 0,
       }),
-      refresh: async () => {},
+      refresh: async function () {return this.balance.value},
     },
     favourites: {
       favouriteModelIds: ids,
@@ -207,6 +208,8 @@ function environment(fetch?: (url: string, options: any) => unknown) {
       return { pipeline: saved() };
     },
   };
+  env.createCredit = () => createGenerationCreditController(env.account, env.balance, ref(initialGenerationCreditState()));
+  return env;
 }
 function components(app: any) {
   app.component("UIcon", {
@@ -752,6 +755,91 @@ test("node-run setup includes only connected ancestry and preserves independent 
     value.app.unmount();
   }
 });
+test('paid pipeline start and run-to-step refuse zero credit with a popup; local-only targets still start', async () => {
+  for (const target of [undefined, 'generate']) {
+    const env = environment(); env.balance.balance.value = {unlimited: false, actualBalanceUsd: '0', outstandingCount: 0}
+    const value = await mount(env)
+    try {
+      value.exposed.useTemplate(PIPELINE_TEMPLATES.find(template => template.id === 'product-photo'))
+      await value.exposed.prepareRun(target); value.exposed.batchImages.value = [source]
+      assert.equal(value.exposed.canStart.value, true)
+      await value.exposed.startRun()
+      assert.equal(env.calls.some((call: any) => call.url.endsWith('/runs') && call.options.method === 'POST'), false)
+      assert.equal(env.credit.open.value, true); assert.equal(value.exposed.runError.value, '')
+    } finally {value.app.unmount()}
+  }
+  const env = environment(); env.balance.balance.value = {unlimited: false, actualBalanceUsd: '-0.01', outstandingCount: 0}
+  const value = await mount(env)
+  try {
+    value.exposed.useTemplate(PIPELINE_TEMPLATES.find(template => template.id === 'clean-catalog'))
+    await value.exposed.prepareRun(); value.exposed.batchImages.value = [source]
+    await value.exposed.startRun()
+    assert.equal(env.calls.some((call: any) => call.url.endsWith('/runs') && call.options.method === 'POST'), true)
+    assert.equal(env.credit.open.value, false)
+  } finally {value.app.unmount()}
+})
+
+test('pipeline retry uses the saved run and paid descendants even when the current editor is a local pipeline', async () => {
+  const env = environment(); env.balance.balance.value = {unlimited: false, actualBalanceUsd: '0', outstandingCount: 0}
+  const value = await mount(env)
+  try {
+    value.exposed.useTemplate(PIPELINE_TEMPLATES.find(template => template.id === 'clean-catalog'))
+    const original = run(); original.status = 'failed'; original.items[0]!.steps.forEach(step => {step.status = 'failed'})
+    value.exposed.activeRun.value = original
+    const inputStep = original.items[0]!.steps.find(step => step.type === 'image-input')!
+    await value.exposed.retryRun([inputStep.id])
+    assert.equal(env.calls.some((call: any) => call.url.endsWith('/retry')), false)
+    assert.equal(env.credit.open.value, true); assert.equal(value.exposed.runError.value, '')
+  } finally {value.app.unmount()}
+})
+
+test('an authoritative pipeline 402 and a background exhausted step show a deduplicated balance notice', async () => {
+  const env = environment((url, options) => {
+    if (url.endsWith('/runs')) throw {statusCode: 402, data: {data: {code: 'CREDIT_EXHAUSTED'}}}
+    if (url === '/api/image-models') return {items: SUPPORTED_IMAGE_MODEL_IDS.map(id => ({id, catalogStatus: 'available'}))}
+    if (url === '/api/pipelines') return options.method === 'POST' ? {pipeline: {...saved(), ...options.body}} : {pipelines: [saved()], nextCursor: null}
+    return {pipeline: saved()}
+  })
+  const value = await mount(env)
+  try {
+    value.exposed.useTemplate(PIPELINE_TEMPLATES.find(template => template.id === 'product-photo'))
+    await value.exposed.prepareRun(); value.exposed.batchImages.value = [source]
+    await value.exposed.startRun()
+    assert.equal(env.credit.open.value, true); assert.equal(value.exposed.runError.value, '')
+    env.credit.close()
+    env.balance.balance.value = {unlimited: false, actualBalanceUsd: '0', outstandingCount: 0}
+    const failed = run(); failed.status = 'failed'
+    failed.items[0]!.steps.find(step => step.type === 'generate-image')!.error = {code: 'CREDIT_EXHAUSTED', message: 'Credit exhausted', retryable: true}
+    value.exposed.activeRun.value = failed
+    await flush(); assert.equal(env.credit.open.value, true)
+    env.credit.close(); value.exposed.activeRun.value = structuredClone(failed)
+    await flush(); assert.equal(env.credit.open.value, false, 'closing a notice survives identical polling responses')
+  } finally {value.app.unmount()}
+})
+
+test('historical background credit failures use fresh balance and do not ask topped-up or unlimited users for credit', async () => {
+  for (const fresh of [{unlimited: false, actualBalanceUsd: '0.000000000001', outstandingCount: 0}, {unlimited: true, actualBalanceUsd: null, outstandingCount: 4}]) {
+    const env = environment(); env.balance.balance.value = {unlimited: false, actualBalanceUsd: '0', outstandingCount: 0}
+    let checks = 0
+    env.balance.refresh = async (options: {force?: boolean} = {}) => {
+      if (options.force) checks++
+      env.balance.balance.value = fresh
+      return fresh
+    }
+    const value = await mount(env)
+    try {
+      const failed = run(); failed.status = 'failed'
+      failed.items[0]!.steps.find(step => step.type === 'generate-image')!.error = {code: 'CREDIT_EXHAUSTED', message: 'Credit exhausted', retryable: true}
+      value.exposed.activeRun.value = failed
+      await flush()
+      assert.equal(checks, 1); assert.equal(env.credit.open.value, false)
+      assert.equal(value.exposed.runError.value, '')
+      value.exposed.activeRun.value = structuredClone(failed)
+      await flush(); assert.equal(checks, 1, 'identical saved failures must not keep checking credit')
+    } finally {value.app.unmount()}
+  }
+})
+
 test("uncertain run submission reuses one idempotency key and does not duplicate accepted work", async () => {
   let attempts = 0;
   const env = environment((url, options) => {

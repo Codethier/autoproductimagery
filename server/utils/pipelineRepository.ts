@@ -9,7 +9,7 @@ import type {AssetActor} from './assetAccess'
 import {assertGenerationCredit} from './accountBilling'
 import {createPeopleRepository} from './peopleRepository'
 import {hasConfirmedGenerationPrice} from '../../schemas/generation-billing'
-import {formatUsdUnits} from '../../schemas/account-billing'
+import {CREDIT_EXHAUSTED_CODE, CREDIT_EXHAUSTED_MESSAGE, formatUsdUnits} from '../../schemas/account-billing'
 import {SavePipelineSchema, UpdatePipelineSchema, StartPipelineRunSchema, RetryPipelineRunSchema,
     getPipelineExecutionNodes, pipelineRunIssues, pipelineExpectedNodeOutputs, PIPELINE_LIMITS,
     type PipelineDTO, type PipelineListDTO, type PipelineRunDTO, type PipelineRunStepDTO, type PipelineValue,
@@ -28,12 +28,14 @@ const liveStatuses: PipelineRunState[] = ['queued', 'running', 'awaiting-price']
 const terminalStepStatuses: PipelineStepState[] = ['succeeded', 'failed', 'skipped', 'cancelled', 'interrupted']
 const date = (value: string | null) => value ? new Date(value).toISOString() : null
 const invalid = (message = 'Invalid pipeline request'): never => {throw createError({statusCode: 400, statusMessage: message})}
+const isPaidNode = (node: PipelineNode) => ['generate-image', 'expand', 'translate', 'describe-image', 'prompt-enhancer', 'llm'].includes(node.type)
+    || node.type === 'upscale' && node.config.mode === 'ai'
 export const emptyPipelineValue = (): PipelineValue => ({images: [], text: null})
 export function safePipelineError(error: unknown) {
     const value = error && typeof error === 'object' ? error as {statusCode?: number; code?: string; data?: {code?: string}; retryable?: boolean} : {}
     const status = value.statusCode
     const code = value.code ?? value.data?.code
-    if (status === 402) return {code: 'CREDIT_EXHAUSTED', message: 'Your available credit is exhausted. Ask your organization owner to update your balance.', retryable: true}
+    if (status === 402) return {code: CREDIT_EXHAUSTED_CODE, message: CREDIT_EXHAUSTED_MESSAGE, retryable: true}
     if (status === 409) return {code: 'WORK_BLOCKED', message: 'This step is waiting for confirmed prices or an active execution to finish.', retryable: true}
     if ([401, 403, 404, 410, 425].includes(status ?? 0)) return {code: 'SOURCE_UNAVAILABLE', message: 'A required image or account is no longer available.', retryable: false}
     if (status === 429) return {code: 'CAPACITY_UNAVAILABLE', message: 'Processing capacity is busy. Retry this step later.', retryable: true}
@@ -43,7 +45,10 @@ export function safePipelineError(error: unknown) {
 }
 export function pipelineRequestError(error: unknown): never {
     const value = error as {statusCode?: number; statusMessage?: string; data?: unknown}
-    if (value && typeof value.statusCode === 'number' && [400, 401, 402, 403, 404, 409, 413, 415, 429].includes(value.statusCode)) {
+    // Forward only the public credit discriminator, never arbitrary provider
+    // diagnostics, credentials or repository error data.
+    if (value?.statusCode === 402) throw createError({statusCode: 402, statusMessage: CREDIT_EXHAUSTED_MESSAGE, data: {code: CREDIT_EXHAUSTED_CODE}})
+    if (value && typeof value.statusCode === 'number' && [400, 401, 403, 404, 409, 413, 415, 429].includes(value.statusCode)) {
         throw createError({statusCode: value.statusCode, statusMessage: value.statusMessage ?? 'Pipeline request failed'})
     }
     console.error('Pipeline storage is temporarily unavailable.')
@@ -253,7 +258,7 @@ export function createPipelineRepository(actor: PipelineActor, db: Database = ge
             if (node.type === 'image-input' && node.config.required && !(node.id === input.batchInputNodeId && input.inputImages.length) && !(input.inputs[node.id] || node.config.defaultImage)) invalid(`${node.label}: choose an image.`)
             if (node.type === 'text-input' && node.config.required && !(input.inputs[node.id] ?? node.config.defaultValue).trim()) invalid(`${node.label}: enter text.`)
         }
-        const hasPaidNodes = nodes.some(node => ['generate-image','expand','translate','describe-image','prompt-enhancer','llm'].includes(node.type) || node.type === 'upscale' && node.config.mode === 'ai')
+        const hasPaidNodes = nodes.some(isPaidNode)
         const images = input.inputImages.length ? input.inputImages : [null]
         boundExecution(nodes, definition, images.length)
         const sourceUrls = [...input.inputImages, ...graphSources(definition, nodes, input.inputs, input.batchInputNodeId)]
@@ -587,6 +592,11 @@ export function createPipelineRepository(actor: PipelineActor, db: Database = ge
                 while (changed) {changed = false; for (const edge of run.definition.edges) if (descendants.has(edge.source) && !descendants.has(edge.target)) {descendants.add(edge.target); changed = true}}
                 for (const sibling of steps.filter(value => value.itemId === step.itemId && descendants.has(value.nodeId))) affected.add(sibling.id)
             }
+            // A retry is new provider work, including paid descendants of a
+            // local node. Refuse it before replacing any steps. A fresh server
+            // batch ID must not use the existing-batch persistence allowance.
+            const affectedNodes = run.definition.nodes.filter(node => steps.some(step => affected.has(step.id) && step.nodeId === node.id))
+            if (affectedNodes.some(isPaidNode)) await assertGenerationCredit(tx, actor, randomUUID())
             for (const step of steps.filter(value => affected.has(value.id))) {
                 if (step.attempt >= 5) throw createError({statusCode: 409, statusMessage: 'This step reached its retry limit; start a new run'})
                 await tx.update(pipelineRunSteps).set({active: false, updatedAt: sql`CURRENT_TIMESTAMP`}).where(eq(pipelineRunSteps.id, step.id))

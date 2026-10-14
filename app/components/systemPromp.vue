@@ -39,6 +39,7 @@ type SystemPrompt = {
 
 const props = defineProps<{ data: SystemPrompt }>()
 const account = useAccount()
+const generationCredit = useGenerationCredit()
 // A history card belongs to the account that created this component. Do not
 // rebind old replay data to a new session when the browser changes accounts.
 const cardAccount = {identity: account.identity.value, epoch: account.epoch.value}
@@ -179,7 +180,7 @@ watch(
 
 async function sendRefine() {
   const text = chatInput.value.trim()
-  if (!cardIsCurrent.value || !text || chatLoading.value) return
+  if (!cardIsCurrent.value || !text || chatLoading.value || generationCredit.checking.value) return
   if (!currentImage.value) {
     toast.add({
       title: 'No image to refine',
@@ -194,9 +195,13 @@ async function sendRefine() {
     toast.add({ title: 'Original model is unavailable', description: 'This legacy item cannot be refined safely without choosing a replacement explicitly.', color: 'warning' })
     return
   }
-  chatInput.value = ''
   chatLoading.value = true
   try {
+    if (!await generationCredit.ensureCredit() || !cardIsCurrent.value) {
+      if (cardIsCurrent.value && !generationCredit.open.value && generationCredit.blockedReason.value) toast.add({title: 'Generation unavailable', description: generationCredit.blockedReason.value, color: 'warning'})
+      return
+    }
+    chatInput.value = ''
     const res = await $fetch<{ ok: boolean; obj: SystemPrompt[] }>('/api/image-generate', {
       method: 'POST',
       body: {
@@ -222,6 +227,8 @@ async function sendRefine() {
       toast.add({ title: 'Refinement failed', description: row?.errors || 'Unknown error', color: 'warning' })
     }
   } catch (e: any) {
+    if (!cardIsCurrent.value) return
+    if (await generationCredit.handleError(e)) { if (cardIsCurrent.value && !chatInput.value) chatInput.value = text; return }
     if (cardIsCurrent.value) toast.add({ title: 'Refinement failed', description: e?.data?.statusMessage || e?.message || 'Request failed', color: 'warning' })
   } finally {
     if (cardIsCurrent.value) chatLoading.value = false
@@ -236,7 +243,7 @@ function onChatKeydown(e: KeyboardEvent) {
 }
 
 async function regenerate() {
-  if (!cardIsCurrent.value || regenLoading.value) return
+  if (!cardIsCurrent.value || regenLoading.value || generationCredit.checking.value) return
   try {
     regenLoading.value = true
     const storedInputImages = Array.isArray(props.data?.serverImages) ? props.data.serverImages : []
@@ -277,6 +284,11 @@ async function regenerate() {
         ? config.maskImage
         : undefined
 
+    if (!await generationCredit.ensureCredit() || !cardIsCurrent.value) {
+      if (cardIsCurrent.value && !generationCredit.open.value && generationCredit.blockedReason.value) toast.add({title: 'Generation unavailable', description: generationCredit.blockedReason.value, color: 'warning'})
+      return
+    }
+
     // Ask the user to edit/confirm the prompt before regenerating
     const currentPrompt = props.data?.TextPrompt || ''
     const editedPrompt = typeof window !== 'undefined' ? window.prompt('Edit prompt before regenerating:', currentPrompt) : currentPrompt
@@ -290,6 +302,10 @@ async function regenerate() {
     // Run the job count times
     for (let i = 0; i < count; i++) {
       if (!cardIsCurrent.value) return
+      if (!await generationCredit.ensureCredit() || !cardIsCurrent.value) {
+        if (cardIsCurrent.value && !generationCredit.open.value && generationCredit.blockedReason.value) toast.add({title: 'Generation unavailable', description: generationCredit.blockedReason.value, color: 'warning'})
+        return
+      }
       const res = await $fetch<{ ok: boolean; obj: SystemPrompt[] }>('/api/image-generate', {
         method: 'POST',
         body: {
@@ -316,6 +332,8 @@ async function regenerate() {
 
     toast.add({ title: 'Regeneration started', description: `Created ${count} job${count > 1 ? 's' : ''}.` })
   } catch (e: any) {
+    if (!cardIsCurrent.value) return
+    if (await generationCredit.handleError(e)) return
     if (!cardIsCurrent.value) return
     toast.add({
       title: 'Regeneration failed',
