@@ -6,6 +6,7 @@ import { buildComposerRequest, composerSources, imageName, type GenerationCompos
 import { isNewImageModel, orderImageModels } from '../../schemas/image-model-discovery'
 import { useImageModelFavourites } from '../composables/useImageModelFavourites'
 import { watchImageModelSelection } from '../utils/watchImageModelSelection'
+import {validateAssetUploads} from '../utils/assetPreferences'
 import {hasConfirmedGenerationPrice} from '~~/schemas/generation-billing'
 import {formatBalanceUsd, formatUsd, generationPriceLabel, type GenerationPrice} from '../utils/generationPrice'
 import {parseUsdUnits} from '~~/schemas/account-billing'
@@ -483,7 +484,7 @@ watch(() => route.query.source, (source) => {
 function chooseSource(source: string) {
   if (isEdit.value) data.editSource = source
   else if (!data.inputImages.includes(source)) {
-    if (data.inputImages.length >= 20) { errorMsg.value = 'A batch supports at most 20 input images.'; return }
+    if (data.inputImages.length >= 50) { errorMsg.value = 'A batch supports at most 50 input images.'; return }
     data.inputImages.push(source)
   }
   errorMsg.value = null
@@ -505,8 +506,8 @@ function confirmPicker(files: SelectableFile[]) {
   const urls = files.map(file => file.url)
   if (pickerKind.value === 'source') {
     if (isEdit.value) data.editSource = urls[0] || null
-    else if (urls.length <= 20) data.inputImages = urls
-    else { errorMsg.value = 'A batch supports at most 20 input images.'; return }
+    else if (urls.length <= 50) data.inputImages = urls
+    else { errorMsg.value = 'A batch supports at most 50 input images.'; return }
   } else if (pickerKind.value === 'references') {
     data.models = urls
   } else data.maskImage = urls[0] || null
@@ -521,14 +522,12 @@ async function uploadFiles(files: File[]) {
     errorMsg.value = 'Choose one image for Edit. Use Same-origin batch for multiple images.'
     return
   }
-  if (files.length + (isEdit.value ? 0 : data.inputImages.length) > 20) {
-    errorMsg.value = 'A batch supports at most 20 input images.'
+  if (files.length + (isEdit.value ? 0 : data.inputImages.length) > 50) {
+    errorMsg.value = 'A batch supports at most 50 input images.'
     return
   }
-  if (files.some(file => file.size > 25 * 1024 * 1024) || files.reduce((bytes, file) => bytes + file.size, 0) > 100 * 1024 * 1024) {
-    errorMsg.value = 'Images must be under 25 MB each and uploads under 100 MB in total.'
-    return
-  }
+  const invalid = validateAssetUploads(files)
+  if (invalid) { errorMsg.value = invalid; return }
   uploading.value = true
   errorMsg.value = null
   const snapshot = accountSnapshot()
@@ -709,7 +708,8 @@ async function submit() {
       <template #body>
         <AssetBrowser v-model:selected-urls="pickerSelection"
                       :selection-mode="pickerKind === 'references' || (pickerKind === 'source' && !isEdit) ? 'multiple' : 'single'"
-                      :max-selection="pickerKind === 'references' ? Math.max(0, selectedProfile.maxReferenceImages - 1) : pickerKind === 'source' && !isEdit ? 20 : 1"
+                      :max-selection="pickerKind === 'references' ? Math.max(0, selectedProfile.maxReferenceImages - 1) : pickerKind === 'source' && !isEdit ? 50 : 1"
+                      :selection-cap="pickerKind === 'source' && !isEdit ? 50 : 20"
                       :accepted-extensions="pickerKind === 'mask' ? ['png'] : undefined"
                       @confirm="confirmPicker" />
       </template>
@@ -738,7 +738,7 @@ async function submit() {
               <UButton color="neutral" variant="soft" icon="i-lucide-folder" @click="openPicker('source')">Assets</UButton>
             </div>
             <div class="studio-file-types"><span>JPG</span><span>PNG</span><span>WebP</span><span>HEIC</span></div>
-            <p class="studio-upload-limits">Images only · up to 25 MB per image{{ isEdit ? '' : ' · up to 20 inputs' }}</p>
+            <p class="studio-upload-limits">Images only · up to 25 MB per image{{ isEdit ? '' : ' · up to 50 inputs · 100 MB total' }}</p>
           </div>
           <div v-if="recentImages.length" class="studio-recent">
             <span>Continue editing</span>
@@ -793,7 +793,7 @@ async function submit() {
               <div class="studio-input-preview"><img :src="sourceUrl(image, 480)" :alt="`Input ${index + 1}: ${imageName(image)}`" loading="lazy" decoding="async"><span class="studio-input-number">{{ index + 1 }}</span><button type="button" :aria-label="`Remove ${imageName(image)} from batch`" @click="removeSource(image)"><UIcon name="i-lucide-x" class="size-4" /></button></div>
               <div class="studio-input-caption"><span :title="imageName(image)">{{ imageName(image) }}</span><small>{{ outputsPerJob }} output{{ outputsPerJob === 1 ? '' : 's' }}</small></div>
             </div>
-            <button v-if="sourceImages.length < 20" type="button" class="studio-add-card" @click="uploadInput?.click()"><UIcon name="i-lucide-plus" class="size-7" /><span>Add images</span><small>or drop them here</small></button>
+            <button v-if="sourceImages.length < 50" type="button" class="studio-add-card" @click="uploadInput?.click()"><UIcon name="i-lucide-plus" class="size-7" /><span>Add images</span><small>or drop them here</small></button>
           </div>
         </template>
       </section>
@@ -814,6 +814,7 @@ async function submit() {
             <div class="studio-model-meta"><UBadge v-if="selectedProfile.supportsTransparentBackground" class="model-transparent-badge" size="xs" color="neutral" variant="subtle" title="Supports transparent image output; enable it in model settings." aria-label="Supports transparent image output">Transparent</UBadge><UBadge v-if="isNewImageModel(data.selectedModel)" size="xs" color="primary" variant="subtle">New</UBadge><span v-if="selectedProfile.lifecycle === 'recommended'">Recommended</span><span v-if="selectedIsFavourite">Favourite</span></div>
             <p v-if="selectedProfile.supportsTransparentBackground" class="studio-help">For a transparent image, choose Background → Transparent in Model settings and use PNG or WebP.</p>
             <p v-if="!favouritesPersistent" role="status" class="studio-notice">Browser storage is unavailable. Favourites last for this visit.</p>
+            <ModelGuidance :model-id="data.selectedModel" :settings="data.generationSettings" compact />
           </div>
           <details class="studio-settings">
             <summary><span>Model settings</span><UIcon name="i-lucide-sliders-horizontal" class="size-4" /></summary>

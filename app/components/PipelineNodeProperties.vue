@@ -20,6 +20,14 @@ import {
   orderImageModels,
 } from "../../schemas/image-model-discovery";
 import { BACKGROUND_REMOVAL_MODELS } from "../../schemas/background-removal-models";
+import {
+  PIPELINE_TEXT_MODEL_IDS,
+  PIPELINE_TEXT_MODEL_PROFILES,
+  GEMINI_ENHANCER_THINKING_BUDGETS,
+  createPromptEnhancerConfig,
+  pipelineTextSupportsTemperature,
+  type PipelineTextModelId,
+} from "../../schemas/pipeline-text-models";
 import { useImageModelFavourites } from "../composables/useImageModelFavourites";
 import { imagePreviewUrl } from "../utils/imageDelivery";
 import { pipelineNodeIcon } from "../utils/pipelineTemplates";
@@ -69,6 +77,14 @@ const ai = computed(() =>
 );
 const imageProfile = computed(() =>
   ai.value ? IMAGE_MODEL_PROFILES[ai.value.model] : null,
+);
+const textProfile = computed(() =>
+  props.node.type === "prompt-enhancer" || props.node.type === "describe-image" || props.node.type === "llm"
+    ? PIPELINE_TEXT_MODEL_PROFILES[props.node.config.model] : null,
+);
+const textTemperatureEnabled = computed(() =>
+  (props.node.type === "prompt-enhancer" || props.node.type === "describe-image" || props.node.type === "llm")
+    && pipelineTextSupportsTemperature(props.node.config),
 );
 const ports = computed(() => getPipelineNodePorts(props.node));
 const orderedModels = computed(() =>
@@ -164,6 +180,37 @@ function changeModel(event: Event) {
   const model = (event.target as HTMLSelectElement).value as ImageModelId;
   if (!SUPPORTED_IMAGE_MODEL_IDS.includes(model)) return;
   updateNode({ model, settings: createDefaultSettings(model) });
+}
+function changeEnhancerModel(event: Event) {
+  if (props.disabled || draftNode.value.type !== "prompt-enhancer") return;
+  const model = (event.target as HTMLSelectElement).value as PipelineTextModelId;
+  if (!PIPELINE_TEXT_MODEL_IDS.includes(model)) return;
+  const current = draftNode.value.config;
+  const parsed = PipelineNodeSchema.safeParse({...draftNode.value, config: {
+    ...createPromptEnhancerConfig(model), prompt: current.prompt, systemPrompt: current.systemPrompt,
+  }});
+  if (!parsed.success) return;
+  errorMessage.value = "";
+  draftNode.value = parsed.data;
+  emit("update", parsed.data);
+}
+function changeEnhancerReasoning(event: Event) {
+  if (props.disabled || draftNode.value.type !== "prompt-enhancer") return;
+  const reasoningEffort = (event.target as HTMLSelectElement).value;
+  const current = draftNode.value.config;
+  const next = {...current, reasoningEffort};
+  if (next.model === "openai/gpt-6-luna") {
+    if (reasoningEffort !== "none") delete next.temperature;
+    else next.temperature ??= 0.5;
+  }
+  if (next.model === "google/gemini-2.5-flash" && reasoningEffort in GEMINI_ENHANCER_THINKING_BUDGETS)
+    next.maxOutputTokens = Math.max(next.maxOutputTokens,
+      GEMINI_ENHANCER_THINKING_BUDGETS[reasoningEffort as keyof typeof GEMINI_ENHANCER_THINKING_BUDGETS] + 64);
+  const parsed = PipelineNodeSchema.safeParse({...draftNode.value, config: next});
+  if (!parsed.success) return;
+  errorMessage.value = "";
+  draftNode.value = parsed.data;
+  emit("update", parsed.data);
 }
 function settings(value: ImageGenerationSettings) {
   updateNode({ settings: value });
@@ -512,6 +559,7 @@ watch(
           <p v-if="imageProfile.requiresMask" class="pipeline-help">
             This model requires a connected mask or a selected mask picture.
           </p>
+          <ModelGuidance :model-id="ai.model" :settings="ai.settings" context="pipeline" compact />
           <details class="pipeline-model-settings">
             <summary>
               Model settings
@@ -855,9 +903,21 @@ watch(
             node.type === 'prompt-enhancer' ||
             node.type === 'llm'
           "
-          ><p class="pipeline-help">
-            Gemini 2.5 Flash through AI Gateway. Text steps have confirmed usage
-            costs too.
+          >
+          <template v-if="node.type === 'prompt-enhancer'">
+            <label class="pipeline-label" for="pipeline-enhancer-model">Prompt enhancement model</label>
+            <select id="pipeline-enhancer-model" class="pipeline-input" :value="node.config.model" :disabled="disabled" @change="changeEnhancerModel">
+              <option v-for="id in PIPELINE_TEXT_MODEL_IDS" :key="id" :value="id">{{ PIPELINE_TEXT_MODEL_PROFILES[id].name }}</option>
+            </select>
+            <p class="pipeline-help">{{ textProfile?.description }} These steps improve text; connect their output to an image generator’s Prompt input.</p>
+            <label class="pipeline-label" for="pipeline-enhancer-reasoning">Reasoning effort (attention level)</label>
+            <select id="pipeline-enhancer-reasoning" class="pipeline-input" :value="node.config.reasoningEffort ?? 'none'" :disabled="disabled" @change="changeEnhancerReasoning">
+              <option v-for="level in textProfile?.reasoningLevels" :key="level" :value="level">{{ level === 'xhigh' ? 'Extra high' : level.charAt(0).toUpperCase() + level.slice(1) }}</option>
+            </select>
+            <p class="pipeline-help">{{ textProfile?.reasoningHelp }}</p>
+          </template>
+          <p class="pipeline-help">
+            {{ textProfile?.name }} through AI Gateway. Text steps have confirmed usage costs too; their prices appear after Gateway confirms them.
           </p>
           <label class="pipeline-label" for="pipeline-system-prompt"
             >System instruction</label
@@ -881,7 +941,7 @@ watch(
             :disabled="disabled"
             @input="text('prompt', $event)" />
           <div class="pipeline-field-grid">
-            <div>
+            <div v-if="textTemperatureEnabled">
               <label class="pipeline-label" for="pipeline-temperature"
                 >Temperature</label
               ><input
@@ -889,7 +949,7 @@ watch(
                 class="pipeline-input"
                 type="number"
                 min="0"
-                max="2"
+                :max="textProfile?.temperatureMax ?? 2"
                 step="0.1"
                 :value="node.config.temperature"
                 :disabled="disabled"
@@ -898,13 +958,13 @@ watch(
             </div>
             <div>
               <label class="pipeline-label" for="pipeline-text-tokens"
-                >Max tokens</label
+                >Output token cap</label
               ><input
                 id="pipeline-text-tokens"
                 class="pipeline-input"
                 type="number"
                 min="64"
-                max="4096"
+                :max="textProfile?.maxOutputTokens ?? 4096"
                 :value="node.config.maxOutputTokens"
                 :disabled="disabled"
                 @input="numeric('maxOutputTokens', $event)"

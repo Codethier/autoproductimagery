@@ -1,4 +1,5 @@
 import type {AssetFile} from '../../schemas/image-storage'
+import {MAX_UPLOAD_FILES, MAX_UPLOAD_FILE_BYTES, MAX_UPLOAD_AGGREGATE_BYTES} from '../../schemas/upload-limits'
 
 export const ASSET_FAVOURITES_KEY = 'autoproductimagery.asset-favourites.v1'
 export const MAX_ASSET_FAVOURITES = 200
@@ -79,10 +80,10 @@ export function assetSelectionLimit(mode?: 'single' | 'multiple', requested?: nu
 
 export function validateAssetUploads(files: readonly Pick<File, 'name' | 'size' | 'type'>[]): string | undefined {
     if (!files.length) return 'Choose at least one image.'
-    if (files.length > 20) return 'Upload up to 20 images at a time.'
-    if (files.reduce((total, file) => total + file.size, 0) > 100 * 1024 * 1024) return 'The selected images exceed the 100 MB upload limit.'
+    if (files.length > MAX_UPLOAD_FILES) return `Upload up to ${MAX_UPLOAD_FILES} images at a time.`
+    if (files.reduce((total, file) => total + file.size, 0) > MAX_UPLOAD_AGGREGATE_BYTES) return 'The selected images exceed the 100 MB upload limit.'
     for (const file of files) {
-        if (file.size > 25 * 1024 * 1024) return `“${file.name}” exceeds the 25 MB image limit.`
+        if (file.size > MAX_UPLOAD_FILE_BYTES) return `“${file.name}” exceeds the 25 MB image limit.`
         if (!file.size) return `“${file.name}” is empty.`
         const extension = file.name.split('.').at(-1)?.toLowerCase() ?? ''
         if (!SUPPORTED_EXTENSIONS.has(extension) || (file.type && !['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/bmp', 'image/x-ms-bmp', 'image/tiff', 'image/heic', 'image/heif'].includes(file.type))) {

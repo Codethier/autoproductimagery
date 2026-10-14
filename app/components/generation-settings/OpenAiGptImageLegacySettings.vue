@@ -40,6 +40,7 @@ function setCompression(event: Event) {
           <option value="">Model default</option>
           <option v-for="size in GPT_IMAGE_LEGACY_SIZES" :key="size" :value="size">{{ size }}</option>
         </select>
+        <span class="setting-help">Dimensions of the generated picture. Choose square, landscape, or portrait; the source and mask dimensions stay unchanged.</span>
       </label>
       <label class="text-sm font-medium">Quality
         <select v-model="settings.quality" class="setting-input">
@@ -51,18 +52,18 @@ function setCompression(event: Event) {
         <select v-model="settings.background" class="setting-input">
           <option value="auto">Auto</option><option value="opaque">Opaque</option><option value="transparent">Transparent</option>
         </select>
-        <span class="setting-help">Transparent backgrounds require PNG or WebP.</span>
+        <span class="setting-help">Auto lets the model decide; Opaque fills the background; Transparent preserves empty areas using PNG or WebP.</span>
       </label>
       <label class="text-sm font-medium">Output format
         <select v-model="settings.outputFormat" class="setting-input">
           <option value="png">PNG</option><option value="jpeg" :disabled="settings.background === 'transparent'">JPEG</option><option value="webp">WebP</option>
         </select>
-        <span class="setting-help">JPEG is usually fastest; PNG disables compression.</span>
+        <span class="setting-help">PNG or WebP can preserve transparency when enabled. JPEG cannot. PNG has no compression control.</span>
       </label>
       <label class="text-sm font-medium">Output compression
         <input class="setting-input" type="number" min="0" max="100" step="1"
                :disabled="compressionDisabled" :value="settings.outputCompression ?? ''" @input="setCompression">
-        <span class="setting-help">Optional, 0–100. Available only for JPEG and WebP.</span>
+        <span class="setting-help">Optional compression value, 0–100, for JPEG or WebP. It affects file size and image detail; blank uses the model default.</span>
       </label>
       <label class="text-sm font-medium">Moderation
         <select v-model="settings.moderation" class="setting-input">

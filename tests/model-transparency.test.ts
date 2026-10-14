@@ -127,6 +127,7 @@ function props(surface: Surface, env: ReturnType<typeof environment>) {
   return {node: env.pipeline.node, definition: {version: 1, nodes: [env.pipeline.node], edges: []}, models: env.models, onUpdate: (node: PipelineNode) => {env.pipeline.node = node}}
 }
 function primitives(app: ReturnType<typeof createSSRApp>) {
+  app.component('ModelGuidance', {render: () => null})
   app.component('UIcon', {render: () => h('span', {'aria-hidden': true})})
   app.component('UButton', {props: ['disabled'], setup: (props: any, {slots}: any) => () => h('button', {disabled: props.disabled}, slots.default?.())})
   app.component('UBadge', {setup: (_: unknown, {slots}: any) => () => h('span', slots.default?.())})

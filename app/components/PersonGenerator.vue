@@ -8,6 +8,7 @@ import {hasConfirmedGenerationPrice} from '../../schemas/generation-billing'
 import {useImageModelFavourites} from '../composables/useImageModelFavourites'
 import {formatBalanceUsd} from '../utils/generationPrice'
 import {imagePreviewUrl} from '../utils/imageDelivery'
+import {selectImageRange} from '../utils/imageSelection'
 import Gemini31FlashImageSettings from './generation-settings/Gemini31FlashImageSettings.vue'
 import Gemini3ProImageSettings from './generation-settings/Gemini3ProImageSettings.vue'
 import Gemini31FlashLiteImageSettings from './generation-settings/Gemini31FlashLiteImageSettings.vue'
@@ -31,6 +32,8 @@ const settings = ref<ImageGenerationSettings>(createDefaultSettings(DEFAULT_IMAG
 const scene = ref('A natural studio portrait, neutral background, soft light, realistic detail.')
 const pictureCount = ref(1)
 const referenceUrls = ref<string[]>([])
+const referenceAnchor = ref('')
+const referenceSelectionNotice = ref('')
 const models = ref<Array<{id: string; catalogStatus: 'available' | 'unavailable' | 'unknown'; availabilityNote?: string}>>([])
 const loadingModels = ref(false)
 const generating = ref(false)
@@ -70,10 +73,14 @@ async function loadModels() {
   catch { if (current(value)) errorMessage.value = 'Could not load image models. Try again.' }
   finally { if (current(value)) loadingModels.value = false }
 }
-function toggleReference(url: string) {
-  if (generating.value || !eligiblePhotos.value.some(photo => photo.url === url)) return
-  if (referenceUrls.value.includes(url)) referenceUrls.value = referenceUrls.value.filter(value => value !== url)
-  else if (selectedReferences.value.length < profile.value.maxReferenceImages) referenceUrls.value.push(url)
+function toggleReference(url: string, event?: Pick<MouseEvent, 'shiftKey'>) {
+  if (!currentAccount.value || generating.value || !eligiblePhotos.value.some(photo => photo.url === url)) return
+  const result = selectImageRange(selectedReferences.value, eligiblePhotos.value.map(photo => photo.url), url, {
+    anchor: referenceAnchor.value, shift: event?.shiftKey, limit: profile.value.maxReferenceImages,
+  })
+  referenceUrls.value = result.selection
+  referenceAnchor.value = result.anchor
+  referenceSelectionNotice.value = result.limited ? `This model accepts up to ${profile.value.maxReferenceImages} identity references. Only pictures that fit were selected.` : ''
 }
 function generationPrompt() {
   return [selectedReferences.value.length ? 'Create a new photograph of the same adult person shown in the reference images. Preserve their facial identity and distinctive features.' : 'Create a fictional adult person for a product photography reference.', `Person: ${props.person.name}.`, props.person.description.trim() ? `Appearance and character: ${props.person.description.trim()}` : '', `Photograph: ${scene.value.trim()}`].filter(Boolean).join('\n\n')
@@ -110,7 +117,10 @@ function keydown(event: KeyboardEvent) {
     else if (!event.shiftKey && document.activeElement === elements.at(-1)) { event.preventDefault(); elements[0]?.focus() }
   }
 }
-watch(model, () => { settings.value = createDefaultSettings(model.value); errorMessage.value = '' }, {flush: 'sync'})
+watch(model, () => { settings.value = createDefaultSettings(model.value); errorMessage.value = ''; referenceAnchor.value = ''; referenceSelectionNotice.value = '' }, {flush: 'sync'})
+watch(() => props.person.id, () => { referenceAnchor.value = ''; referenceSelectionNotice.value = '' }, {flush: 'sync'})
+watch(eligiblePhotos, photos => { if (!photos.some(photo => photo.url === referenceAnchor.value)) referenceAnchor.value = '' }, {flush: 'sync'})
+watch([account.epoch, account.identity], () => { referenceAnchor.value = ''; referenceSelectionNotice.value = '' }, {flush: 'sync'})
 watch([account.epoch, account.identity], () => { cancelRequests(); for (const controller of generationRequests) controller.abort(); models.value = []; referenceUrls.value = []; scene.value = ''; model.value = DEFAULT_IMAGE_MODEL_ID; settings.value = createDefaultSettings(DEFAULT_IMAGE_MODEL_ID); pictureCount.value = 1; errorMessage.value = ''; generating.value = false; loadingModels.value = false }, {flush: 'sync'})
 onMounted(() => {
   const supplied = (props.selectedUrls ?? []).filter(url => eligiblePhotos.value.some(photo => photo.url === url))
@@ -128,8 +138,9 @@ onBeforeUnmount(() => { cancelRequests(); document.removeEventListener('keydown'
     <header><div><span class="person-eyebrow">People factory</span><h2 id="person-generator-title">Photograph {{ currentAccount ? person.name : 'a person' }}</h2></div><button type="button" class="person-icon" aria-label="Close person generator" @click="close"><UIcon name="i-lucide-x" /></button></header>
     <p class="person-muted">Create their first portrait or explore new looks with the same person as a reference. Pictures join this profile once their exact cost is confirmed.</p>
     <label class="person-label" for="person-scene">Scene, pose & styling</label><textarea id="person-scene" v-model="scene" class="person-input" rows="3" maxlength="12000" :disabled="generating" />
-    <fieldset v-if="eligiblePhotos.length" class="person-identity"><legend>Identity references <span>{{ selectedReferences.length }}/{{ profile.maxReferenceImages }}</span></legend><div><button v-for="photo in eligiblePhotos" :key="photo.id" class="person-reference" :class="{'is-selected': selectedReferences.includes(photo.url)}" type="button" :aria-pressed="selectedReferences.includes(photo.url)" :aria-label="`Use ${photo.name} as identity reference`" :disabled="generating || (!selectedReferences.includes(photo.url) && selectedReferences.length >= profile.maxReferenceImages)" @click="toggleReference(photo.url)"><img :src="imagePreviewUrl(photo.url, 160)" :alt="photo.name" loading="lazy" decoding="async"><span v-if="selectedReferences.includes(photo.url)"><UIcon name="i-lucide-check" /></span></button></div><p class="person-muted">Selected pictures help preserve identity. Different angles and lighting can still vary.</p></fieldset>
+    <fieldset v-if="eligiblePhotos.length" class="person-identity"><legend>Identity references <span>{{ selectedReferences.length }}/{{ profile.maxReferenceImages }}</span></legend><div><button v-for="photo in eligiblePhotos" :key="photo.id" class="person-reference" :class="{'is-selected': selectedReferences.includes(photo.url)}" type="button" :aria-pressed="selectedReferences.includes(photo.url)" :aria-label="`Use ${photo.name} as identity reference`" :disabled="generating" @click="toggleReference(photo.url, $event)"><img :src="imagePreviewUrl(photo.url, 160)" :alt="photo.name" loading="lazy" decoding="async"><span v-if="selectedReferences.includes(photo.url)"><UIcon name="i-lucide-check" /></span></button></div><p class="person-muted">Selected pictures help preserve identity. Click a picture, then Shift-click another to select a range. Different angles and lighting can still vary.</p><p v-if="referenceSelectionNotice" class="person-muted" role="status">{{ referenceSelectionNotice }}</p></fieldset>
     <div class="person-model-row"><div><label class="person-label" for="person-model">Image model</label><div class="person-model-select"><select id="person-model" v-model="model" class="person-input" :disabled="generating || loadingModels"><option v-for="item in orderedModels" :key="item.id" :value="item.id" :disabled="item.disabled">{{ favouriteSet.has(item.id) ? '♥ ' : '' }}{{ item.profile.shortName }}{{ isNewImageModel(item.id) ? ' · New' : '' }}{{ item.profile.supportsTransparentBackground ? ' · Transparent' : '' }}{{ item.profile.requiresMask ? ' · mask required' : item.disabled ? ' · unavailable' : '' }}</option></select><button type="button" class="person-icon" :disabled="!favouritesReady || generating" :aria-pressed="favouriteSet.has(model)" :aria-label="`${favouriteSet.has(model) ? 'Remove' : 'Add'} ${profile.shortName} ${favouriteSet.has(model) ? 'from' : 'to'} favourites`" @click="toggleFavourite(model)"><UIcon name="i-lucide-heart" :class="{'person-heart': favouriteSet.has(model)}" /></button></div></div><div><label class="person-label" for="person-picture-count">Variations</label><select id="person-picture-count" v-model.number="pictureCount" class="person-input" :disabled="generating"><option v-for="count in 4" :key="count" :value="count">{{ count }}</option></select></div></div>
+    <ModelGuidance :model-id="model" :settings="settings" context="people" />
     <p v-if="!favouritesPersistent" class="person-muted" role="status">Favourites last for this visit because browser storage is unavailable.</p><p v-if="profile.requiresMask" class="person-error" role="alert">This model requires a mask and cannot create person portraits here.</p>
     <details class="person-settings"><summary>Model settings <span>{{ profile.shortName }}<small v-if="profile.supportsTransparentBackground" class="person-transparency-badge model-transparent-badge" title="Supports transparent image output; enable it in model settings." aria-label="Supports transparent image output">Transparent</small><small v-if="isNewImageModel(model)">New</small></span></summary><div><p v-if="profile.supportsTransparentBackground" class="person-transparency-help">For a transparent image, choose Background → Transparent and use PNG or WebP.</p><NuxtErrorBoundary :key="model"><component :is="component" v-model="settings" /><template #error><p class="person-error">Settings could not load. <button type="button" @click="settings = createDefaultSettings(model)">Restore defaults</button></p></template></NuxtErrorBoundary></div></details>
     <p v-if="totalPictures > 4" class="person-error" role="alert">Choose fewer variations or reduce the model’s number of images. A person batch can contain up to 4 pictures.</p><p v-if="selectedReferences.length > profile.maxReferenceImages" class="person-error" role="alert">This model accepts up to {{ profile.maxReferenceImages }} reference pictures. Remove some selections.</p>

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import {imagePreviewUrl} from '../utils/imageDelivery'
+import {validateAssetUploads} from '../utils/assetPreferences'
 import type {BreadcrumbItem} from "#ui/components/Breadcrumb.vue";
 import {useDataStore} from "~/stores/data.store";
 import type {SelectableFile} from "~~/schemas/main.dto";
@@ -156,6 +157,8 @@ function buildUploadBody(): FormData {
 
 async function fileFormSubmit() {
   if (images.value.length === 0 || uploading.value) return
+  const invalid = validateAssetUploads(images.value)
+  if (invalid) { toast.add({title: 'Could not upload images', description: invalid, color: 'error'}); return }
   uploading.value = true
   try {
     const result = await $fetch<{ saved: string[]; failed: Array<{ filename: string; reason: string }> }>(
@@ -310,7 +313,7 @@ onBeforeUnmount(() => window.removeEventListener('paste', handlePaste))
       <UBreadcrumb :items="bradCrumbItems" class="col-span-4"/>
       <div class="col-span-4 flex flex-col gap-2">
         <UFileUpload v-model="images" label="Drop your image here" accept="image/*" multiple class="w-96 min-h-48"
-                     description="WEBP, PNG, JPG" icon="i-lucide-image"/>
+                     description="Images only · up to 50 files · 25 MB per image · 100 MB total" icon="i-lucide-image"/>
         <UButton :disabled="images.length === 0 || uploading" :loading="uploading"
                  @click="fileFormSubmit" type="submit" label="Upload"/>
         <UPopover>

@@ -104,6 +104,7 @@ function registerUiPrimitives(app: ReturnType<typeof createSSRApp>) {
   app.component('AssetBrowser', { render: () => null })
   app.component('PeopleBrowser', { render: () => null })
   app.component('BackgroundRemovalPanel', { render: () => null })
+  app.component('ModelGuidance', { props: ['modelId', 'settings', 'context'], setup: (props: any) => () => h('aside', {'data-model-guidance': props.modelId, 'data-guidance-kind': props.settings?.kind}) })
   // The parent must not mount result components until their exact prices exist.
   // A marked stub makes that boundary observable independently of the child's
   // defensive visibility gate tested in generated-image-retention-ui.test.ts.
@@ -500,6 +501,34 @@ test('uploads select the server-assigned immutable image URL instead of rebuildi
   await workspace.exposed.uploadFiles([new File(['test'], 'product.png', {type: 'image/png'})])
   assert.equal(workspace.store.editSource, url)
   assert.equal(workspace.exposed.errorMsg.value, null)
+})
+
+test('Same-origin batch uploads fifty images with shared preflight and rejects fifty-one before sending', async () => {
+  const workspace = await renderWorkspace('batch')
+  const savedFiles = Array.from({length: 50}, (_, index) => ({url: `/images/product-${index}.png`}))
+  const requests: FormData[] = []
+  workspace.environment.fetch = async (_url: string, options: {body: FormData}) => {requests.push(options.body); return {savedFiles, failed: []}}
+  const files = Array.from({length: 50}, (_, index) => new File(['test'], `product-${index}.png`, {type: 'image/png'}))
+  await workspace.exposed.uploadFiles([...files, files[0]!])
+  assert.equal(requests.length, 0)
+  assert.match(workspace.exposed.errorMsg.value, /50 input images/)
+  await workspace.exposed.uploadFiles(files)
+  assert.equal(requests.length, 1)
+  assert.equal(requests[0]!.getAll('files').length, 50)
+  assert.equal(workspace.store.inputImages.length, 50)
+  await workspace.exposed.uploadFiles([files[0]!])
+  assert.equal(requests.length, 1)
+})
+
+test('Same-origin batch assets selection accepts fifty independent inputs and rejects fifty-one', async () => {
+  const workspace = await renderWorkspace('batch')
+  const files = Array.from({length: 50}, (_, index) => ({name: `${index}.png`, url: `/images/${index}.png`}))
+  workspace.exposed.pickerKind.value = 'source'
+  workspace.exposed.confirmPicker(files)
+  assert.equal(workspace.store.inputImages.length, 50)
+  workspace.exposed.confirmPicker([...files, {name: 'extra.png', url: '/images/extra.png'}])
+  assert.equal(workspace.store.inputImages.length, 50)
+  assert.match(workspace.exposed.errorMsg.value, /50 input images/)
 })
 
 for (const outcome of ['success', 'failure'] as const) {

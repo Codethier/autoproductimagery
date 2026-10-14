@@ -3,6 +3,7 @@ import {
   CATALOG_IMAGE_DEFINITIONS, CatalogImageSettingsSchema,
   type CatalogImageSettings, type CatalogImageControl,
 } from '~~/schemas/catalog-image-models'
+import {imageControlHelp} from '~~/schemas/image-model-guidance'
 
 const settings = defineModel<CatalogImageSettings>({required: true})
 const definition = computed(() => CATALOG_IMAGE_DEFINITIONS[settings.value.kind])
@@ -38,6 +39,7 @@ watch(() => settings.value.kind, () => { error.value = '' }, {flush: 'sync'})
         <input v-else-if="control.type === 'checkbox'" type="checkbox" class="ml-2" :checked="checkedFor(control.key)" @change="update(control, $event)">
         <input v-else class="setting-input" type="number" :min="control.min" :max="control.max" :step="control.step"
                :placeholder="control.optional ? 'Model default' : undefined" :value="valueFor(control.key)" @change="update(control, $event)">
+        <span v-if="imageControlHelp(settings.kind, control.key)" class="setting-help">{{ imageControlHelp(settings.kind, control.key) }}</span>
       </label>
     </div>
     <p v-if="!definition.controls.length" class="text-sm text-gray-500">This model chooses the output dimensions and format. Each product generates one image.</p>

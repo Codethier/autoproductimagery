@@ -16,8 +16,8 @@ const progressUrl = new URL('app/composables/usePeopleGenerationProgress.ts', ro
 const favouritesUrl = new URL('app/composables/useImageModelFavourites.ts', root).href
 const key = '__peopleUiTest'
 const exposures: Record<string, string> = {
-  [browserUrl]: 'people, activePerson, photos, pendingCount, failedCount, photoCursor, selection, loading, loadingMore, detailLoading, saving, removing, attaching, detailError, errorMessage, newName, newDescription, editName, editDescription, search, keyword, createOpen, selectionNotice, openPerson, back, loadPeople, loadPerson, pollDetail, togglePhoto, confirm, createPerson, savePerson, deletePerson, attachPhotos, removePhoto, generated, generatorClosed, visibilityChanged, pollingPaused, scope, sources, sourceId, shareTarget, shares, shareUsers, shareRecipient, shareLoading, shareSaving, shareError, openShares, closeShares, loadShares, grantShare, revokeShare, changeScope, editablePerson',
-  [generatorUrl]: 'model, settings, models, referenceUrls, selectedReferences, scene, pictureCount, totalPictures, canGenerate, generate, generating, running, errorMessage, toggleReference, generationPrompt, loadModels',
+  [browserUrl]: 'people, activePerson, photos, pendingCount, failedCount, photoCursor, selection, loading, loadingMore, detailLoading, saving, removing, attaching, detailError, errorMessage, newName, newDescription, editName, editDescription, search, keyword, createOpen, selectionNotice, openPerson, back, loadPeople, loadPerson, pollDetail, togglePhoto, confirm, createPerson, savePerson, deletePerson, attachPhotos, removePhoto, generated, generatorClosed, visibilityChanged, pollingPaused, scope, sources, sourceId, shareTarget, shares, shareUsers, shareRecipient, shareLoading, shareSaving, shareError, openShares, closeShares, loadShares, grantShare, revokeShare, changeScope, editablePerson, selectionAnchor, clearSelection',
+  [generatorUrl]: 'model, settings, models, referenceUrls, selectedReferences, scene, pictureCount, totalPictures, canGenerate, generate, generating, running, errorMessage, toggleReference, generationPrompt, loadModels, referenceAnchor, referenceSelectionNotice',
 }
 registerHooks({
   resolve(specifier, context, nextResolve) {
@@ -68,6 +68,7 @@ function registerComponents(app: any) {
   app.component('NuxtErrorBoundary', {render(this: any) { return this.$slots.default?.() }})
   app.component('AssetBrowser', {render: () => h('div')})
   app.component('PersonGenerator', {render: () => h('div')})
+  app.component('ModelGuidance', {render: () => null})
 }
 async function renderComponent(url: string, options: {env?: ReturnType<typeof environment>; props?: Record<string, unknown>; initialize?: (value: any) => void} = {}) {
   const env = options.env ?? environment(); (globalThis as any)[key] = env
@@ -146,6 +147,58 @@ test('People pipeline batches select fifty independent pictures while normal ref
   const references = await renderComponent(browserUrl, {props: {selectionMode: 'multiple', maxSelection: 50}})
   for (let index = 0; index < 17; index++) references.exposed.togglePhoto(photo({id: `photo-${index}`, url: source.replace('person.png', `person-${index}.png`)}))
   assert.equal(references.exposed.selection.value.length, 16)
+})
+
+test('People Shift selects only confirmed visible photos, preserves other profiles, and respects remaining references', async () => {
+  const photos = Array.from({length: 5}, (_, index) => photo({id: `photo-${index}`, url: source.replace('person.png', `${index}.png`), ...(index === 2 ? {priceSource: 'estimate'} : {})}))
+  const value = await renderComponent(browserUrl, {props: {selectionMode: 'multiple', selectedUrls: [otherSource], maxSelection: 4}, initialize: state => {state.activePerson.value = person(); state.photos.value = photos}})
+  value.exposed.togglePhoto(photos[0])
+  value.exposed.togglePhoto(photos[4], {shiftKey: true})
+  assert.deepEqual(value.exposed.selection.value, [otherSource, photos[0]!.url, photos[1]!.url, photos[3]!.url])
+  assert.match(value.exposed.selectionNotice.value, /up to 4 references/)
+  assert.equal(value.exposed.selection.value.includes(photos[2]!.url), false)
+  value.exposed.clearSelection()
+  assert.equal(value.exposed.selectionAnchor.value, '')
+})
+
+test('People Shift anchors reset on profile, shared source, search and account changes', async () => {
+  const photos = Array.from({length: 4}, (_, index) => photo({id: `photo-${index}`, url: source.replace('person.png', `${index}.png`)}))
+  const env = environment()
+  await renderComponent(browserUrl, {env, props: {selectionMode: 'multiple'}, initialize(state) {
+    state.activePerson.value = person(); state.photos.value = photos
+    state.togglePhoto(photos[0]); state.activePerson.value = person({id: '22222222-2222-4222-8222-222222222222'})
+    assert.equal(state.selectionAnchor.value, '')
+    state.togglePhoto(photos[3], {shiftKey: true}); assert.deepEqual(state.selection.value, [photos[0]!.url, photos[3]!.url])
+    state.sourceId.value = 'another-sharer'; assert.equal(state.selectionAnchor.value, '')
+    state.togglePhoto(photos[1]); state.search.value = 'filtered'; assert.equal(state.selectionAnchor.value, '')
+    state.togglePhoto(photos[1]); env.account.epoch.value += 1
+    assert.equal(state.selectionAnchor.value, ''); assert.deepEqual(state.selection.value, [])
+  }})
+})
+
+test('person identity Shift ranges exclude unconfirmed photos, obey the selected model cap and disabled state', async () => {
+  const photos = Array.from({length: 5}, (_, index) => photo({id: `photo-${index}`, url: source.replace('person.png', `${index}.png`), ...(index === 2 ? {priceSource: 'estimate'} : {})}))
+  const env = environment()
+  const value = await mountComponent(generatorUrl, env, {photos})
+  try {
+    value.exposed.referenceUrls.value = []
+    value.exposed.toggleReference(photos[0]!.url)
+    value.exposed.toggleReference(photos[4]!.url, {shiftKey: true})
+    assert.deepEqual(value.exposed.selectedReferences.value, [photos[0]!.url, photos[1]!.url, photos[3]!.url, photos[4]!.url])
+    const limitedModel = SUPPORTED_IMAGE_MODEL_IDS.find(id => IMAGE_MODEL_PROFILES[id].maxReferenceImages > 0 && IMAGE_MODEL_PROFILES[id].maxReferenceImages < 4)!
+    assert.ok(limitedModel)
+    value.exposed.model.value = limitedModel
+    assert.equal(value.exposed.referenceAnchor.value, '')
+    value.exposed.referenceUrls.value = []
+    value.exposed.toggleReference(photos[0]!.url); value.exposed.toggleReference(photos[4]!.url, {shiftKey: true})
+    assert.equal(value.exposed.selectedReferences.value.length, IMAGE_MODEL_PROFILES[limitedModel].maxReferenceImages)
+    assert.match(value.exposed.referenceSelectionNotice.value, /Only pictures that fit/)
+    const selected = [...value.exposed.selectedReferences.value]
+    value.exposed.generating.value = true; value.exposed.toggleReference(photos[0]!.url)
+    assert.deepEqual(value.exposed.selectedReferences.value, selected)
+    value.exposed.generating.value = false; env.account.epoch.value += 1
+    assert.equal(value.exposed.referenceAnchor.value, ''); assert.deepEqual(value.exposed.selectedReferences.value, [])
+  } finally { value.app.unmount() }
 })
 test('external and unconfirmed images cannot be added to People reference selections', async () => {
   const value = await renderComponent(browserUrl, {props: {selectedUrls: ['https://example.org/photo.png', '//example.org/photo.png', source]}})

@@ -28,7 +28,7 @@ registerHooks({
     if (url !== browserUrl && url !== legacyFilesUrl && url !== layoutUrl && url !== balanceUrl && url !== teamUrl) return nextLoad(url, context)
     const filename = fileURLToPath(url)
     let source = readFileSync(filename, 'utf8')
-    if (url === browserUrl) source = source.replace('</script>', 'defineExpose({files, directories, rootFolders, loading, openSharing, shareTarget, shareRecipient, saveShare, revokeShare, grants, currentFolder, preview, selection, selectedMetadata, confirmSelection, fetchPage, view, backgroundRemovalSources, openBackgroundRemoval, choose, selectionLimit})\n</script>')
+    if (url === browserUrl) source = source.replace('</script>', 'defineExpose({files, directories, rootFolders, loading, openSharing, shareTarget, shareRecipient, saveShare, revokeShare, grants, currentFolder, preview, selection, selectedMetadata, confirmSelection, fetchPage, view, backgroundRemovalSources, openBackgroundRemoval, choose, selectionLimit, selectionAnchor, clearSelection, search, sourceUserId})\n</script>')
     if (url === legacyFilesUrl) source = source.replace('import {useDataStore} from "~/stores/data.store";', '')
     if (url === teamUrl) source = source.replace('</script>', 'defineExpose({openBalance, saveBalance, balanceForm, balanceDetails, balanceError})\n</script>')
     const {descriptor} = parse(source, {filename})
@@ -57,7 +57,7 @@ function fixtureFile(name: string, sourceId: string, permission: 'owner' | 'edit
     permissions: {view: true, edit: permission !== 'view', share: permission === 'owner'}, kind: 'file', source: {userId: sourceId, username: sourceId, displayName: sourceId === 'alice' ? 'Alice' : 'Bea'},
     ...(permission !== 'owner' ? {sharedBy: {userId: sourceId, username: sourceId, displayName: sourceId === 'alice' ? 'Alice' : 'Bea'}} : {})}
 }
-async function renderBrowser(options: {shared?: boolean; files?: AssetFile[]; dirs?: AssetFolder[]; rootFolders?: AssetFolder[]; actorId?: string; currentFolder?: AssetFolder; selected?: boolean; preview?: boolean; sharing?: boolean; pickerLimit?: number; pickerCap?: number} = {}) {
+async function renderBrowser(options: {shared?: boolean; files?: AssetFile[]; dirs?: AssetFolder[]; rootFolders?: AssetFolder[]; actorId?: string; currentFolder?: AssetFolder; selected?: boolean; preview?: boolean; sharing?: boolean; pickerLimit?: number; pickerCap?: number; initialize?: (state: any, session: any) => void} = {}) {
   const calls: Array<{url: string; options: any}> = []
   const session = {account: ref({userId: options.actorId ?? 'member', organizationId: 'org', displayName: 'Member', username: 'member', role: 'user', organizationName: 'Studio'}), epoch: ref(0), identity: ref('org.member'), isOwner: ref(false)}
   const environment: any = {session, exposed: undefined, fetch: async (url: string, options: any) => {
@@ -70,7 +70,7 @@ async function renderBrowser(options: {shared?: boolean; files?: AssetFile[]; di
   const originalSetup = Browser.setup
   const component = {...Browser, setup(props: unknown, context: any) {
     return originalSetup(props, {...context, expose(value: any) {
-      environment.exposed = value; value.files.value = options.files ?? []; value.directories.value = options.dirs ?? []; value.rootFolders.value = options.rootFolders ?? []; value.loading.value = false; if (options.currentFolder) value.currentFolder.value = options.currentFolder; if (options.selected) {value.selection.value = options.files?.map(file => file.url) ?? []; for (const file of options.files ?? []) value.selectedMetadata.value.set(file.url, file)}; if (options.preview) value.preview.value = options.files?.[0]; if (options.sharing) {value.shareTarget.value = options.files?.[0]; value.grants.value = [{id: 'legacy-grant', recipientUserId: 'recipient', permission: 'edit', username: 'cora', displayName: 'Cora', createdAt: '2026-10-12T00:00:00.000Z'}]}; context.expose(value)
+      environment.exposed = value; value.files.value = options.files ?? []; value.directories.value = options.dirs ?? []; value.rootFolders.value = options.rootFolders ?? []; value.loading.value = false; if (options.currentFolder) value.currentFolder.value = options.currentFolder; if (options.selected) {value.selection.value = options.files?.map(file => file.url) ?? []; for (const file of options.files ?? []) value.selectedMetadata.value.set(file.url, file)}; if (options.preview) value.preview.value = options.files?.[0]; if (options.sharing) {value.shareTarget.value = options.files?.[0]; value.grants.value = [{id: 'legacy-grant', recipientUserId: 'recipient', permission: 'edit', username: 'cora', displayName: 'Cora', createdAt: '2026-10-12T00:00:00.000Z'}]}; options.initialize?.(value, session); context.expose(value)
     }})
   }}
   const app = createSSRApp({render: () => h(component, {initialScope: options.shared ? 'shared' : 'all', sharedOnly: options.shared, ...(options.pickerLimit !== undefined ? {selectionMode: 'multiple', maxSelection: options.pickerLimit, selectionCap: options.pickerCap} : {})})})
@@ -261,6 +261,37 @@ test('the Library pipeline picker accepts fifty existing images and refuses a fi
   assert.equal(browser.exposed.selection.value.length, 50)
   const normal = await renderBrowser({files, actorId: 'alice', pickerLimit: 50})
   assert.equal(normal.exposed.selectionLimit.value, 20)
+})
+
+test('Library Shift selection follows visible source grouping, keeps outside images, and honors picker slots', async () => {
+  const files = [fixtureFile('a.png', 'alice', 'view'), fixtureFile('b.png', 'bea', 'view'), fixtureFile('c.png', 'alice', 'view'), fixtureFile('d.png', 'bea', 'view')]
+  const browser = await renderBrowser({files, shared: true, pickerLimit: 4, pickerCap: 50})
+  browser.exposed.selection.value = ['/images/another-folder.png']
+  browser.exposed.choose(files[0])
+  browser.exposed.choose(files[3], {shiftKey: true})
+  assert.deepEqual(browser.exposed.selection.value, ['/images/another-folder.png', files[0]!.url, files[2]!.url, files[1]!.url])
+  assert.equal(browser.exposed.selectedMetadata.value.has(files[2]!.url), true)
+  assert.equal(browser.exposed.selectedMetadata.value.has(files[3]!.url), false)
+  browser.exposed.choose(files[3], {shiftKey: true})
+  assert.equal(new Set(browser.exposed.selection.value).size, 4)
+  browser.exposed.clearSelection()
+  assert.equal(browser.exposed.selectionAnchor.value, '')
+  assert.deepEqual(browser.exposed.selection.value, [])
+})
+
+test('Library changing search, sharer or account resets a Shift anchor before another click', async () => {
+  const files = Array.from({length: 4}, (_, index) => fixtureFile(`${index}.png`, 'alice', 'owner'))
+  // Run while the component's synchronous watchers are alive during setup.
+  await renderBrowser({files, actorId: 'alice', pickerLimit: 5, initialize(state, session) {
+    state.choose(files[0]); state.search.value = 'a new filter'
+    assert.equal(state.selectionAnchor.value, '')
+    state.choose(files[3], {shiftKey: true})
+    assert.deepEqual(state.selection.value, [files[0]!.url, files[3]!.url])
+    state.sourceUserId.value = 'bea'; assert.equal(state.selectionAnchor.value, '')
+    state.choose(files[1]); session.epoch.value += 1
+    assert.equal(state.selectionAnchor.value, '')
+    assert.deepEqual(state.selection.value, [])
+  }})
 })
 
 test('balance summary separates available credit, outstanding estimates and exact confirmed charges', async () => {

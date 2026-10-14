@@ -222,6 +222,7 @@ function components(app: any) {
   });
   app.component("AssetBrowser", { render: () => h("div") });
   app.component("PeopleBrowser", { render: () => h("div") });
+  app.component("ModelGuidance", { props: ["modelId", "settings", "context"], setup: (props: any) => () => h("aside", {"data-model-guidance": props.modelId, "data-guidance-context": props.context}) });
   app.component("NuxtLink", {
     props: ["to"],
     render(this: any) {

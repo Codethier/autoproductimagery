@@ -54,6 +54,7 @@ function definition(node: PipelineNode): PipelineDefinition {
 function registerComponents(app: any) {
   app.component("UIcon", {props: ["name"], setup: (props: any) => () => h("span", {"data-icon": props.name})});
   app.component("NuxtErrorBoundary", {setup: (_props: unknown, {slots}: any) => () => slots.default?.()});
+  app.component("ModelGuidance", {props: ["modelId", "settings", "context"], setup: (props: any) => () => h("aside", {"data-model-guidance": props.modelId})});
 }
 type MemoryNode = {tag: string; text: string; children: MemoryNode[]; parent: MemoryNode | null; props: Record<string, any>};
 function memoryNode(tag: string, text = ""): MemoryNode { return {tag, text, children: [], parent: null, props: {}}; }
