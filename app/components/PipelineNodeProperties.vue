@@ -169,6 +169,7 @@ function settings(value: ImageGenerationSettings) {
   updateNode({ settings: value });
 }
 function connect(portId: string, event: Event) {
+  if (props.disabled) return;
   const value = (event.target as HTMLSelectElement).value;
   if (!value) return;
   const [source, port] = value.split(":");
@@ -179,6 +180,7 @@ function connect(portId: string, event: Event) {
 function selectImage(
   field: "images" | "referenceImages" | "maskImage" | "defaultImage",
 ) {
+  if (props.disabled) return;
   const value = config.value[field];
   const urls = Array.isArray(value)
     ? (value as string[])
@@ -197,6 +199,7 @@ function removeImage(
   field: "images" | "referenceImages" | "maskImage" | "defaultImage",
   url: string,
 ) {
+  if (props.disabled) return;
   const value = config.value[field];
   if (Array.isArray(value))
     updateNode({ [field]: value.filter((item) => item !== url) });
@@ -378,6 +381,55 @@ watch(
             :disabled="disabled"
             @input="text('text', $event)"
           />
+        </template>
+        <template v-if="node.type === 'people-input'">
+          <p class="pipeline-help">
+            Choose pictures from your People or profiles shared with you.
+            These references stay the same for every product in a batch.
+          </p>
+          <button
+            type="button"
+            class="pipeline-secondary"
+            :disabled="disabled"
+            @click="selectImage('images')"
+          >
+            <UIcon name="i-lucide-contact-round" />Choose person pictures
+          </button>
+          <div class="pipeline-reference-list">
+            <div v-for="url in node.config.images" :key="url">
+              <img
+                :src="imagePreviewUrl(url, 160)"
+                alt="Person reference"
+                loading="lazy"
+              />
+              <button
+                type="button"
+                class="pipeline-icon"
+                :disabled="disabled"
+                aria-label="Remove person reference"
+                @click="removeImage('images', url)"
+              >
+                <UIcon name="i-lucide-x" />
+              </button>
+            </div>
+          </div>
+          <p class="pipeline-help">
+            {{ node.config.images.length }} / 16 person pictures selected
+          </p>
+          <button
+            v-if="node.config.images.length"
+            type="button"
+            class="pipeline-secondary"
+            :disabled="disabled"
+            @click="updateNode({ images: [] })"
+          >
+            <UIcon name="i-lucide-x" />Clear selection
+          </button>
+          <p class="pipeline-help">
+            Connect this node to Generate Image → References to reuse the
+            selected people in your generated pictures. The selected model’s
+            reference-picture limit still applies.
+          </p>
         </template>
         <template v-if="node.type === 'static-image'"
           ><p class="pipeline-help">

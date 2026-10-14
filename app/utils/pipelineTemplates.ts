@@ -19,6 +19,12 @@ export const PIPELINE_PALETTE: Array<{
     description: "A picture supplied each time the pipeline runs.",
   },
   {
+    type: "people-input",
+    group: "Inputs",
+    icon: "i-lucide-contact-round",
+    description: "Reusable person pictures from your People or shared profiles.",
+  },
+  {
     type: "text-input",
     group: "Inputs",
     icon: "i-lucide-text-cursor-input",
@@ -130,6 +136,10 @@ export function pipelineNodeDescription(node: PipelineNode): string {
     return node.config.defaultValue || "Text supplied when you run.";
   if (node.type === "static-image")
     return `${node.config.images.length} reference picture${node.config.images.length === 1 ? "" : "s"}`;
+  if (node.type === "people-input")
+    return node.config.images.length
+      ? `${node.config.images.length} person reference${node.config.images.length === 1 ? "" : "s"} · reused across the batch`
+      : "Choose person pictures from People.";
   if (node.type === "image-input")
     return "One independent job for each batch picture.";
   if (node.type === "remove-background")
@@ -225,7 +235,7 @@ export const PIPELINE_TEMPLATES: PipelineTemplate[] = [
     icon: "i-lucide-contact-round",
     definition: () => {
       const { input, generation, output } = base();
-      const person = createPipelineNode("static-image", "person", {
+      const person = createPipelineNode("people-input", "person", {
         x: 80,
         y: 420,
       });

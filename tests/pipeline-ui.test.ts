@@ -34,7 +34,7 @@ const favourites = new URL("app/composables/useImageModelFavourites.ts", root)
   .href;
 const exposures: Record<string, string> = {
   [workspace]:
-    "pipelines,pipeline,definition,name,description,editing,selectedId,selectedEdgeId,models,dirty,conflict,saveError,notice,useTemplate,addNode,updateNode,moveNode,removeNode,duplicateNode,copyNode,pasteNode,connect,disconnect,undo,redo,canUndo,canRedo,loadPipelines,openPipeline,save,prepareRun,runTarget,batchInput,batchImages,runInputs,inputNodes,executionNodes,canStart,runIssues,creditBlockReason,startRun,runMode,activeRun,runError,starting,picker,pickerUrls,openPicker,confirmPicker,refreshRun,resumeRun,cancelRun,retryRun,closeRun,loadRuns,runHistory,keyboard,metadataOpen,openRuns",
+    "pipelines,pipeline,definition,name,description,editing,selectedId,selectedEdgeId,models,dirty,conflict,saveError,notice,useTemplate,addNode,updateNode,moveNode,removeNode,duplicateNode,copyNode,pasteNode,connect,disconnect,disconnectNode,undo,redo,canUndo,canRedo,loadPipelines,openPipeline,save,prepareRun,runTarget,batchInput,batchImages,runInputs,inputNodes,executionNodes,canStart,runIssues,creditBlockReason,startRun,runMode,activeRun,runError,starting,picker,pickerUrls,pickerTab,peopleOnlyPicker,pickerTabKey,openPicker,confirmPicker,refreshRun,resumeRun,cancelRun,retryRun,closeRun,loadRuns,runHistory,keyboard,metadataOpen,deleteOpen,discardOpen,openRuns",
   [properties]:
     "updateNode,changeModel,settings,orderedModels,ai,imageProfile,connect,selectImage,errorMessage",
   [results]:
@@ -394,7 +394,7 @@ function findElement(tree: Node, id: string): Node | undefined {
 }
 
 test("all editable templates validate and the palette contains every supported image-only node", () => {
-  assert.equal(PIPELINE_PALETTE.length, 17);
+  assert.equal(PIPELINE_PALETTE.length, 18);
   for (const template of PIPELINE_TEMPLATES)
     assert.equal(
       PipelineDefinitionSchema.safeParse(template.definition()).success,
@@ -511,6 +511,142 @@ test("graph editing replaces single input connections, rejects type mismatch and
     value.app.unmount();
   }
 });
+test("reselecting an exact connection toggles single and multiple inputs without touching siblings", async () => {
+  const value = await mount();
+  try {
+    const s = value.exposed;
+    s.useTemplate(PIPELINE_TEMPLATES[1]);
+    const nodes = JSON.parse(JSON.stringify(s.definition.value.nodes));
+    const original = JSON.parse(JSON.stringify(s.definition.value.edges));
+    s.connect("product", "image", "generate", "image");
+    assert.equal(s.definition.value.edges.length, original.length - 1);
+    assert.deepEqual(s.definition.value.nodes, nodes);
+    s.undo();
+    assert.deepEqual(s.definition.value.edges, original);
+    s.redo();
+    assert.equal(s.definition.value.edges.length, original.length - 1);
+    s.connect("product", "image", "generate", "image");
+    s.addNode("people-input", { x: 0, y: 600 });
+    const person = s.definition.value.nodes.at(-1);
+    s.connect(person.id, "image", "generate", "references");
+    s.connect("product", "image", "generate", "references");
+    const withReferences = JSON.parse(JSON.stringify(s.definition.value.edges));
+    s.connect(person.id, "image", "generate", "references");
+    assert.deepEqual(
+      s.definition.value.edges,
+      withReferences.filter((edge: any) => edge.source !== person.id),
+    );
+    s.undo();
+    assert.deepEqual(s.definition.value.edges, withReferences);
+    s.redo();
+    assert.equal(s.definition.value.edges.some((edge: any) => edge.source === person.id), false);
+    s.connect(person.id, "image", "generate", "image");
+    assert.equal(s.definition.value.edges.filter((edge: any) => edge.target === "generate" && edge.targetPort === "image").length, 1);
+    assert.equal(s.definition.value.edges.find((edge: any) => edge.target === "generate" && edge.targetPort === "image").source, person.id);
+  } finally {
+    value.app.unmount();
+  }
+});
+
+test("Delete disconnects the selected node or edge, preserves nodes, and ignores fields and dialogs", async () => {
+  const value = await mount();
+  try {
+    const s = value.exposed;
+    s.useTemplate(PIPELINE_TEMPLATES[1]);
+    const nodes = JSON.parse(JSON.stringify(s.definition.value.nodes));
+    const edges = JSON.parse(JSON.stringify(s.definition.value.edges));
+    const key = (extras: any = {}) => ({ key: "Delete", target: { matches: () => false }, preventDefault() {}, ...extras });
+    s.selectedId.value = "generate";
+    for (const extras of [
+      { target: { matches: () => true } },
+      { target: { matches: () => false, isContentEditable: true } },
+      { defaultPrevented: true },
+    ]) s.keyboard(key(extras));
+    for (const flag of ["metadataOpen", "deleteOpen", "discardOpen"]) {
+      s[flag].value = true;
+      s.keyboard(key());
+      s[flag].value = false;
+    }
+    s.runMode.value = "prepare";
+    s.keyboard(key());
+    s.runMode.value = null;
+    s.openPicker("product", "defaultImage", [], 1);
+    s.keyboard(key());
+    s.picker.value = null;
+    s.editing.value = false;
+    s.keyboard(key());
+    s.editing.value = true;
+    assert.deepEqual(s.definition.value.edges, edges);
+    s.keyboard(key());
+    assert.deepEqual(s.definition.value.nodes, nodes);
+    assert.equal(s.selectedId.value, "generate");
+    assert.equal(s.definition.value.edges.some((edge: any) => edge.source === "generate" || edge.target === "generate"), false);
+    s.undo();
+    assert.deepEqual(s.definition.value.edges, edges);
+    s.selectedEdgeId.value = edges[0].id;
+    s.keyboard(key());
+    assert.deepEqual(s.definition.value.edges, edges.slice(1));
+    assert.deepEqual(s.definition.value.nodes, nodes);
+    s.removeNode("generate");
+    assert.equal(s.definition.value.nodes.some((node: any) => node.id === "generate"), false);
+  } finally {
+    value.app.unmount();
+  }
+});
+
+test("focused node Delete emits disconnect while its explicit trash action still removes", async () => {
+  const definition = PIPELINE_TEMPLATES[1]!.definition();
+  const events: string[] = [];
+  const value = await render(canvas, {
+    definition, selectedId: "generate",
+    onDisconnectNode: (id: string) => events.push(`disconnect:${id}`),
+    onRemove: (id: string) => events.push(`remove:${id}`),
+  });
+  let prevented = false;
+  value.exposed.moveKey(definition.nodes.find((node) => node.id === "generate"), { key: "Delete", preventDefault() { prevented = true; } });
+  assert.equal(prevented, true);
+  assert.deepEqual(events, ["disconnect:generate"]);
+  assert.match(value.html, /Delete disconnects/);
+  assert.match(value.html, /aria-label="Delete Generate Image"/);
+  const disabled = await render(canvas, {
+    definition, selectedId: "generate", disabled: true,
+    onDisconnectNode: () => events.push("disabled-disconnect"),
+  });
+  disabled.exposed.moveKey(definition.nodes[0], { key: "Delete", preventDefault() {} });
+  assert.deepEqual(events, ["disconnect:generate"]);
+});
+
+test("People Input opens a People-only picker and keeps its exact selected pictures", async () => {
+  const value = await mount();
+  try {
+    const s = value.exposed;
+    s.useTemplate(PIPELINE_TEMPLATES[0]);
+    s.addNode("people-input", { x: 50, y: 400 });
+    const person = s.definition.value.nodes.at(-1);
+    s.openPicker(person.id, "images", [], 16);
+    await flush();
+    assert.equal(s.peopleOnlyPicker.value, true);
+    assert.equal(s.pickerTab.value, "people");
+    assert.equal(findElement(value.tree, "pipeline-library-tab"), undefined);
+    assert.ok(findElement(value.tree, "pipeline-people-tab"));
+    (globalThis as any).document.getElementById = () => ({ focus() {} });
+    for (const key of ["Home", "End", "ArrowLeft", "ArrowRight"]) {
+      s.pickerTabKey({ key, preventDefault() {} });
+      assert.equal(s.pickerTab.value, "people");
+    }
+    s.confirmPicker([source, source, "https://example.com/not-private.png"]);
+    assert.deepEqual(s.definition.value.nodes.find((node: any) => node.id === person.id).config.images, [source]);
+    s.openPicker("product", "defaultImage", [], 1);
+    await flush();
+    assert.equal(s.peopleOnlyPicker.value, false);
+    assert.equal(s.pickerTab.value, "library");
+    assert.ok(findElement(value.tree, "pipeline-library-tab"));
+    s.picker.value = null;
+  } finally {
+    value.app.unmount();
+  }
+});
+
 test("property input events preserve both dimensions and Ctrl S saves them before any blur", async () => {
   const value = await mount();
   try {

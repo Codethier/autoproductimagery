@@ -87,6 +87,13 @@ const picker = ref<{
 } | null>(null);
 const pickerTab = ref<"library" | "people">("library"),
   pickerUrls = ref<string[]>([]);
+const peopleOnlyPicker = computed(
+  () =>
+    picker.value?.field === "images" &&
+    definition.value.nodes.some(
+      (node) => node.id === picker.value?.nodeId && node.type === "people-input",
+    ),
+);
 const runMode = ref<"prepare" | "results" | "history" | null>(null),
   runTarget = ref<string | null>(null),
   batchInput = ref(""),
@@ -502,6 +509,18 @@ function disconnect(id: string) {
   });
   selectedEdgeId.value = null;
 }
+function disconnectNode(id: string) {
+  const node = definition.value.nodes.find((value) => value.id === id);
+  if (!node) return;
+  commit({
+    ...definition.value,
+    edges: definition.value.edges.filter(
+      (edge) => edge.source !== id && edge.target !== id,
+    ),
+  });
+  selectedEdgeId.value = null;
+  notice.value = `Disconnected ${node.label}`;
+}
 function connect(
   sourceId: string,
   sourcePort: "image" | "text",
@@ -527,22 +546,24 @@ function connect(
     notice.value = "Connect image to image, or text to text.";
     return;
   }
+  const existing = definition.value.edges.find(
+    (edge) =>
+      edge.source === sourceId &&
+      edge.sourcePort === sourcePort &&
+      edge.target === targetId &&
+      edge.targetPort === targetPort,
+  );
+  if (existing) {
+    disconnect(existing.id);
+    notice.value = "";
+    return;
+  }
   let edges = definition.value.edges.filter(
     (edge) =>
       port.multiple ||
       edge.target !== targetId ||
       edge.targetPort !== targetPort,
   );
-  if (
-    edges.some(
-      (edge) =>
-        edge.source === sourceId &&
-        edge.sourcePort === sourcePort &&
-        edge.target === targetId &&
-        edge.targetPort === targetPort,
-    )
-  )
-    return;
   if (createsPipelineCycle(edges, sourceId, targetId)) {
     notice.value =
       "That connection would create a loop. Choose a later step instead.";
@@ -806,7 +827,7 @@ function openPicker(
 ) {
   picker.value = { nodeId, field, urls: [...urls], limit };
   pickerUrls.value = [...urls];
-  pickerTab.value = "library";
+  pickerTab.value = peopleOnlyPicker.value ? "people" : "library";
 }
 function confirmPicker(urls: string[]) {
   const target = picker.value;
@@ -1100,6 +1121,7 @@ function visibilityChanged() {
     schedulePoll();
 }
 function keyboard(event: KeyboardEvent) {
+  if (event.defaultPrevented) return;
   if (trapDialogTab(event)) return;
   const target = event.target as HTMLElement | null;
   if (event.key === "Escape") {
@@ -1113,6 +1135,25 @@ function keyboard(event: KeyboardEvent) {
   }
   if (target?.matches("input,textarea,select") || target?.isContentEditable)
     return;
+  if (event.key === "Delete") {
+    if (
+      !editing.value ||
+      picker.value ||
+      runMode.value ||
+      metadataOpen.value ||
+      deleteOpen.value ||
+      discardOpen.value
+    )
+      return;
+    if (selectedEdgeId.value) {
+      event.preventDefault();
+      disconnect(selectedEdgeId.value);
+    } else if (selectedId.value) {
+      event.preventDefault();
+      disconnectNode(selectedId.value);
+    }
+    return;
+  }
   if (
     (event.ctrlKey || event.metaKey) &&
     event.key.toLowerCase() === "s" &&
@@ -1184,7 +1225,9 @@ function pickerTabKey(event: KeyboardEvent) {
   if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
   event.preventDefault();
   pickerTab.value =
-    event.key === "Home"
+    peopleOnlyPicker.value
+      ? "people"
+      : event.key === "Home"
       ? "library"
       : event.key === "End"
         ? "people"
@@ -1565,6 +1608,7 @@ onBeforeUnmount(() => {
           @add="addNode"
           @move="moveNode"
           @connect="connect"
+          @disconnect-node="disconnectNode"
           @remove="removeNode"
           @duplicate="duplicateNode"
           @remove-edge="disconnect"
@@ -1605,7 +1649,7 @@ onBeforeUnmount(() => {
             <UIcon name="i-lucide-copy" />Copy step</button
           ><button v-if="copiedNode" type="button" @click="pasteNode">
             <UIcon name="i-lucide-clipboard-paste" />Paste step</button
-          ><span>Ctrl/⌘ Z · undo <small>Ctrl/⌘ S · save</small></span>
+          ><span>Delete · disconnect <small>Ctrl/⌘ Z · undo · Ctrl/⌘ S · save</small></span>
         </div>
       </footer>
     </section>
@@ -1712,7 +1756,9 @@ onBeforeUnmount(() => {
           <div>
             <h2>
               {{
-                picker.field === "batch"
+                peopleOnlyPicker
+                  ? "Choose People pictures"
+                  : picker.field === "batch"
                   ? "Choose batch pictures"
                   : "Choose reference pictures"
               }}
@@ -1741,6 +1787,7 @@ onBeforeUnmount(() => {
           @keydown="pickerTabKey"
         >
           <button
+            v-if="!peopleOnlyPicker"
             id="pipeline-library-tab"
             type="button"
             role="tab"
@@ -1767,13 +1814,13 @@ onBeforeUnmount(() => {
           class="pipeline-picker-content"
           role="tabpanel"
           :aria-labelledby="
-            pickerTab === 'library'
+            !peopleOnlyPicker && pickerTab === 'library'
               ? 'pipeline-library-tab'
               : 'pipeline-people-tab'
           "
         >
           <AssetBrowser
-            v-if="pickerTab === 'library'"
+            v-if="!peopleOnlyPicker && pickerTab === 'library'"
             :key="`assets-${picker.nodeId}-${picker.field}`"
             v-model:selected-urls="pickerUrls"
             selection-mode="multiple"

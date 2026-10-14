@@ -48,6 +48,7 @@ const emit = defineEmits<{
   ];
   duplicate: [id: string];
   remove: [id: string];
+  "disconnect-node": [id: string];
   "remove-edge": [id: string];
   run: [id: string];
 }>();
@@ -214,7 +215,8 @@ function moveKey(node: PipelineNode, event: KeyboardEvent) {
     select(node.id);
   } else if (event.key === "Delete") {
     event.preventDefault();
-    emit("remove", node.id);
+    emit("disconnect-node", node.id);
+    announcement.value = `Disconnected ${node.label}`;
   }
 }
 function outputPort(node: PipelineNode, port: "image" | "text") {
@@ -283,7 +285,8 @@ function image(node: PipelineNode) {
     );
   if (value) return value.url;
   if (node.type === "image-input") return node.config.defaultImage;
-  if (node.type === "static-image") return node.config.images[0];
+  if (node.type === "static-image" || node.type === "people-input")
+    return node.config.images[0];
   return null;
 }
 function stepState(node: PipelineNode) {
@@ -395,7 +398,7 @@ defineExpose({ fit, view, paletteOpen, pendingSource, add });
             class="pipeline-node-header"
             role="button"
             tabindex="0"
-            :aria-label="`Select or move ${node.label}. Arrow keys move; Shift moves farther.`"
+            :aria-label="`Select or move ${node.label}. Arrow keys move; Shift moves farther. Delete disconnects.`"
             @pointerdown="startMove(node, $event)"
             @pointermove="move"
             @pointerup="endMove"
