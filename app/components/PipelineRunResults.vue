@@ -6,9 +6,11 @@ import type {
   PipelineRunDTO,
   PipelineRunStepDTO,
 } from "../../schemas/pipelines";
+import { getPipelineDisplayNodes } from "../../schemas/pipeline-display";
 import { imageDownloadUrl, imagePreviewUrl } from "../utils/imageDelivery";
 import { formatUsd } from "../utils/generationPrice";
 import { pipelineNodeIcon } from "../utils/pipelineTemplates";
+import { pipelineJobRerunBlockedReason, pipelineRerunUsesCredit } from "../utils/pipelineCredit";
 const props = defineProps<{
   run: PipelineRunDTO;
   busy?: boolean;
@@ -19,6 +21,7 @@ const emit = defineEmits<{
   resume: [];
   cancel: [];
   retry: [stepIds: string[]];
+  rerun: [itemId: string];
   close: [];
   refresh: [];
 }>();
@@ -26,6 +29,7 @@ const expandedItems = ref(new Set<string>());
 const retryIds = ref<string[]>([]);
 const retryOpen = ref(false);
 const chargeConfirmed = ref(false);
+const submittedItems = ref(new Map<string, string>());
 const active = computed(() =>
   ["queued", "running", "awaiting-price"].includes(props.run.status),
 );
@@ -57,7 +61,7 @@ const zipAvailable = computed(
       256 * 1024 * 1024,
 );
 const steps = computed(() =>
-  props.run.definition.nodes.filter((node) =>
+  getPipelineDisplayNodes(props.run.definition.nodes).filter((node) =>
     props.run.items.some((item) =>
       item.steps.some((step) => step.nodeId === node.id),
     ),
@@ -65,7 +69,7 @@ const steps = computed(() =>
 );
 const retryable = computed(() =>
   props.run.items.flatMap((item) =>
-    item.steps
+    orderedItemSteps(item)
       .filter(
         (step) =>
           ["failed", "interrupted"].includes(step.status) &&
@@ -101,6 +105,31 @@ function imagePrice(image: PipelineImageValue) {
 function stepFor(item: PipelineRunDTO["items"][number], id: string) {
   return item.steps.find((step) => step.nodeId === id);
 }
+function orderedItemSteps(item: PipelineRunDTO["items"][number]) {
+  return steps.value.flatMap(node => {
+    const step = stepFor(item, node.id);
+    return step ? [step] : [];
+  });
+}
+function rerunReason(item: PipelineRunDTO["items"][number]) {
+  return pipelineJobRerunBlockedReason(props.run, item.id);
+}
+function itemStepFingerprint(item: PipelineRunDTO["items"][number]) {
+  return item.steps.map(step => step.id).join(",");
+}
+function rerunSubmitted(item: PipelineRunDTO["items"][number]) {
+  return submittedItems.value.get(item.id) === itemStepFingerprint(item);
+}
+function rerun(item: PipelineRunDTO["items"][number]) {
+  if (props.busy || rerunReason(item) || rerunSubmitted(item)) return;
+  submittedItems.value = new Map(submittedItems.value).set(item.id, itemStepFingerprint(item));
+  emit("rerun", item.id);
+}
+watch(() => props.busy, busy => {
+  // A refusal can leave the same step IDs in place. Release the local click
+  // fence once its parent has finished handling the request.
+  if (!busy) submittedItems.value = new Map();
+});
 function status(step?: PipelineRunStepDTO) {
   return step ? (stateLabels[step.status] ?? step.status) : "Not in this run";
 }
@@ -128,6 +157,7 @@ watch(
     );
     retryIds.value = [];
     retryOpen.value = false;
+    submittedItems.value = new Map();
   },
   { immediate: true },
 );
@@ -316,13 +346,31 @@ watch(
             /><span>{{ status(stepFor(item, node.id)) }}</span>
           </div>
         </div>
+        <div v-if="item.status === 'succeeded'" class="pipeline-job-actions">
+          <button
+            type="button"
+            class="pipeline-secondary"
+            :aria-label="`Rerun job for Input ${item.index + 1}`"
+            :disabled="busy || Boolean(rerunReason(item)) || rerunSubmitted(item)"
+            :title="rerunReason(item) || 'Repeat this input with the saved workflow and settings'"
+            @click="rerun(item)"
+          >
+            <UIcon name="i-lucide-rotate-cw" />Rerun job
+          </button>
+          <span v-if="rerunReason(item)">{{ rerunReason(item) }}</span>
+          <span v-else>
+            Repeats this input with the saved workflow and settings.
+            {{ pipelineRerunUsesCredit(run, item.id) ? 'AI steps create new charges.' : 'Local steps have no provider charge.' }}
+            Previous pictures stay in Assets; displayed results are replaced.
+          </span>
+        </div>
         <div
           v-if="expandedItems.has(item.id)"
           :id="`pipeline-item-${item.id}`"
           class="pipeline-run-item-details"
         >
           <section
-            v-for="step in item.steps.filter(
+            v-for="step in orderedItemSteps(item).filter(
               (value) =>
                 value.value?.text ||
                 value.value?.images.some(visibleImage) ||
@@ -646,6 +694,21 @@ watch(
 .pipeline-run-item {
   border-top: 1px solid var(--workspace-border);
 }
+.pipeline-job-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 15px;
+  border-top: 1px solid var(--workspace-border);
+  max-width: calc(100vw - 100px);
+}
+.pipeline-job-actions span {
+  font-size: 9px;
+  line-height: 1.7;
+  color: var(--workspace-muted);
+}
+.pipeline-job-actions button { flex: none; }
+.pipeline-job-actions button:disabled { opacity: 0.5; cursor: not-allowed; }
 .pipeline-run-input {
   display: flex;
   align-items: center;
@@ -905,6 +968,7 @@ watch(
     max-width: calc(100vw - 35px);
     padding: 15px;
   }
+  .pipeline-job-actions { max-width: calc(100vw - 35px); align-items: start; }
   .pipeline-result-card {
     width: 100%;
     max-width: 300px;

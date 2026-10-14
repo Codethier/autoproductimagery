@@ -10,7 +10,7 @@ import {assertGenerationCredit} from './accountBilling'
 import {createPeopleRepository} from './peopleRepository'
 import {hasConfirmedGenerationPrice} from '../../schemas/generation-billing'
 import {CREDIT_EXHAUSTED_CODE, CREDIT_EXHAUSTED_MESSAGE, formatUsdUnits} from '../../schemas/account-billing'
-import {SavePipelineSchema, UpdatePipelineSchema, StartPipelineRunSchema, RetryPipelineRunSchema,
+import {SavePipelineSchema, UpdatePipelineSchema, StartPipelineRunSchema, RetryPipelineRunSchema, RerunPipelineRunSchema,
     getPipelineExecutionNodes, pipelineRunIssues, pipelineExpectedNodeOutputs, PIPELINE_LIMITS,
     type PipelineDTO, type PipelineListDTO, type PipelineRunDTO, type PipelineRunStepDTO, type PipelineValue,
     type PipelineImageValue, type PipelineDefinition, type PipelineNode, type PipelineRunListDTO} from '../../schemas/pipelines'
@@ -409,7 +409,7 @@ export function createPipelineRepository(actor: PipelineActor, db: Database = ge
         const run = await requireRun(id), steps = await allSteps(id)
         const items = await db.select().from(pipelineRunItems).where(and(eq(pipelineRunItems.runId, id), eq(pipelineRunItems.organizationId, actor.organizationId), eq(pipelineRunItems.userId, actor.userId))).orderBy(asc(pipelineRunItems.index)).limit(PIPELINE_LIMITS.batchImages)
         const linked = await db.select({id: systemPrompt.id, stepId: systemPrompt.pipelineStepId}).from(systemPrompt)
-            .innerJoin(pipelineRunSteps, eq(systemPrompt.pipelineStepId, pipelineRunSteps.id)).where(and(eq(pipelineRunSteps.runId, id), stepScope(), eq(systemPrompt.organizationId, actor.organizationId), eq(systemPrompt.userId, actor.userId)))
+            .innerJoin(pipelineRunSteps, eq(systemPrompt.pipelineStepId, pipelineRunSteps.id)).where(and(eq(pipelineRunSteps.runId, id), stepScope(), eq(pipelineRunSteps.active, true), eq(systemPrompt.organizationId, actor.organizationId), eq(systemPrompt.userId, actor.userId)))
         const generations = new Map<string, number[]>()
         for (const row of linked) if (row.stepId) generations.set(row.stepId, [...(generations.get(row.stepId) ?? []), row.id])
         const outputItems = []
@@ -426,7 +426,7 @@ export function createPipelineRepository(actor: PipelineActor, db: Database = ge
                     const withdrawn = new Set(peopleSources(getPipelineExecutionNodes(run.definition, node.id)).filter(url => !visiblePeople.has(url)))
                     value.images = value.images.filter(image => !withdrawn.has(image.url))
                 }
-                outputSteps.push({id: step.id, nodeId: step.nodeId, type: node.type, status: step.status,
+                outputSteps.push({id: step.id, nodeId: step.nodeId, type: node.type, attempt: step.attempt, status: step.status,
                     value,
                     error: step.error, generationIds: generations.get(step.id) ?? [], backgroundRemovalJobId: step.backgroundRemovalJobId,
                     startedAt: date(step.startedAt), completedAt: date(step.completedAt)})
@@ -608,6 +608,63 @@ export function createPipelineRepository(actor: PipelineActor, db: Database = ge
         await notify(id)
         return {run: await detail(id)}
     }
+    async function rerun(id: string, raw: unknown) {
+        const parsed = RerunPipelineRunSchema.safeParse(raw)
+        const input = parsed.success ? parsed.data : invalid()
+        await db.transaction(async tx => {
+            // Match start/claim admission lock order. A completed job becomes
+            // new queue work, so it must not bypass global or per-user limits.
+            await lockQueue(tx); const user = await activeActor(tx)
+            const run = await requireRun(id, tx, true), steps = await allSteps(id, tx)
+            // Clearing a draining cancellation must not revive another item's
+            // accepted provider call or let it publish an unwanted result.
+            if (run.cancelRequested && steps.some(step => !terminalStepStatuses.includes(step.status))) throw createError({statusCode: 409, statusMessage: 'Wait for cancelled work to finish before rerunning a job'})
+            const selected = steps.filter(step => input.itemIds.includes(step.itemId))
+            const expectedIds = new Set(input.expectedStepIds)
+            if (selected.length !== expectedIds.size || selected.some(step => !expectedIds.has(step.id))) throw createError({statusCode: 409, statusMessage: 'This job changed. Reload its latest result before rerunning it.'})
+            const items = await tx.select().from(pipelineRunItems).where(and(eq(pipelineRunItems.runId, id),
+                eq(pipelineRunItems.organizationId, actor.organizationId), eq(pipelineRunItems.userId, actor.userId), inArray(pipelineRunItems.id, input.itemIds)))
+            const nodes = getPipelineExecutionNodes(run.definition, run.targetNodeId ?? undefined)
+            if (items.length !== input.itemIds.length || items.some(item => {
+                const ownSteps = selected.filter(step => step.itemId === item.id)
+                return ownSteps.length !== nodes.length || nodes.some(node => !ownSteps.some(step => step.nodeId === node.id && step.type === node.type))
+                    || ownSteps.some(step => step.status !== 'succeeded')
+            })) invalid('Choose completed jobs from this run. Use Retry for failed or interrupted steps.')
+            if (selected.some(step => step.attempt >= 5)) throw createError({statusCode: 409, statusMessage: 'This job reached its five-attempt limit. Start a new run to generate again.'})
+            const hasPaidNodes = nodes.some(isPaidNode)
+            if (hasPaidNodes && !input.confirmPossibleCharge) throw createError({statusCode: 409, statusMessage: 'Confirm that rerunning this job repeats its paid steps and incurs new charges.'})
+            boundExecution(nodes, run.definition, items.length)
+            // Reuse only the immutable accepted graph, original inputs and
+            // original target, never the current edited pipeline or old output.
+            // Worker checks these sources again before execution/publication.
+            await assertPeopleSources(nodes, tx, true)
+            await (await storage()).assertReadableImages([...new Set([
+                ...items.flatMap(item => item.inputUrl ? [item.inputUrl] : []),
+                ...graphSources(run.definition, nodes, run.inputs, run.batchInputNodeId ?? undefined),
+            ])])
+            if (hasPaidNodes) await assertGenerationCredit(tx, actor, randomUUID())
+            const [personal] = await tx.select({value: count()}).from(pipelineRuns).where(and(runScope(), ne(pipelineRuns.id, id), inArray(pipelineRuns.status, liveStatuses)))
+            const cap = user.creditBalanceUnits === null || !hasPaidNodes ? MAX_ACTIVE_PIPELINE_RUNS_PER_USER : 1
+            if (Number(personal?.value ?? 0) >= cap) throw createError({statusCode: 429, statusMessage: 'Finish or cancel your active pipeline runs first'})
+            const [global] = await tx.select({value: count()}).from(pipelineRuns).where(and(ne(pipelineRuns.id, id), inArray(pipelineRuns.status, liveStatuses)))
+            if (Number(global?.value ?? 0) >= MAX_ACTIVE_PIPELINE_RUNS) throw createError({statusCode: 429, statusMessage: 'Pipeline processing is busy; try again later'})
+            // Old attempts, assets, generation rows and charges stay intact.
+            // The partial unique index permits only one active attempt per node.
+            for (const step of selected) {
+                await tx.update(pipelineRunSteps).set({active: false, updatedAt: sql`CURRENT_TIMESTAMP`})
+                    .where(and(eq(pipelineRunSteps.id, step.id), stepScope(), eq(pipelineRunSteps.active, true), eq(pipelineRunSteps.status, 'succeeded')))
+                await tx.insert(pipelineRunSteps).values({id: randomUUID(), runId: id, itemId: step.itemId, organizationId: actor.organizationId, userId: actor.userId,
+                    nodeId: step.nodeId, type: step.type, attempt: step.attempt + 1})
+            }
+            await tx.update(pipelineRuns).set({cancelRequested: false, completedAt: null, nextAttemptAt: sql`CURRENT_TIMESTAMP`, updatedAt: sql`CURRENT_TIMESTAMP`})
+                .where(and(eq(pipelineRuns.id, id), runScope()))
+            // A sibling may still own a live claim or await exact billing.
+            // Preserve its state/claim and derive the overall run from all jobs.
+            await synchronize(id, tx)
+        })
+        await notify(id)
+        return {run: await detail(id)}
+    }
     async function publishPreparation<T>(stepId: string, token: string, publish: (tx: PipelineTransaction) => Promise<T>, sourceUrls: string[] = []): Promise<T> {
         return db.transaction(async tx => {
             await lockPublicationAccounts(tx, sourceUrls)
@@ -637,5 +694,5 @@ export function createPipelineRepository(actor: PipelineActor, db: Database = ge
         await tx.insert(pipelineStepOutputs).values({id: randomUUID(), stepId, organizationId: actor.organizationId, userId: actor.userId, ...image})
     }
     return {db, storage, list, get, create, update, remove, start, detail, listRuns, requireRun, claim, heartbeat, providerStarted, finish, setBackgroundJob,
-        cancel, retry, wake, schedule, notify, publishPreparation, imageValue, visibleValue, generationRows, registerProcessed, reconcileSteps, synchronize, assertPeopleNodeSources}
+        cancel, retry, rerun, wake, schedule, notify, publishPreparation, imageValue, visibleValue, generationRows, registerProcessed, reconcileSteps, synchronize, assertPeopleNodeSources}
 }

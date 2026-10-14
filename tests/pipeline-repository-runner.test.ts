@@ -9,7 +9,7 @@ import {migrate} from 'drizzle-orm/node-postgres/migrator'
 import {and, eq, sql} from 'drizzle-orm'
 import sharp from 'sharp'
 import {PutObjectCommand, GetObjectCommand, HeadObjectCommand, DeleteObjectCommand} from '@aws-sdk/client-s3'
-import {organizations, users, assets, pipelines, pipelineRuns, pipelineRunSteps, pipelineStepOutputs, systemPrompt} from '../server/db/schema.ts'
+import {organizations, users, assets, pipelines, pipelineRuns, pipelineRunSteps, pipelineStepOutputs, systemPrompt, accountGenerationCharges} from '../server/db/schema.ts'
 import {createS3ImageStorage, type ImageStorageCommand} from '../server/utils/useFS.ts'
 import {useUserFS} from '../server/utils/useUserFS.ts'
 import {createPipelineRepository, pipelineRequestError, safePipelineError} from '../server/utils/pipelineRepository.ts'
@@ -20,7 +20,7 @@ import {createAccountBilling} from '../server/utils/accountBilling.ts'
 import {createBackgroundRemovalRepository} from '../server/utils/backgroundRemovalJobs.ts'
 import {createBackgroundRemovalRunner} from '../server/utils/backgroundRemovalRunner.ts'
 import {getBackgroundRemovalModel} from '../schemas/background-removal-models.ts'
-import {createPipelineNode, type PipelineDefinition, type PipelineNode} from '../schemas/pipelines.ts'
+import {createPipelineNode, RerunPipelineRunSchema, type PipelineDefinition, type PipelineNode, type PipelineRunItemDTO} from '../schemas/pipelines.ts'
 import {getImageModelProfile, createDefaultSettings, generationOutputCount} from '../schemas/image-generation.ts'
 import {PromptEnhancerConfigSchema} from '../schemas/pipeline-text-models.ts'
 import {CREDIT_EXHAUSTED_CODE, CREDIT_EXHAUSTED_MESSAGE} from '../schemas/account-billing.ts'
@@ -79,6 +79,214 @@ async function drain(executor:ReturnType<typeof createPipelineExecutor>, runId:s
     for(let i=0;i<limit&&['queued','running','awaiting-price'].includes(value.run.status);i++)value=await executor.advance(runId)
     return value.run
 }
+const rerunBody = (item: PipelineRunItemDTO, confirmPossibleCharge = false) => ({itemIds: [item.id], expectedStepIds: item.steps.map(step => step.id), confirmPossibleCharge})
+
+test('job rerun requests are strict, bounded and reject duplicate or missing revision fences',()=>{
+    const itemId=randomUUID(),stepId=randomUUID()
+    assert.equal(RerunPipelineRunSchema.safeParse({itemIds:[itemId],expectedStepIds:[stepId]}).success,true)
+    for(const body of [
+        {itemIds:[itemId]}, {itemIds:[],expectedStepIds:[stepId]}, {itemIds:[itemId],expectedStepIds:[]},
+        {itemIds:[itemId,itemId],expectedStepIds:[stepId]}, {itemIds:[itemId],expectedStepIds:[stepId,stepId]},
+        {itemIds:Array.from({length:51},()=>randomUUID()),expectedStepIds:[stepId]},
+        {itemIds:[itemId],expectedStepIds:Array.from({length:1201},()=>randomUUID())},
+        {itemIds:[itemId],expectedStepIds:[stepId],inputImages:['/new.png']},
+        {itemIds:['other-user'],expectedStepIds:[stepId]},
+    ]) assert.equal(RerunPipelineRunSchema.safeParse(body).success,false)
+})
+
+test('rerun replaces only the chosen job with immutable original inputs/settings and keeps previous outputs',integration,async()=>fixture(async f=>{
+    const fs=await useUserFS(f.a,f.raw,f.db),repo=createPipelineRepository(f.a,f.db,{storage:fs})
+    const originals=await Promise.all([fs.saveUpload('/',upload(f.bytes)),fs.saveUpload('/',upload(f.bytes))])
+    const resize=createPipelineNode('resize','resize');resize.config={width:32,height:32,fit:'contain',background:'transparent'}
+    const definition=graph([createPipelineNode('image-input','input'),resize,createPipelineNode('output','out')],[['input','resize'],['resize','out']])
+    const {pipeline,run}=await saveStart(repo,definition,originals.map(image=>image.url)),executor=createPipelineExecutor(f.a,repo,{gateway:noGateway,runtimeConfig})
+    const first=await drain(executor,run.id),previous=first.items[0]!,sibling=first.items[1]!
+    const oldOutput=previous.steps.at(-1)!.value!.images[0]!,oldBytes=(await fs.getImageFile(oldOutput.url)).buffer
+    const historical=await f.db.select().from(pipelineRunSteps).where(eq(pipelineRunSteps.itemId,previous.id))
+    await repo.update(pipeline.id,{revision:1,name:'Changed after run',definition:{...definition,nodes:definition.nodes.map(node=>node.type==='resize'?{...node,config:{...node.config,width:80,height:80}}:node)}})
+    await f.db.update(pipelineRuns).set({nextAttemptAt:sql`CURRENT_TIMESTAMP + INTERVAL '15 minutes'`}).where(eq(pipelineRuns.id,run.id))
+    const queued=(await repo.rerun(run.id,rerunBody(previous))).run
+    assert.equal(queued.id,first.id);assert.equal(queued.revision,1);assert.equal(queued.items[0]!.id,previous.id);assert.equal(queued.items[0]!.inputUrl,originals[0]!.url)
+    assert.deepEqual(queued.items[1],sibling);assert.equal(queued.status,'queued')
+    assert.ok(queued.items[0]!.steps.every(step=>step.attempt===2&&step.status==='queued'&&step.value===null&&!previous.steps.some(old=>old.id===step.id)))
+    const [currentRun]=await f.db.select().from(pipelineRuns).where(eq(pipelineRuns.id,run.id));assert.ok(Date.parse(currentRun!.nextAttemptAt)<=Date.now());assert.deepEqual(currentRun!.definition,definition)
+    for(const old of historical){const [kept]=await f.db.select().from(pipelineRunSteps).where(eq(pipelineRunSteps.id,old.id));assert.deepEqual({...kept,active:old.active,updatedAt:old.updatedAt},old);assert.equal(kept!.active,false)}
+    const second=await drain(executor,run.id),newOutput=second.items[0]!.steps.at(-1)!.value!.images[0]!
+    assert.equal(newOutput.width,32);assert.equal(newOutput.height,32);assert.notEqual(newOutput.url,oldOutput.url);assert.deepEqual(second.items[1],sibling)
+    assert.deepEqual((await fs.getImageFile(oldOutput.url)).buffer,oldBytes);assert.deepEqual((await fs.getImageFile(originals[0]!.url)).buffer,f.bytes)
+    assert.equal((await f.db.select().from(pipelineStepOutputs)).length,3)
+}))
+
+test('concurrent and stale rerun clicks admit one fresh attempt, including after its fast completion',integration,async()=>fixture(async f=>{
+    const fs=await useUserFS(f.a,f.raw,f.db),repo=createPipelineRepository(f.a,f.db,{storage:fs})
+    const text=createPipelineNode('static-text','text');text.config.text='Same immutable prompt'
+    const {run}=await saveStart(repo,graph([text,createPipelineNode('output','out')],[['text','out']]))
+    const executor=createPipelineExecutor(f.a,repo,{gateway:noGateway,runtimeConfig}),first=await drain(executor,run.id),body=rerunBody(first.items[0]!)
+    const results=await Promise.allSettled([repo.rerun(run.id,body),repo.rerun(run.id,body)])
+    assert.equal(results.filter(result=>result.status==='fulfilled').length,1)
+    const refused=results.find(result=>result.status==='rejected') as PromiseRejectedResult;assert.equal(refused.reason.statusCode,409)
+    assert.equal((await f.db.select().from(pipelineRunSteps)).length,4)
+    const second=await drain(executor,run.id);assert.equal(second.status,'succeeded');assert.equal(second.items[0]!.steps.at(-1)!.value!.text,'Same immutable prompt')
+    await assert.rejects(repo.rerun(run.id,body),(error:any)=>error.statusCode===409)
+    assert.equal((await f.db.select().from(pipelineRunSteps)).length,4)
+}))
+
+test('paid reruns require confirmation, preserve all prices/history and use a new charge batch',integration,async()=>fixture(async f=>{
+    const fs=await useUserFS(f.a,f.raw,f.db),repo=createPipelineRepository(f.a,f.db,{storage:fs}),original=await fs.saveUpload('/',upload(f.bytes))
+    await f.db.update(users).set({creditBalanceUnits:'1000000000000'}).where(eq(users.id,f.a.userId))
+    const {run}=await saveStart(repo,graph([createPipelineNode('image-input','input'),generateNode('g'),createPipelineNode('output','out')],[['input','g'],['g','out']]),[original.url])
+    const calls={value:0,batches:[] as string[]},executor=createPipelineExecutor(f.a,repo,{gateway:noGateway,runtimeConfig,generate:fakeGeneration(f,fs,'gateway',calls)}),first=await drain(executor,run.id)
+    const history=await f.db.select().from(systemPrompt),charges=await f.db.select().from(accountGenerationCharges),oldOutput=first.items[0]!.steps.at(-1)!.value!.images[0]!
+    await assert.rejects(repo.rerun(run.id,rerunBody(first.items[0]!)),(error:any)=>error.statusCode===409)
+    assert.equal((await f.db.select().from(pipelineRunSteps)).length,3)
+    await repo.rerun(run.id,rerunBody(first.items[0]!,true));const second=await drain(executor,run.id)
+    assert.equal(calls.value,2);assert.equal(new Set(calls.batches).size,2);assert.equal(second.summary.confirmedCostUsd,'0.500000000000');assert.equal(second.summary.outstandingCount,0)
+    assert.equal((await createAccountBilling(f.db).balanceFor(f.a)).actualBalanceUsd,'0.500000000000')
+    assert.deepEqual((await f.db.select().from(systemPrompt).where(eq(systemPrompt.id,history[0]!.id)))[0],history[0])
+    assert.deepEqual((await f.db.select().from(accountGenerationCharges).where(eq(accountGenerationCharges.generationId,charges[0]!.generationId)))[0],charges[0])
+    assert.deepEqual((await fs.getImageFile(oldOutput.url)).buffer,f.bytes)
+    assert.notEqual(second.items[0]!.steps.find(step=>step.nodeId==='g')!.generationIds[0],history[0]!.id)
+    assert.equal((await repo.listRuns({limit:20,search:''})).runs[0]!.summary.confirmedCostUsd,'0.500000000000')
+}))
+
+test('zero-credit reruns refuse atomically with the popup code, while local reruns remain free and scoped',integration,async()=>fixture(async f=>{
+    const fs=await useUserFS(f.a,f.raw,f.db),repo=createPipelineRepository(f.a,f.db,{storage:fs}),original=await fs.saveUpload('/',upload(f.bytes))
+    const {run}=await saveStart(repo,graph([createPipelineNode('image-input','input'),generateNode('g'),createPipelineNode('output','out')],[['input','g'],['g','out']]),[original.url])
+    const calls={value:0,batches:[] as string[]},first=await drain(createPipelineExecutor(f.a,repo,{gateway:noGateway,runtimeConfig,generate:fakeGeneration(f,fs,'gateway',calls)}),run.id)
+    const before=await f.db.select().from(pipelineRunSteps),beforeRun=await repo.requireRun(run.id),body=rerunBody(first.items[0]!,true)
+    for(const actor of [f.b,f.stranger]) await assert.rejects(createPipelineRepository(actor,f.db,{storage:await useUserFS(actor,f.raw,f.db)}).rerun(run.id,body),(error:any)=>error.statusCode===404)
+    for(const creditBalanceUnits of ['0','-1']){
+        await f.db.update(users).set({creditBalanceUnits}).where(eq(users.id,f.a.userId))
+        await assert.rejects(repo.rerun(run.id,body),(error:any)=>{assert.equal(error.statusCode,402);assert.deepEqual(error.data,{code:CREDIT_EXHAUSTED_CODE});return true})
+        assert.deepEqual(await f.db.select().from(pipelineRunSteps),before);assert.deepEqual(await repo.requireRun(run.id),beforeRun)
+    }
+    const local=await saveStart(repo,graph([createPipelineNode('image-input','input'),createPipelineNode('output','out')],[['input','out']]),[original.url])
+    const localExecutor=createPipelineExecutor(f.a,repo,{gateway:noGateway,runtimeConfig}),done=await drain(localExecutor,local.run.id)
+    assert.equal((await repo.rerun(local.run.id,rerunBody(done.items[0]!))).run.status,'queued')
+    const completed=await drain(localExecutor,local.run.id);assert.equal(completed.status,'succeeded');assert.equal((await createAccountBilling(f.db).balanceFor(f.a)).actualBalanceUsd,'-0.000000000001')
+    await f.db.update(users).set({authVersion:2}).where(eq(users.id,f.a.userId))
+    await assert.rejects(repo.rerun(local.run.id,rerunBody(completed.items[0]!)),(error:any)=>error.statusCode===401)
+    await f.db.update(users).set({authVersion:1,disabledAt:sql`CURRENT_TIMESTAMP`}).where(eq(users.id,f.a.userId))
+    await assert.rejects(repo.rerun(local.run.id,rerunBody(completed.items[0]!)),(error:any)=>error.statusCode===401)
+    assert.equal(calls.value,1)
+}))
+
+test('one completed job reruns while a sibling owns a live claim without altering its provider fence or outputs',integration,async()=>fixture(async f=>{
+    const fs=await useUserFS(f.a,f.raw,f.db),repo=createPipelineRepository(f.a,f.db,{storage:fs}),original=await fs.saveUpload('/',upload(f.bytes))
+    const {run}=await saveStart(repo,graph([createPipelineNode('image-input','input'),createPipelineNode('resize','resize'),createPipelineNode('output','out')],[['input','resize'],['resize','out']]),[original.url,original.url])
+    const executor=createPipelineExecutor(f.a,repo,{gateway:noGateway,runtimeConfig})
+    for(let i=0;i<3;i++)await executor.advance(run.id)
+    const first=await repo.detail(run.id);assert.equal(first.items[0]!.status,'succeeded');assert.equal(first.items[1]!.status,'queued')
+    const claim=await repo.claim(run.id);assert.ok(claim);assert.equal(claim.step.itemId,first.items[1]!.id)
+    await repo.providerStarted(claim.step.id,claim.token,randomUUID())
+    const siblingBefore=await f.db.select().from(pipelineRunSteps).where(eq(pipelineRunSteps.itemId,first.items[1]!.id))
+    const queued=(await repo.rerun(run.id,rerunBody(first.items[0]!))).run
+    assert.equal(queued.status,'running');assert.equal(queued.items[0]!.status,'queued');assert.equal(queued.items[1]!.status,'running')
+    assert.deepEqual(await f.db.select().from(pipelineRunSteps).where(eq(pipelineRunSteps.itemId,first.items[1]!.id)),siblingBefore)
+    assert.equal(await repo.claim(run.id),null,'the one live sibling claim prevents overlapping execution in this run')
+    assert.equal(await repo.finish(claim.step.id,claim.token,'succeeded',{images:[await repo.imageValue(original.url)],text:null}),true)
+    const done=await drain(executor,run.id);assert.equal(done.status,'succeeded');assert.ok(done.items[0]!.steps.every(step=>step.attempt===2));assert.ok(done.items[1]!.steps.every(step=>step.attempt===1))
+}))
+
+test('a sibling provider-start fence overlaps a held rerun transaction without inverting account/run locks',integration,async()=>fixture(async f=>{
+    const fs=await useUserFS(f.a,f.raw,f.db),repo=createPipelineRepository(f.a,f.db,{storage:fs}),original=await fs.saveUpload('/',upload(f.bytes))
+    const {run}=await saveStart(repo,graph([createPipelineNode('image-input','input'),generateNode('g'),createPipelineNode('output','out')],[['input','g'],['g','out']]),[original.url,original.url])
+    const calls={value:0,batches:[] as string[]},executor=createPipelineExecutor(f.a,repo,{gateway:noGateway,runtimeConfig,generate:fakeGeneration(f,fs,'gateway',calls)})
+    for(let i=0;i<4;i++)await executor.advance(run.id)
+    const current=await repo.detail(run.id);assert.equal(current.items[0]!.status,'succeeded')
+    const claim=await repo.claim(run.id);assert.ok(claim);assert.equal(claim.step.nodeId,'g');assert.equal(claim.step.itemId,current.items[1]!.id)
+    const entered=Promise.withResolvers<void>(),release=Promise.withResolvers<void>(),realAssert=fs.assertReadableImages.bind(fs)
+    fs.assertReadableImages=async paths=>{await realAssert(paths);entered.resolve();await release.promise}
+    const rerunning=repo.rerun(run.id,rerunBody(current.items[0]!,true));await entered.promise
+    let fenced=false;const batchId=randomUUID(),fencing=repo.providerStarted(claim.step.id,claim.token,batchId).then(()=>{fenced=true})
+    await new Promise(resolve=>setTimeout(resolve,50));assert.equal(fenced,false,'the provider fence waits on the account acquired before the rerun run lock')
+    release.resolve();const [result]=await Promise.all([rerunning,fencing])
+    assert.equal(result.run.items[0]!.status,'queued');assert.equal(result.run.status,'running')
+    const [sibling]=await f.db.select().from(pipelineRunSteps).where(eq(pipelineRunSteps.id,claim.step.id))
+    assert.equal(sibling!.active,true);assert.equal(sibling!.status,'running');assert.equal(sibling!.claimToken,claim.token);assert.equal(sibling!.batchId,batchId);assert.ok(sibling!.providerStartedAt)
+    assert.equal(await repo.finish(claim.step.id,claim.token,'succeeded',{images:[await repo.imageValue(original.url)],text:null}),true)
+    assert.equal(calls.value,1,'no paid provider is contacted by requeue or the synthetic fence')
+}))
+
+test('selected unfinished/unpriced jobs cannot rerun and a draining cancellation never revives another claim',integration,async()=>fixture(async f=>{
+    const fs=await useUserFS(f.a,f.raw,f.db),repo=createPipelineRepository(f.a,f.db,{storage:fs}),original=await fs.saveUpload('/',upload(f.bytes))
+    const {run}=await saveStart(repo,graph([createPipelineNode('image-input','input'),createPipelineNode('output','out')],[['input','out']]),[original.url,original.url])
+    const executor=createPipelineExecutor(f.a,repo,{gateway:noGateway,runtimeConfig});await executor.advance(run.id);await executor.advance(run.id)
+    const first=await repo.detail(run.id)
+    await assert.rejects(repo.rerun(run.id,rerunBody(first.items[1]!)),(error:any)=>error.statusCode===400)
+    const claim=await repo.claim(run.id);assert.ok(claim)
+    await repo.finish(claim.step.id,claim.token,'awaiting-price',null)
+    const held=await repo.detail(run.id);assert.equal(held.items[1]!.status,'awaiting-price')
+    await assert.rejects(repo.rerun(run.id,rerunBody(held.items[1]!)),(error:any)=>error.statusCode===400)
+    const repeated=(await repo.rerun(run.id,rerunBody(first.items[0]!))).run;assert.equal(repeated.status,'awaiting-price')
+    assert.equal((await f.db.select().from(pipelineRunSteps).where(eq(pipelineRunSteps.id,claim.step.id)))[0]!.status,'awaiting-price')
+    await f.db.update(pipelineRunSteps).set({status:'succeeded',value:{images:[await repo.imageValue(original.url)],text:null},completedAt:sql`CURRENT_TIMESTAMP`}).where(eq(pipelineRunSteps.id,claim.step.id))
+    const done=await drain(executor,run.id);assert.equal(done.status,'succeeded')
+    await repo.rerun(run.id,rerunBody(done.items[1]!));const draining=await repo.claim(run.id);assert.ok(draining)
+    await repo.cancel(run.id)
+    const snapshot=await f.db.select().from(pipelineRunSteps)
+    const cancelled=await repo.detail(run.id)
+    await assert.rejects(repo.rerun(run.id,rerunBody(cancelled.items[0]!)),(error:any)=>error.statusCode===409)
+    assert.deepEqual(await f.db.select().from(pipelineRunSteps),snapshot);assert.equal((await repo.requireRun(run.id)).cancelRequested,true)
+    await repo.finish(draining.step.id,draining.token,'cancelled',null)
+    const terminal=await repo.detail(run.id)
+    const restored=(await repo.rerun(run.id,rerunBody(terminal.items[0]!))).run;assert.equal(restored.cancelRequested,false);assert.equal(restored.items[1]!.status,'cancelled')
+}))
+
+test('rerun authorization checks fresh shared sources at admission and again after requeue',integration,async()=>fixture(async f=>{
+    const sourceFS=await useUserFS(f.a,f.raw,f.db),fs=await useUserFS(f.b,f.raw,f.db),repo=createPipelineRepository(f.b,f.db,{storage:fs}),original=await sourceFS.saveUpload('/',upload(f.bytes))
+    await sourceFS.share(original.id!,f.b.userId,'view')
+    const {run}=await saveStart(repo,graph([createPipelineNode('image-input','input'),createPipelineNode('output','out')],[['input','out']]),[original.url])
+    const executor=createPipelineExecutor(f.b,repo,{gateway:noGateway,runtimeConfig}),first=await drain(executor,run.id),before=await f.db.select().from(pipelineRunSteps)
+    await sourceFS.revoke(original.id!,f.b.userId)
+    await assert.rejects(repo.rerun(run.id,rerunBody(first.items[0]!)),(error:any)=>error.statusCode===404)
+    assert.deepEqual(await f.db.select().from(pipelineRunSteps),before)
+    await sourceFS.share(original.id!,f.b.userId,'view');await repo.rerun(run.id,rerunBody(first.items[0]!));await sourceFS.revoke(original.id!,f.b.userId)
+    const failed=await drain(executor,run.id);assert.equal(failed.items[0]!.steps[0]!.error?.code,'SOURCE_UNAVAILABLE');assert.equal((await f.db.select().from(systemPrompt)).length,0)
+}))
+
+test('People reruns cannot bypass a revoked profile through an independent file grant',integration,async()=>fixture(async f=>{
+    const sourceFS=await useUserFS(f.a,f.raw,f.db),fs=await useUserFS(f.b,f.raw,f.db),people=createPeopleRepository(f.a,f.db),repo=createPipelineRepository(f.b,f.db,{storage:fs})
+    const person=(await people.create({name:'Shared reference'})).person,photo=await sourceFS.saveUpload('/',upload(f.bytes));await people.addPhotos(person.id,{urls:[photo.url]});await people.share(person.id,{recipientUserId:f.b.userId});await sourceFS.share(photo.id!,f.b.userId,'view')
+    const input=createPipelineNode('people-input','people');input.config.images=[photo.url]
+    const {run}=await saveStart(repo,graph([input,createPipelineNode('output','out')],[['people','out']]))
+    const executor=createPipelineExecutor(f.b,repo,{gateway:noGateway,runtimeConfig}),first=await drain(executor,run.id),before=await f.db.select().from(pipelineRunSteps)
+    await people.revoke(person.id,f.b.userId);assert.equal((await fs.assetByUrl(photo.url)).id,photo.id)
+    await assert.rejects(repo.rerun(run.id,rerunBody(first.items[0]!)),(error:any)=>error.statusCode===404);assert.deepEqual(await f.db.select().from(pipelineRunSteps),before)
+    await people.share(person.id,{recipientUserId:f.b.userId});await repo.rerun(run.id,rerunBody(first.items[0]!));await people.removePhoto(person.id,photo.id!)
+    const failed=await drain(executor,run.id);assert.equal(failed.items[0]!.steps[0]!.error?.code,'SOURCE_UNAVAILABLE');assert.equal((await f.db.select().from(systemPrompt)).length,0)
+}))
+
+test('reruns retain a node-only target and immutable input text after the saved pipeline is removed, with a five-attempt cap',integration,async()=>fixture(async f=>{
+    const fs=await useUserFS(f.a,f.raw,f.db),repo=createPipelineRepository(f.a,f.db,{storage:fs})
+    const text=createPipelineNode('text-input','text');text.config.required=true
+    const {pipeline,run}=await saveStart(repo,graph([text,createPipelineNode('output','out'),createPipelineNode('image-input','unused')],[['text','out']]),[],{inputs:{text:'The original prompt'},targetNodeId:'text'})
+    const executor=createPipelineExecutor(f.a,repo,{gateway:noGateway,runtimeConfig});let current=await drain(executor,run.id)
+    await repo.remove(pipeline.id)
+    for(let attempt=2;attempt<=5;attempt++){
+        await repo.rerun(run.id,rerunBody(current.items[0]!));current=await drain(executor,run.id)
+        assert.equal(current.targetNodeId,'text');assert.equal(current.items[0]!.steps.length,1);assert.equal(current.items[0]!.steps[0]!.attempt,attempt);assert.equal(current.items[0]!.steps[0]!.value!.text,'The original prompt')
+    }
+    const before=await f.db.select().from(pipelineRunSteps)
+    await assert.rejects(repo.rerun(run.id,rerunBody(current.items[0]!)),(error:any)=>error.statusCode===409&&error.statusMessage.includes('five-attempt'))
+    assert.deepEqual(await f.db.select().from(pipelineRunSteps),before);assert.equal(before.length,5)
+}))
+
+test('requeued completed runs obey personal and global pipeline queue admission limits',integration,async()=>fixture(async f=>{
+    const fs=await useUserFS(f.a,f.raw,f.db),repo=createPipelineRepository(f.a,f.db,{storage:fs})
+    const text=createPipelineNode('static-text','text');text.config.text='Local bounded work'
+    const definition=graph([text,createPipelineNode('output','out')],[['text','out']]),{pipeline,run}=await saveStart(repo,definition)
+    const completed=await drain(createPipelineExecutor(f.a,repo,{gateway:noGateway,runtimeConfig}),run.id),body=rerunBody(completed.items[0]!)
+    const live=await Promise.all(Array.from({length:3},()=>repo.start(pipeline.id,{revision:1,idempotencyKey:randomUUID(),inputs:{}})))
+    const before=await f.db.select().from(pipelineRunSteps).where(eq(pipelineRunSteps.runId,run.id))
+    await assert.rejects(repo.rerun(run.id,body),(error:any)=>error.statusCode===429)
+    assert.deepEqual(await f.db.select().from(pipelineRunSteps).where(eq(pipelineRunSteps.runId,run.id)),before)
+    for(const value of live)await repo.cancel(value.run.id)
+    const bRepo=createPipelineRepository(f.b,f.db,{storage:await useUserFS(f.b,f.raw,f.db)}),bPipeline=(await bRepo.create({name:'Other account live runs',definition})).pipeline
+    await f.db.insert(pipelineRuns).values(Array.from({length:20},()=>({id:randomUUID(),pipelineId:bPipeline.id,organizationId:f.b.organizationId,userId:f.b.userId,name:bPipeline.name,revision:1,definition,inputs:{},idempotencyKey:randomUUID()})))
+    await assert.rejects(repo.rerun(run.id,body),(error:any)=>error.statusCode===429)
+    assert.deepEqual(await f.db.select().from(pipelineRunSteps).where(eq(pipelineRunSteps.runId,run.id)),before)
+}))
 
 test('pipeline credit refusals keep only the canonical public discriminator across HTTP and persisted step errors',()=>{
     const privateError={statusCode:402,statusMessage:'private provider detail',data:{code:CREDIT_EXHAUSTED_CODE,credential:'private-test-diagnostic'}}

@@ -664,6 +664,7 @@ export type PipelineRunStepDTO = {
   id: string;
   nodeId: string;
   type: PipelineNodeType;
+  attempt: number;
   status: PipelineStepStatus;
   value: PipelineValue | null;
   error: PipelineError | null;
@@ -711,6 +712,17 @@ export const RetryPipelineRunSchema = z
     confirmPossibleCharge: z.boolean().default(false),
   })
   .strict();
+export const RerunPipelineRunSchema = z
+  .object({
+    itemIds: z.array(z.string().uuid()).min(1).max(PIPELINE_LIMITS.batchImages),
+    // The current IDs act as a revision fence: a double click or stale tab
+    // cannot start another paid attempt after the first rerun completes.
+    expectedStepIds: z.array(z.string().uuid()).min(1).max(PIPELINE_LIMITS.batchImages * PIPELINE_LIMITS.nodes),
+    confirmPossibleCharge: z.boolean().default(false),
+  })
+  .strict()
+  .refine(value => new Set(value.itemIds).size === value.itemIds.length && new Set(value.expectedStepIds).size === value.expectedStepIds.length,
+    {message: "Choose each job and current step only once."});
 export const PipelineListQuerySchema = z
   .object({
     limit: z.coerce.number().int().min(1).max(50).default(20),

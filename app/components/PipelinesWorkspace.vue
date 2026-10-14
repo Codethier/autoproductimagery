@@ -17,6 +17,7 @@ import {
   type PipelineRunDTO,
   type PipelineRunListDTO,
 } from "../../schemas/pipelines";
+import {getPipelineDisplayNodes} from '../../schemas/pipeline-display';
 import {
   ImagePathSchema,
   IMAGE_MODEL_PROFILES,
@@ -25,7 +26,7 @@ import type { SelectableFile } from "../../schemas/main.dto";
 import { parseUsdUnits } from "../../schemas/account-billing";
 import { formatBalanceUsd, formatUsd } from "../utils/generationPrice";
 import { imagePreviewUrl } from "../utils/imageDelivery";
-import {pipelineNodeUsesCredit, pipelineRetryUsesCredit} from '../utils/pipelineCredit';
+import {pipelineNodeUsesCredit, pipelineRetryUsesCredit, pipelineRerunUsesCredit, pipelineJobRerunBlockedReason} from '../utils/pipelineCredit';
 import {
   PIPELINE_TEMPLATES,
   pipelineNodeIcon,
@@ -150,7 +151,7 @@ const canUndo = computed(() => {
     return history.canRedo;
   });
 const executionNodes = computed(() =>
-  getPipelineExecutionNodes(definition.value, runTarget.value ?? undefined),
+  getPipelineDisplayNodes(getPipelineExecutionNodes(definition.value, runTarget.value ?? undefined)),
 );
 const inputNodes = computed(() =>
   executionNodes.value.filter(
@@ -857,7 +858,7 @@ async function prepareRun(targetId?: string) {
   batchImages.value = [];
   runInputs.value = {};
   batchInput.value =
-    getPipelineExecutionNodes(definition.value, targetId).find(
+    getPipelineDisplayNodes(getPipelineExecutionNodes(definition.value, targetId)).find(
       (node) => node.type === "image-input",
     )?.id ?? "";
   for (const node of getPipelineExecutionNodes(definition.value, targetId)) {
@@ -942,7 +943,8 @@ function schedulePoll() {
     !mounted ||
     !isRunActive.value ||
     runMode.value !== "results" ||
-    runRefreshing.value
+    runRefreshing.value ||
+    runMutating.value
   )
     return;
   if (pollAttempts >= 120) {
@@ -956,7 +958,7 @@ function schedulePoll() {
   }, 5000);
 }
 async function refreshRun(poll = false) {
-  if (!activeRun.value || runRefreshing.value) return;
+  if (!activeRun.value || runRefreshing.value || runMutating.value) return;
   const value = snapshot(),
     id = activeRun.value.id,
     number = ++runNumber;
@@ -991,7 +993,7 @@ async function resumeRun() {
   schedulePoll();
 }
 async function cancelRun() {
-  if (!activeRun.value || runMutating.value) return;
+  if (!activeRun.value || runMutating.value || runRefreshing.value) return;
   const value = snapshot(),
     id = activeRun.value.id;
   runMutating.value = true;
@@ -1019,12 +1021,14 @@ async function cancelRun() {
   }
 }
 async function retryRun(stepIds: string[]) {
-  if (!activeRun.value || runMutating.value || generationCredit.checking.value) return;
+  if (!activeRun.value || runMutating.value || runRefreshing.value || generationCredit.checking.value) return;
   const value = snapshot(),
     id = activeRun.value.id,
     usesCredit = pipelineRetryUsesCredit(activeRun.value, stepIds);
   runMutating.value = true;
   runError.value = '';
+  clearTimeout(pollTimer);
+  pollTimer = undefined;
   try {
     if (usesCredit && !await generationCredit.ensureCredit()) {
       if (current(value) && !generationCredit.open.value) runError.value = generationCredit.blockedReason.value;
@@ -1055,6 +1059,46 @@ async function retryRun(stepIds: string[]) {
       runMutating.value = false;
       schedulePoll();
     }
+  }
+}
+async function rerunJob(itemId: string) {
+  const savedRun = activeRun.value;
+  if (!savedRun || runMutating.value || runRefreshing.value || generationCredit.checking.value) return;
+  const reason = pipelineJobRerunBlockedReason(savedRun, itemId);
+  if (reason) { runError.value = reason; return; }
+  const item = savedRun.items.find(value => value.id === itemId)!;
+  const value = snapshot(), id = savedRun.id,
+    expectedStepIds = item.steps.map(step => step.id),
+    usesCredit = pipelineRerunUsesCredit(savedRun, itemId);
+  runMutating.value = true;
+  runError.value = '';
+  clearTimeout(pollTimer);
+  pollTimer = undefined;
+  try {
+    if (usesCredit && !await generationCredit.ensureCredit()) {
+      if (current(value) && !generationCredit.open.value) runError.value = generationCredit.blockedReason.value;
+      return;
+    }
+    if (!current(value) || activeRun.value?.id !== id) return;
+    const response = await request<{run: PipelineRunDTO}>(`/api/pipeline-runs/${id}/rerun`, {
+      method: 'POST',
+      body: {itemIds: [itemId], expectedStepIds, confirmPossibleCharge: usesCredit},
+    });
+    if (current(value) && activeRun.value?.id === id) {
+      activeRun.value = response.run;
+      runError.value = '';
+      pollAttempts = 0;
+      pollingPaused.value = false;
+      await balance.refresh();
+    }
+  } catch (error) {
+    if (!current(value)) return;
+    if (await generationCredit.handleError(error)) { if (current(value)) runError.value = ''; return; }
+    if (current(value)) runError.value = statusCode(error) === 409
+      ? 'This job cannot be requeued yet. Refresh progress and wait for outstanding prices to settle before trying again.'
+      : message(error, 'Could not rerun this job. Refresh progress before trying again; accepted work may already be queued.');
+  } finally {
+    if (current(value)) { runMutating.value = false; schedulePoll(); }
   }
 }
 const shownCreditFailures = new Set<string>();
@@ -2102,7 +2146,7 @@ onBeforeUnmount(() => {
           v-else-if="runMode === 'results' && activeRun"
           :key="activeRun.id"
           :run="activeRun"
-          :busy="runMutating"
+          :busy="runMutating || runRefreshing || generationCredit.checking.value"
           :error="runError"
           :paused="pollingPaused"
           @close="closeRun"
@@ -2110,6 +2154,7 @@ onBeforeUnmount(() => {
           @resume="resumeRun"
           @cancel="cancelRun"
           @retry="retryRun"
+          @rerun="rerunJob"
         />
         <section v-else-if="runMode === 'history'" class="pipeline-run-history">
           <header>

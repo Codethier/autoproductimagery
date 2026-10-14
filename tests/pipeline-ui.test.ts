@@ -23,6 +23,7 @@ import {
   PIPELINE_TEMPLATES,
 } from "../app/utils/pipelineTemplates.ts";
 import {createGenerationCreditController, initialGenerationCreditState} from '../app/utils/generationCredit.ts';
+import {pipelineRerunUsesCredit, pipelineJobRerunBlockedReason} from '../app/utils/pipelineCredit.ts';
 
 const root = new URL("../", import.meta.url),
   key = "__pipelineUi";
@@ -35,11 +36,11 @@ const favourites = new URL("app/composables/useImageModelFavourites.ts", root)
   .href;
 const exposures: Record<string, string> = {
   [workspace]:
-    "pipelines,pipeline,definition,name,description,editing,selectedId,selectedEdgeId,models,dirty,conflict,saveError,notice,useTemplate,addNode,updateNode,moveNode,removeNode,duplicateNode,copyNode,pasteNode,connect,disconnect,disconnectNode,undo,redo,canUndo,canRedo,loadPipelines,openPipeline,save,prepareRun,runTarget,batchInput,batchImages,runInputs,inputNodes,executionNodes,canStart,runIssues,creditBlockReason,startRun,runMode,activeRun,runError,starting,picker,pickerUrls,pickerTab,peopleOnlyPicker,pickerTabKey,openPicker,confirmPicker,refreshRun,resumeRun,cancelRun,retryRun,closeRun,loadRuns,runHistory,keyboard,metadataOpen,deleteOpen,discardOpen,openRuns",
+    "pipelines,pipeline,definition,name,description,editing,selectedId,selectedEdgeId,models,dirty,conflict,saveError,notice,useTemplate,addNode,updateNode,moveNode,removeNode,duplicateNode,copyNode,pasteNode,connect,disconnect,disconnectNode,undo,redo,canUndo,canRedo,loadPipelines,openPipeline,save,prepareRun,runTarget,batchInput,batchImages,runInputs,inputNodes,executionNodes,canStart,runIssues,creditBlockReason,startRun,runMode,activeRun,runError,starting,picker,pickerUrls,pickerTab,peopleOnlyPicker,pickerTabKey,openPicker,confirmPicker,refreshRun,resumeRun,cancelRun,retryRun,rerunJob,closeRun,loadRuns,runHistory,keyboard,metadataOpen,deleteOpen,discardOpen,openRuns",
   [properties]:
     "updateNode,changeModel,settings,orderedModels,ai,imageProfile,connect,selectImage,errorMessage",
   [results]:
-    "expandedItems,retryIds,retryOpen,chargeConfirmed,visibleImage,openRetry,retry",
+    "expandedItems,retryIds,retryOpen,chargeConfirmed,visibleImage,openRetry,retry,rerun,steps,orderedItemSteps,rerunReason",
   [canvas]:
     "view,paletteOpen,pendingSource,add,outputPort,inputPort,moveKey,fit",
 };
@@ -143,6 +144,7 @@ function run(): PipelineRunDTO {
           nodeId: node.id,
           type: node.type,
           status: "queued",
+          attempt: 1,
           value: null,
           error: null,
           generationIds: [],
@@ -266,6 +268,7 @@ async function render(
         ...props,
         onUpdate: (value: any) => events.push({ name: "update", value }),
         onRetry: (value: any) => events.push({ name: "retry", value }),
+        onRerun: (value: any) => events.push({ name: "rerun", value }),
       }),
   });
   components(app);
@@ -395,6 +398,16 @@ function findElement(tree: Node, id: string): Node | undefined {
     const value = findElement(child, id);
     if (value) return value;
   }
+}
+function findByLabel(tree: Node, label: string): Node | undefined {
+  if (tree.props["aria-label"] === label) return tree;
+  return tree.children.map(child => findByLabel(child, label)).find(Boolean);
+}
+function completedRun(): PipelineRunDTO {
+  const value = run();
+  value.status = 'succeeded'; value.summary.succeeded = 1; value.summary.pending = 0;
+  value.items.forEach(item => {item.status = 'succeeded'; item.steps.forEach(step => {step.status = 'succeeded'; step.completedAt = value.updatedAt;})});
+  return value;
 }
 
 test("all editable templates validate and the palette contains every supported image-only node", () => {
@@ -792,6 +805,119 @@ test('pipeline retry uses the saved run and paid descendants even when the curre
     assert.equal(env.credit.open.value, true); assert.equal(value.exposed.runError.value, '')
   } finally {value.app.unmount()}
 })
+
+test('completed job rerun uses live credit and saved model nodes instead of the edited canvas', async () => {
+  for (const credit of ['0', '-0.01']) {
+    const env = environment(); env.balance.balance.value = {unlimited: false, actualBalanceUsd: credit, outstandingCount: 0};
+    const value = await mount(env);
+    try {
+      value.exposed.useTemplate(PIPELINE_TEMPLATES.find(template => template.id === 'clean-catalog'));
+      const original = completedRun(); value.exposed.activeRun.value = original;
+      await value.exposed.rerunJob(original.items[0]!.id);
+      assert.equal(env.calls.some((call: any) => call.url.endsWith('/rerun')), false);
+      assert.equal(env.credit.open.value, true); assert.equal(value.exposed.runError.value, '');
+    } finally {value.app.unmount();}
+  }
+});
+
+test('local-only reruns have no balance check; positive and Unlimited paid reruns submit immutable attempt IDs', async () => {
+  for (const mode of ['free', 'positive', 'unlimited']) {
+    const env = environment();
+    env.balance.balance.value = mode === 'unlimited' ? {unlimited: true, actualBalanceUsd: null, outstandingCount: 4}
+      : {unlimited: false, actualBalanceUsd: mode === 'free' ? '0' : '0.000000000001', outstandingCount: 0};
+    let forced = 0; env.balance.refresh = async (options: {force?: boolean} = {}) => {if (options.force) forced++; return env.balance.balance.value;};
+    const value = await mount(env);
+    try {
+      const original = completedRun();
+      if (mode === 'free') {
+        const template = PIPELINE_TEMPLATES.find(template => template.id === 'clean-catalog')!.definition();
+        original.definition = template;
+        original.items[0]!.steps = template.nodes.map((node, index) => ({...original.items[0]!.steps[0]!, id: `55555555-5555-4555-8555-${String(index).padStart(12, '0')}`, nodeId: node.id, type: node.type}));
+      }
+      value.exposed.useTemplate(PIPELINE_TEMPLATES.find(template => template.id === 'clean-catalog'));
+      value.exposed.activeRun.value = original; value.exposed.runMode.value = 'results';
+      await value.exposed.rerunJob(original.items[0]!.id);
+      const call = env.calls.find((call: any) => call.url.endsWith('/rerun'))!;
+      assert.ok(call);
+      assert.deepEqual(call.options.body, {itemIds: [original.items[0]!.id], expectedStepIds: original.items[0]!.steps.map(step => step.id), confirmPossibleCharge: mode !== 'free'});
+      assert.equal(forced, mode === 'free' ? 0 : 1); assert.equal(env.credit.open.value, false);
+      assert.equal(value.exposed.activeRun.value.id, original.id); assert.equal(value.exposed.activeRun.value.status, 'queued');
+      assert.equal(value.exposed.runMode.value, 'results');
+      assert.equal('definition' in call.options.body, false); assert.equal('inputImages' in call.options.body, false);
+    } finally {value.app.unmount();}
+  }
+});
+
+test('a real per-input rerun button requeues one job in the same pane and suppresses rapid double clicks', async () => {
+  const env = environment(); const originalFetch = env.fetch; let release!: (response: unknown) => void;
+  env.fetch = async (url: string, options: any) => {
+    const response = await originalFetch(url, options);
+    return url.endsWith('/rerun') ? new Promise(resolve => {release = resolve;}) : response;
+  };
+  const value = await mount(env);
+  try {
+    const original = completedRun();
+    const sibling = {...original.items[0]!, id: '66666666-6666-4666-8666-666666666666', index: 1, steps: original.items[0]!.steps.map((step, index) => ({...step, id: `77777777-7777-4777-8777-${String(index).padStart(12, '0')}`}))};
+    original.items.push(sibling); original.summary.total = 2; original.summary.succeeded = 2;
+    value.exposed.activeRun.value = original; value.exposed.runMode.value = 'results'; await flush();
+    const button = findByLabel(value.tree, 'Rerun job for Input 1')!; assert.ok(button); assert.equal(Boolean(button.props.disabled), false);
+    button.props.onClick(); button.props.onClick(); await flush();
+    assert.equal(env.calls.filter((call: any) => call.url.endsWith('/rerun')).length, 1);
+    assert.deepEqual(env.calls.find((call: any) => call.url.endsWith('/rerun'))!.options.body.itemIds, [original.items[0]!.id]);
+    const queued = structuredClone(original); queued.status = 'queued'; queued.items[0]!.status = 'queued';
+    queued.items[0]!.steps.forEach((step, index) => {step.id = `88888888-8888-4888-8888-${String(index).padStart(12, '0')}`; step.status = 'queued'; step.attempt = 2;});
+    release({run: queued}); await flush();
+    assert.equal(value.exposed.runMode.value, 'results'); assert.equal(value.exposed.activeRun.value.items[0].status, 'queued');
+    assert.deepEqual(value.exposed.activeRun.value.items[1], sibling);
+    assert.equal(findByLabel(value.tree, 'Rerun job for Input 1'), undefined);
+    assert.equal(findByLabel(value.tree, 'Batch progress by input and step')!.props.tabindex, '0');
+  } finally {value.app.unmount();}
+});
+
+test('authoritative rerun 402 shows shared balance popup and account switches discard pending rerun responses', async () => {
+  const env = environment(); const originalFetch = env.fetch;
+  env.fetch = async (url: string, options: any) => {const response = await originalFetch(url, options); if (url.endsWith('/rerun')) throw {statusCode: 402, data: {data: {code: 'CREDIT_EXHAUSTED'}}}; return response;};
+  const value = await mount(env);
+  try {
+    const original = completedRun(); value.exposed.activeRun.value = original;
+    await value.exposed.rerunJob(original.items[0]!.id);
+    assert.equal(env.credit.open.value, true); assert.equal(value.exposed.runError.value, '');
+  } finally {value.app.unmount();}
+  const switchedEnv = environment(); const baseFetch = switchedEnv.fetch; let release!: (response: unknown) => void;
+  switchedEnv.fetch = async (url: string, options: any) => {const response = await baseFetch(url, options); return url.endsWith('/rerun') ? new Promise(resolve => {release = resolve;}) : response;};
+  const switched = await mount(switchedEnv);
+  try {
+    const original = completedRun(); switched.exposed.activeRun.value = original;
+    const request = switched.exposed.rerunJob(original.items[0]!.id); await flush();
+    switchedEnv.account.identity.value = 'org.bob'; switchedEnv.account.epoch.value++; await flush();
+    release({run: original}); await request; await flush();
+    assert.equal(switched.exposed.activeRun.value, null); assert.equal(switchedEnv.credit.open.value, false);
+  } finally {switched.app.unmount();}
+});
+
+test('progress refresh cannot race a rerun while its live balance check or POST is in flight', async () => {
+  const env = environment(); const baseFetch = env.fetch;
+  env.balance.balance.value = {unlimited: false, actualBalanceUsd: '1', outstandingCount: 0};
+  let releaseBalance!: (balance: unknown) => void, releaseRerun!: (response: unknown) => void;
+  env.balance.refresh = async (options: {force?: boolean} = {}) => options.force ? new Promise(resolve => {releaseBalance = resolve;}) : env.balance.balance.value;
+  env.fetch = async (url: string, options: any) => {const response = await baseFetch(url, options); return url.endsWith('/rerun') ? new Promise(resolve => {releaseRerun = resolve;}) : response;};
+  const value = await mount(env);
+  try {
+    const original = completedRun(); original.status = 'running';
+    original.items.push({...original.items[0]!, id: '99999999-9999-4999-8999-999999999999', index: 1, status: 'queued', steps: original.items[0]!.steps.map(step => ({...step, status: 'queued'}))});
+    value.exposed.activeRun.value = original; value.exposed.runMode.value = 'results';
+    const job = value.exposed.rerunJob(original.items[0]!.id); await flush();
+    await value.exposed.refreshRun();
+    assert.equal(env.calls.some((call: any) => call.url === `/api/pipeline-runs/${original.id}`), false);
+    releaseBalance(env.balance.balance.value); await flush();
+    await value.exposed.refreshRun();
+    assert.equal(env.calls.some((call: any) => call.url === `/api/pipeline-runs/${original.id}`), false);
+    const queued = structuredClone(original); queued.items[0]!.status = 'queued'; queued.items[0]!.steps.forEach(step => {step.attempt = 2; step.status = 'queued';});
+    releaseRerun({run: queued}); await job; await flush();
+    assert.equal(value.exposed.activeRun.value.items[0].status, 'queued');
+    assert.deepEqual(value.exposed.activeRun.value.items[1], original.items[1]);
+  } finally {value.app.unmount();}
+});
 
 test('an authoritative pipeline 402 and a background exhausted step show a deduplicated balance notice', async () => {
   const env = environment((url, options) => {
@@ -1231,6 +1357,60 @@ test("retry requires selection and explicit possible-charge acknowledgment befor
     value.events.find((event) => event.name === "retry")!.value,
     [step.id],
   );
+});
+test('rerun action is per completed input, has a new-charge notice, and guards pending prices, failures and attempt limits', async () => {
+  const fixture = completedRun();
+  const value = await render(results, {run: fixture});
+  assert.match(value.html, /aria-label="Rerun job for Input 1"/);
+  assert.match(value.html, /AI steps create new charges/);
+  assert.match(value.html, /Previous pictures stay in Assets/);
+  value.exposed.rerun(fixture.items[0]); value.exposed.rerun(fixture.items[0]);
+  assert.deepEqual(value.events.filter(event => event.name === 'rerun').map(event => event.value), [fixture.items[0]!.id]);
+  for (const state of ['queued', 'running', 'awaiting-price', 'failed', 'interrupted', 'cancelled']) {
+    const blocked = completedRun(); blocked.items[0]!.status = state as PipelineRunDTO['status']; blocked.items[0]!.steps[1]!.status = state as PipelineRunDTO['items'][number]['steps'][number]['status'];
+    const rendered = await render(results, {run: blocked});
+    assert.doesNotMatch(rendered.html, /aria-label="Rerun job for Input 1"/);
+    rendered.exposed.rerun(blocked.items[0]); assert.equal(rendered.events.some(event => event.name === 'rerun'), false);
+  }
+  const held = completedRun(); held.items[0]!.steps[1]!.value = {text: null, images: [{id: 'held', url: source, name: 'Held', generationId: 1, priceUsd: '0.01', priceSource: 'estimate'}]};
+  assert.match(pipelineJobRerunBlockedReason(held, held.items[0]!.id), /exact prices/);
+  const capped = completedRun(); capped.items[0]!.steps[1]!.attempt = 5;
+  const cappedUi = await render(results, {run: capped}); assert.match(cappedUi.html, /five-attempt limit/);
+  cappedUi.exposed.rerun(capped.items[0]); assert.equal(cappedUi.events.some(event => event.name === 'rerun'), false);
+  const busyUi = await render(results, {run: fixture, busy: true}); busyUi.exposed.rerun(fixture.items[0]); assert.equal(busyUi.events.some(event => event.name === 'rerun'), false);
+});
+
+test('a completed job can rerun while a sibling works unless cancellation is still draining', () => {
+  const fixture = completedRun(); fixture.status = 'running';
+  fixture.items.push({...fixture.items[0]!, id: 'other-input', index: 1, status: 'running', steps: fixture.items[0]!.steps.map(step => ({...step, status: 'running'}))});
+  assert.equal(pipelineJobRerunBlockedReason(fixture, fixture.items[0]!.id), '');
+  assert.equal(pipelineRerunUsesCredit(fixture, fixture.items[0]!.id), true);
+  fixture.cancelRequested = true;
+  assert.match(pipelineJobRerunBlockedReason(fixture, fixture.items[0]!.id), /remaining cancelled work/);
+});
+
+test('run setup, result columns, expanded details and retry options follow saved left-to-right canvas positions', async () => {
+  const fixture = completedRun();
+  fixture.definition.nodes.find(node => node.id === 'output')!.position = {x: 10, y: 100};
+  fixture.definition.nodes.find(node => node.id === 'product')!.position = {x: 200, y: 200};
+  fixture.definition.nodes.find(node => node.id === 'generate')!.position = {x: 200, y: 100};
+  fixture.items[0]!.steps.forEach(step => {step.value = {images: [], text: `Details for ${step.nodeId}`};});
+  const rendered = await render(results, {run: fixture});
+  assert.deepEqual(rendered.exposed.steps.value.map((node: any) => node.id), ['output', 'generate', 'product']);
+  assert.deepEqual(rendered.exposed.orderedItemSteps(fixture.items[0]).map((step: any) => step.nodeId), ['output', 'generate', 'product']);
+  const detail = rendered.html.slice(rendered.html.indexOf('pipeline-run-item-details'));
+  assert.ok(detail.indexOf('Details for output') < detail.indexOf('Details for generate')); assert.ok(detail.indexOf('Details for generate') < detail.indexOf('Details for product'));
+  const retryFixture = structuredClone(fixture); retryFixture.status = 'failed'; retryFixture.items[0]!.status = 'failed';
+  retryFixture.items[0]!.steps.forEach(step => {step.status = 'failed'; step.error = {code: 'test', message: 'Test error', retryable: true};});
+  const retryUi = await render(results, {run: retryFixture}); retryUi.exposed.openRetry();
+  assert.deepEqual(retryUi.exposed.retryIds.value, ['output', 'generate', 'product'].map(id => retryFixture.items[0]!.steps.find(step => step.nodeId === id)!.id));
+  const workspaceUi = await mount();
+  try {
+    workspaceUi.exposed.useTemplate(PIPELINE_TEMPLATES.find(template => template.id === 'product-photo'));
+    workspaceUi.exposed.definition.value = structuredClone(fixture.definition); await workspaceUi.exposed.prepareRun();
+    assert.deepEqual(workspaceUi.exposed.executionNodes.value.map((node: any) => node.id), ['output', 'generate', 'product']);
+    assert.equal(workspaceUi.exposed.batchInput.value, 'product');
+  } finally {workspaceUi.app.unmount();}
 });
 test("download all uses the authenticated run endpoint for confirmed final outputs only", async () => {
   const fixture = run();
