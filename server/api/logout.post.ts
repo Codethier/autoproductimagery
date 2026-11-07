@@ -1,16 +1,14 @@
-import { deleteCookie, getHeader, getRequestProtocol } from "h3"
-import { AUTH_COOKIE_NAME } from "../utils/authSession"
+import {deleteCookie, getCookie, setHeader} from 'h3'
+import {AUTH_COOKIE_NAME} from '../utils/authSession'
+import {accountCookieSecure, accountRequestError} from '../utils/accountRequests'
+import {createAccountRepository} from '../utils/accountRepository'
 
-export default defineEventHandler((event) => {
-    const forwardedProtocol = getHeader(event, "x-forwarded-proto")?.split(",", 1)[0]?.trim().toLowerCase()
-    const secure = process.env.NODE_ENV === "production"
-        || forwardedProtocol === "https"
-        || getRequestProtocol(event) === "https"
-    deleteCookie(event, AUTH_COOKIE_NAME, {
-        httpOnly: true,
-        secure,
-        sameSite: "lax",
-        path: "/",
-    })
+export default defineEventHandler(async event => {
+    assertMethod(event, 'POST')
+    setHeader(event, 'cache-control', 'no-store')
+    const token = getCookie(event, AUTH_COOKIE_NAME) || ''
+    try { await createAccountRepository().revokeSession(token) }
+    catch (error) { return accountRequestError(error) }
+    deleteCookie(event, AUTH_COOKIE_NAME, {httpOnly: true, secure: accountCookieSecure(event), sameSite: 'lax', path: '/'})
     return true
 })

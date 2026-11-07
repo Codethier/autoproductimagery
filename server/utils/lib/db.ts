@@ -1,5 +1,6 @@
-import { Pool, type PoolConfig } from "pg";
+import { Pool, type PoolConfig, type PoolClient } from "pg";
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
+import {acquireDatabaseConnection, DATABASE_CONNECT_ATTEMPT_MS, DatabaseUnavailableError} from './databaseConnection';
 
 type DatabaseEnvironment = Record<string, string | undefined>;
 
@@ -32,8 +33,8 @@ export function getDatabasePoolConfig(environment: DatabaseEnvironment = process
         connectionString: url.toString(),
         max,
         min: 0,
-        idleTimeoutMillis: 30_000,
-        connectionTimeoutMillis: 10_000,
+        idleTimeoutMillis: 5_000,
+        connectionTimeoutMillis: DATABASE_CONNECT_ATTEMPT_MS,
         statement_timeout: 30_000,
         query_timeout: 35_000,
         idle_in_transaction_session_timeout: 15_000,
@@ -53,12 +54,40 @@ export function getDatabasePoolConfig(environment: DatabaseEnvironment = process
     return config;
 }
 
+type PoolConnectCallback = Parameters<Pool['connect']>[0];
+
+/** Both Drizzle transactions and pool.query use this acquisition boundary. */
+export class ServerlessPostgresPool extends Pool {
+    constructor(config: PoolConfig) {
+        const requested = config.connectionTimeoutMillis ?? DATABASE_CONNECT_ATTEMPT_MS;
+        super({...config, connectionTimeoutMillis: Number.isFinite(requested) && requested > 0
+            ? Math.max(100, Math.min(DATABASE_CONNECT_ATTEMPT_MS, Math.floor(requested))) : DATABASE_CONNECT_ATTEMPT_MS});
+    }
+    override connect(): Promise<PoolClient>;
+    override connect(callback: PoolConnectCallback): void;
+    override connect(callback?: PoolConnectCallback): Promise<PoolClient> | void {
+        const connected = acquireDatabaseConnection(() => super.connect(), {
+            attemptTimeoutMs: this.options.connectionTimeoutMillis ?? DATABASE_CONNECT_ATTEMPT_MS,
+            stopped: () => this.ending || this.ended,
+        }).then(client => {
+            if (this.ending || this.ended) {
+                client.release(true);
+                throw new DatabaseUnavailableError();
+            }
+            return client;
+        });
+        if (!callback) return connected;
+        void connected.then(client => callback(undefined, client, client.release), (error: unknown) =>
+            callback(error instanceof Error ? error : new DatabaseUnavailableError(), undefined, () => undefined));
+    }
+}
+
 let pool: Pool | undefined;
 let database: NodePgDatabase | undefined;
 
 export function getDatabasePool(): Pool {
     if (!pool) {
-        pool = new Pool(getDatabasePoolConfig());
+        pool = new ServerlessPostgresPool(getDatabasePoolConfig());
         // A disconnected idle client emits an error asynchronously. Handle it
         // without printing connection strings or driver details containing SQL.
         pool.on("error", () => console.error("An idle PostgreSQL connection failed; the pool will reconnect."));

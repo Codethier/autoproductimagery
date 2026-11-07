@@ -7,8 +7,12 @@ const PAGE_SIZE = 100
 const MAX_RUN_ROWS = 10_000
 const MAX_RUN_DURATION_MS = 5 * 60 * 1000
 const MAX_CONSECUTIVE_FAILURES = 10
-const MANAGED_IMAGE_PATTERN = "^/images/output/img-[0-9]+-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\\.(png|jpg|gif|webp|bmp|tiff|heic)$"
+const UUID_PATTERN = '[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}'
+const OUTPUT_PATTERN = `output/img-[0-9]+-${UUID_PATTERN}\\.(png|jpg|gif|webp|bmp|tiff|heic)$`
+const LEGACY_IMAGE_PATTERN = `^/images/${OUTPUT_PATTERN}`
+const MANAGED_IMAGE_PATTERN = `^/images/(organizations/${UUID_PATTERN}/users/${UUID_PATTERN}/)?${OUTPUT_PATTERN}`
 const MANAGED_IMAGE_URL = new RegExp(MANAGED_IMAGE_PATTERN)
+const SCOPED_IMAGE_URL = new RegExp(`^/images/organizations/(${UUID_PATTERN})/users/(${UUID_PATTERN})/${OUTPUT_PATTERN}`)
 
 // A typo must never shorten retention accidentally. Zero is the explicit opt out.
 export function parseRetentionDays(value: string | undefined): number {
@@ -42,7 +46,11 @@ export type GeneratedImageRetentionResult = {
     failed: number
 }
 
-type RetentionCandidate = {id: number; outputImage: string; createdAt: string}
+type RetentionCandidate = {
+    id: number; outputImage: string; createdAt: string;
+    organizationId: string | null; userId: string | null;
+    assetCategory: string | null; assetOrganizationId: string | null; assetOwnerUserId: string | null;
+}
 type RetentionStorage = {removeGeneratedImage(url: string): Promise<void>}
 type RetentionOptions = {
     pool: Pick<Pool, "connect">
@@ -92,15 +100,35 @@ export async function runGeneratedImageRetention(options: RetentionOptions): Pro
         locked = lock.rows[0]?.locked === true
         if (!locked) { result.status = "already_running"; return result }
 
+        // A cron deployment can become available before the web app's additive
+        // migration. Until its registry exists, only old output paths are read.
+        const registry = await client.query<{available: boolean}>("SELECT to_regclass('asset') IS NOT NULL AS available")
+        const hasRegistry = registry.rows[0]?.available === true
+        const registryProjection = hasRegistry
+            ? `registry.category AS "assetCategory", registry.organization_id::text AS "assetOrganizationId", registry.owner_user_id::text AS "assetOwnerUserId"`
+            : `NULL::text AS "assetCategory", NULL::text AS "assetOrganizationId", NULL::text AS "assetOwnerUserId"`
+        const registryJoin = hasRegistry ? `LEFT JOIN asset registry ON registry.url = candidate."outputImage" AND registry.deleted_at IS NULL` : ''
+        const registryFilter = hasRegistry ? `AND (
+            (candidate."outputImage" ~ $6 AND (registry.id IS NULL OR (registry.kind = 'file' AND registry.category = 'generated'
+                AND registry.organization_id::text = to_jsonb(candidate)->>'organizationId'
+                AND registry.owner_user_id::text = to_jsonb(candidate)->>'userId')))
+            OR (registry.kind = 'file' AND registry.category = 'generated'
+                AND registry.organization_id::text = to_jsonb(candidate)->>'organizationId'
+                AND registry.owner_user_id::text = to_jsonb(candidate)->>'userId')
+        )` : 'AND candidate."outputImage" ~ $6'
+
         while (result.scanned < maxRows && performance.now() - startedAt < maxDurationMs) {
             const candidates = await client.query<RetentionCandidate>(`
-                SELECT candidate.id, candidate."outputImage", candidate."createdAt"::text AS "createdAt"
-                FROM "systemPrompt" candidate
+                SELECT candidate.id, candidate."outputImage", candidate."createdAt"::text AS "createdAt",
+                    to_jsonb(candidate)->>'organizationId' AS "organizationId", to_jsonb(candidate)->>'userId' AS "userId",
+                    ${registryProjection}
+                FROM "systemPrompt" candidate ${registryJoin}
                 WHERE candidate."outputImageDeletedAt" IS NULL AND candidate."outputImage" <> ''
                     AND (candidate.status = 'succeeded' OR candidate.status IS NULL)
                     AND candidate."createdAt" < $1::timestamptz
                     AND (candidate."createdAt", candidate.id) > ($2::timestamptz, $3::integer)
                     AND candidate."outputImage" ~ $5
+                    ${registryFilter}
                     AND NOT EXISTS (
                         SELECT 1 FROM "systemPrompt" retained
                         WHERE retained."outputImage" = candidate."outputImage" AND retained.id <> candidate.id
@@ -109,7 +137,7 @@ export async function runGeneratedImageRetention(options: RetentionOptions): Pro
                     )
                 ORDER BY candidate."createdAt", candidate.id
                 LIMIT $4::integer
-            `, [result.cutoff, lastCreatedAt, lastId, Math.min(PAGE_SIZE, maxRows - result.scanned), MANAGED_IMAGE_PATTERN])
+            `, [result.cutoff, lastCreatedAt, lastId, Math.min(PAGE_SIZE, maxRows - result.scanned), MANAGED_IMAGE_PATTERN, LEGACY_IMAGE_PATTERN])
             if (!candidates.rows.length) return result
 
             for (const row of candidates.rows) {
@@ -120,6 +148,11 @@ export async function runGeneratedImageRetention(options: RetentionOptions): Pro
                 lastId = row.id
                 result.scanned += 1
                 if (!isRetentionManagedImageUrl(row.outputImage)) { result.skippedInvalid += 1; continue }
+                const scoped = SCOPED_IMAGE_URL.exec(row.outputImage)
+                if (scoped && (row.organizationId !== scoped[1] || row.userId !== scoped[2]
+                    || row.assetCategory !== 'generated' || row.assetOrganizationId !== scoped[1] || row.assetOwnerUserId !== scoped[2])) {
+                    result.skippedInvalid += 1; continue
+                }
                 try {
                     // A historical import can contain duplicate output URLs.
                     // Preserve the object while another undeleted generation
@@ -136,12 +169,18 @@ export async function runGeneratedImageRetention(options: RetentionOptions): Pro
                     // No database transaction spans the S3 call. Missing objects
                     // delete successfully, making a crash after DELETE safe to retry.
                     await options.storage.removeGeneratedImage(row.outputImage)
-                    const marked = await client.query(`
-                        UPDATE "systemPrompt" SET "outputImageDeletedAt" = $1::timestamptz
+                    const markGeneration = `UPDATE "systemPrompt" SET "outputImageDeletedAt" = $1::timestamptz
                         WHERE id = $2::integer AND "outputImage" = $3 AND "outputImageDeletedAt" IS NULL
-                            AND (status = 'succeeded' OR status IS NULL) AND "createdAt" < $4::timestamptz
-                    `, [now.toISOString(), row.id, row.outputImage, result.cutoff])
-                    if (marked.rowCount !== 1) throw new Error("Cleanup row changed before it could be marked.")
+                            AND (status = 'succeeded' OR status IS NULL) AND "createdAt" < $4::timestamptz`
+                    const markSql = hasRegistry ? `WITH marked AS (${markGeneration} RETURNING "outputImage", "organizationId", "userId"),
+                        expired_assets AS (
+                            UPDATE asset SET deleted_at = $1::timestamptz, updated_at = $1::timestamptz
+                            WHERE url IN (SELECT "outputImage" FROM marked) AND category = 'generated' AND deleted_at IS NULL
+                                AND EXISTS (SELECT 1 FROM marked WHERE marked."organizationId" = asset.organization_id AND marked."userId" = asset.owner_user_id)
+                            RETURNING id
+                        ) SELECT count(*)::integer AS changed FROM marked` : markGeneration
+                    const marked = await client.query<{changed?: number}>(markSql, [now.toISOString(), row.id, row.outputImage, result.cutoff])
+                    if ((marked.rows[0]?.changed ?? marked.rowCount) !== 1) throw new Error("Cleanup row changed before it could be marked.")
                     result.deleted += 1
                     consecutiveFailures = 0
                 } catch {

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
+import {imageDownloadUrl, imagePreviewUrl, type ImagePreviewSize} from '../utils/imageDelivery'
 
 const props = withDefaults(defineProps<{
   src: string
@@ -7,28 +8,21 @@ const props = withDefaults(defineProps<{
   filename?: string
   downloadOnClick?: boolean
   showHoverIcon?: boolean
+  previewSize?: ImagePreviewSize
 }>(), {
   alt: '',
   filename: undefined,
   downloadOnClick: true,
-  showHoverIcon: true
+  showHoverIcon: true,
+  previewSize: 480
 })
 
 const emit = defineEmits<{
   (e: 'download', filename: string): void
 }>()
 
-// Normalize image URL to our data API if it's a repo-stored path (e.g., "/images/.../")
-const actualSrc = computed(() => {
-  const s = props.src || ''
-  if (!s || s.startsWith('data:') || s.startsWith('http://') || s.startsWith('https://') || s.startsWith('/api/')) {
-    return s
-  }
-  // Ensure leading slash
-  const withLead = s.startsWith('/') ? s : '/' + s
-  // Prefix with our file-serving endpoint
-  return '/api/data' + withLead
-})
+const downloadSrc = computed(() => imageDownloadUrl(props.src))
+const previewSrc = computed(() => imagePreviewUrl(props.src, props.previewSize))
 
 function filenameFromUrl(url: string): string {
   try {
@@ -42,7 +36,7 @@ function filenameFromUrl(url: string): string {
 }
 
 async function downloadImage(ev?: Event) {
-  if (!props.downloadOnClick) return
+  if (!props.downloadOnClick || !downloadSrc.value) return
   // Prevent parent click handlers from interfering
   if (ev) ev.stopPropagation()
 
@@ -56,17 +50,17 @@ async function downloadImage(ev?: Event) {
       return
     }
 
-    const urlObj = new URL(actualSrc.value, window.location.href)
+    const urlObj = new URL(downloadSrc.value, window.location.href)
     const sameOrigin = urlObj.origin === window.location.origin
 
     if (sameOrigin) {
-      triggerDownload(actualSrc.value, name)
+      triggerDownload(downloadSrc.value, name)
       emit('download', name)
       return
     }
 
     // Cross-origin: fetch to blob to avoid CORS download issues
-    const res = await fetch(actualSrc.value, { mode: 'cors' })
+    const res = await fetch(downloadSrc.value, { mode: 'cors' })
     const blob = await res.blob()
     const objectUrl = URL.createObjectURL(blob)
     try {
@@ -78,7 +72,7 @@ async function downloadImage(ev?: Event) {
     }
   } catch (e) {
     // As a last resort, attempt direct download which may or may not work depending on CORS
-    triggerDownload(actualSrc.value, name)
+    triggerDownload(downloadSrc.value, name)
     emit('download', name)
   }
 }
@@ -114,7 +108,7 @@ function onKeydown(e: KeyboardEvent) {
     @keydown="onKeydown"
   >
     <!-- Actual image behaves like a normal <img> via $attrs forwarding -->
-    <img loading="lazy" :src="actualSrc" :alt="alt" v-bind="$attrs" />
+    <img loading="lazy" decoding="async" :src="previewSrc" :alt="alt" v-bind="$attrs" />
 
     <!-- Hover overlay with transparent black gradient and download icon -->
     <span v-if="showHoverIcon"

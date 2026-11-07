@@ -38,24 +38,24 @@ function setCompression(event: Event) {
         <select v-model="settings.quality" class="setting-input">
           <option value="auto">Auto</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option>
         </select>
-        <span class="setting-help">Low is fastest; high uses more output tokens.</span>
+        <span class="setting-help">Rendering effort, separate from resolution. Higher settings can take longer and use more output tokens.</span>
       </label>
       <label class="text-sm font-medium">Background
         <select v-model="settings.background" class="setting-input">
           <option value="auto">Auto</option><option value="opaque">Opaque</option>
         </select>
-        <span class="setting-help">Transparent backgrounds are not supported.</span>
+        <span class="setting-help">Auto lets the model decide; Opaque fills the background. Transparent output is not available for this model in this app.</span>
       </label>
       <label class="text-sm font-medium">Output format
         <select v-model="settings.outputFormat" class="setting-input">
           <option value="png">PNG</option><option value="jpeg">JPEG</option><option value="webp">WebP</option>
         </select>
-        <span class="setting-help">JPEG is usually fastest; PNG disables compression.</span>
+        <span class="setting-help">Choose the saved file type. PNG alone does not create transparency. PNG has no compression control.</span>
       </label>
       <label class="text-sm font-medium">Output compression
         <input class="setting-input" type="number" min="0" max="100" step="1"
                :disabled="compressionDisabled" :value="settings.outputCompression ?? ''" @input="setCompression">
-        <span class="setting-help">Optional, 0–100. Available only for JPEG and WebP.</span>
+        <span class="setting-help">Optional compression value, 0–100, for JPEG or WebP. It affects file size and image detail; blank uses the model default.</span>
       </label>
       <label class="text-sm font-medium">Moderation
         <select v-model="settings.moderation" class="setting-input">

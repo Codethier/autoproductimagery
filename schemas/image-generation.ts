@@ -319,13 +319,21 @@ export type StoredGenerationError = z.infer<typeof StoredGenerationErrorSchema>
 export const ImageGenerationRequestSchema = z.object({
   prompt: z.string().trim().min(1, 'Prompt is required.').max(20_000),
   model: ImageModelIdSchema,
-  inputImages: z.array(ImagePathSchema).max(20).default([]),
+  inputImages: z.array(ImagePathSchema).max(50).default([]),
   modelImages: z.array(ImagePathSchema).max(16).default([]),
   maskImage: ImagePathSchema.optional(),
   storeInputImages: z.boolean().default(true),
   parentSystemPromptId: z.number().int().positive().optional(),
+  personId: z.string().uuid().optional(),
+  personPictureCount: z.number().int().min(1).max(4).optional(),
   settings: ImageGenerationSettingsSchema,
 }).strict().superRefine((value, context) => {
+  if (value.personPictureCount !== undefined && !value.personId) {
+    context.addIssue({code: 'custom', path: ['personPictureCount'], message: 'A people profile is required for a picture count.'})
+  }
+  if (value.personPictureCount !== undefined && value.inputImages.length) {
+    context.addIssue({code: 'custom', path: ['inputImages'], message: 'People factory picture requests use reference images, without product inputs.'})
+  }
   const profile = IMAGE_MODEL_PROFILES[value.model]
   const expectedKind = profile.settingsKind
   if (value.settings.kind !== expectedKind) {
@@ -366,7 +374,10 @@ export const ImageGenerationRequestSchema = z.object({
   }
 
   const outputsPerJob = generationOutputCount(value.settings)
-  const providerJobs = Math.max(1, value.inputImages.length)
+  const providerJobs = value.personPictureCount ?? Math.max(1, value.inputImages.length)
+  if (value.personId && providerJobs * outputsPerJob > 4) {
+    context.addIssue({code: 'custom', path: ['personPictureCount'], message: 'A people factory request may create at most 4 pictures.'})
+  }
   if (providerJobs * outputsPerJob > 50) {
     context.addIssue({
       code: 'custom',
@@ -426,6 +437,8 @@ export type ImageModelProfile = {
   requiresMask?: boolean
   maskMode?: 'alpha' | 'luminance'
   supportsTextOutput: boolean
+  /** Verified alpha-channel output through this app's current settings and Gateway adapter. */
+  supportsTransparentBackground: boolean
   aspectRatios: readonly string[]
   imageSizes: readonly string[]
   warnings: readonly string[]
@@ -442,6 +455,7 @@ const catalogProfiles = Object.fromEntries(CATALOG_IMAGE_MODEL_IDS.map(id => {
     supportsMask: definition.requiresMask, requiresMask: definition.requiresMask,
     ...(definition.requiresMask ? {maskMode: 'luminance' as const} : {}),
     supportsTextOutput: false,
+    supportsTransparentBackground: definition.supportsTransparentBackground,
     aspectRatios: definition.controls.find(control => control.key === 'aspectRatio')?.options ?? [],
     imageSizes: definition.controls.find(control => control.key === 'size' || control.key === 'resolution')?.options ?? [],
     warnings: definition.warnings,
@@ -455,8 +469,9 @@ export const IMAGE_MODEL_PROFILES: Readonly<Record<ImageModelId, ImageModelProfi
     id: 'openai/gpt-image-1', profileVersion: 1, name: 'GPT Image 1', shortName: 'GPT Image 1',
     provider: 'openai', adapter: 'gateway-image', settingsComponent: 'OpenAiGptImageLegacySettings',
     settingsKind: 'openai-gpt-image-1', lifecycle: 'legacy',
+    supportsTransparentBackground: true,
     description: 'OpenAI image generation and editing with fixed sizes, transparency, masks, and up to ten outputs.',
-    maxReferenceImages: 16, referenceInputs: ['image'], supportsMask: true, supportsTextOutput: false,
+    maxReferenceImages: 16, referenceInputs: ['image'], supportsMask: true, maskMode: 'alpha', supportsTextOutput: false,
     aspectRatios: [], imageSizes: GPT_IMAGE_LEGACY_SIZES,
     warnings: ['Reference inputs are image files only; use PNG, JPEG, or WebP.', 'Transparent backgrounds require PNG or WebP output.'],
   },
@@ -464,8 +479,9 @@ export const IMAGE_MODEL_PROFILES: Readonly<Record<ImageModelId, ImageModelProfi
     id: 'openai/gpt-image-1-mini', profileVersion: 1, name: 'GPT Image 1 Mini', shortName: 'GPT Image 1 Mini',
     provider: 'openai', adapter: 'gateway-image', settingsComponent: 'OpenAiGptImageLegacySettings',
     settingsKind: 'openai-gpt-image-1-mini', lifecycle: 'legacy',
+    supportsTransparentBackground: true,
     description: 'OpenAI image generation and editing with fixed sizes, transparency, masks, and up to ten outputs.',
-    maxReferenceImages: 16, referenceInputs: ['image'], supportsMask: true, supportsTextOutput: false,
+    maxReferenceImages: 16, referenceInputs: ['image'], supportsMask: true, maskMode: 'alpha', supportsTextOutput: false,
     aspectRatios: [], imageSizes: GPT_IMAGE_LEGACY_SIZES,
     warnings: ['Reference inputs are image files only; use PNG, JPEG, or WebP.', 'Transparent backgrounds require PNG or WebP output.'],
   },
@@ -473,8 +489,9 @@ export const IMAGE_MODEL_PROFILES: Readonly<Record<ImageModelId, ImageModelProfi
     id: 'openai/gpt-image-1.5', profileVersion: 1, name: 'GPT Image 1.5', shortName: 'GPT Image 1.5',
     provider: 'openai', adapter: 'gateway-image', settingsComponent: 'OpenAiGptImageLegacySettings',
     settingsKind: 'openai-gpt-image-1.5', lifecycle: 'legacy',
+    supportsTransparentBackground: true,
     description: 'OpenAI image generation and editing with fixed sizes, transparency, masks, and up to ten outputs.',
-    maxReferenceImages: 16, referenceInputs: ['image'], supportsMask: true, supportsTextOutput: false,
+    maxReferenceImages: 16, referenceInputs: ['image'], supportsMask: true, maskMode: 'alpha', supportsTextOutput: false,
     aspectRatios: [], imageSizes: GPT_IMAGE_LEGACY_SIZES,
     warnings: ['Reference inputs are image files only; use PNG, JPEG, or WebP.', 'Transparent backgrounds require PNG or WebP output.'],
   },
@@ -487,6 +504,7 @@ export const IMAGE_MODEL_PROFILES: Readonly<Record<ImageModelId, ImageModelProfi
     adapter: 'gateway-language-image',
     settingsComponent: 'Gemini31FlashImageSettings',
     settingsKind: 'gemini-3.1-flash-image',
+    supportsTransparentBackground: false,
     lifecycle: 'recommended',
     description: 'Best general-purpose Gemini image model; supports 512–4K, thinking, and web/image grounding.',
     maxReferenceImages: 14,
@@ -512,6 +530,7 @@ export const IMAGE_MODEL_PROFILES: Readonly<Record<ImageModelId, ImageModelProfi
     adapter: 'gateway-language-image',
     settingsComponent: 'Gemini3ProImageSettings',
     settingsKind: 'gemini-3-pro-image',
+    supportsTransparentBackground: false,
     lifecycle: 'current',
     description: 'Premium Gemini model for complex professional assets, text rendering, and high-fidelity edits.',
     maxReferenceImages: 14,
@@ -536,6 +555,7 @@ export const IMAGE_MODEL_PROFILES: Readonly<Record<ImageModelId, ImageModelProfi
     adapter: 'gateway-language-image',
     settingsComponent: 'Gemini31FlashLiteImageSettings',
     settingsKind: 'gemini-3.1-flash-lite-image',
+    supportsTransparentBackground: false,
     lifecycle: 'current',
     description: 'Lowest-latency, low-cost Gemini image generation and editing; fixed to 1K output.',
     maxReferenceImages: 14,
@@ -561,6 +581,7 @@ export const IMAGE_MODEL_PROFILES: Readonly<Record<ImageModelId, ImageModelProfi
     adapter: 'gateway-language-image',
     settingsComponent: 'Gemini25FlashImageSettings',
     settingsKind: 'gemini-2.5-flash-image',
+    supportsTransparentBackground: false,
     lifecycle: 'legacy',
     lifecycleNote: 'Scheduled to retire October 2, 2026. Prefer Gemini 3.1 Flash Lite or Flash.',
     description: 'Legacy 1024-class Gemini model retained for comparison and reproducibility.',
@@ -586,11 +607,13 @@ export const IMAGE_MODEL_PROFILES: Readonly<Record<ImageModelId, ImageModelProfi
     adapter: 'gateway-image',
     settingsComponent: 'OpenAiGptImage25Settings',
     settingsKind: 'openai-gpt-image-2.5-sunburst',
+    supportsTransparentBackground: true,
     lifecycle: 'recommended',
     description: 'OpenAI image generation from text and pictures, focused on precise product edits.',
     maxReferenceImages: 16,
     referenceInputs: ['image'],
     supportsMask: true,
+    maskMode: 'alpha',
     supportsTextOutput: false,
     aspectRatios: [],
     imageSizes: [],
@@ -610,11 +633,13 @@ export const IMAGE_MODEL_PROFILES: Readonly<Record<ImageModelId, ImageModelProfi
     adapter: 'gateway-image',
     settingsComponent: 'OpenAiGptImage25Settings',
     settingsKind: 'openai-gpt-image-2.5-flare',
+    supportsTransparentBackground: true,
     lifecycle: 'current',
     description: 'OpenAI image generation and editing from text and pictures, optimized for fast everyday work.',
     maxReferenceImages: 16,
     referenceInputs: ['image'],
     supportsMask: true,
+    maskMode: 'alpha',
     supportsTextOutput: false,
     aspectRatios: [],
     imageSizes: [],
@@ -634,11 +659,13 @@ export const IMAGE_MODEL_PROFILES: Readonly<Record<ImageModelId, ImageModelProfi
     adapter: 'gateway-image',
     settingsComponent: 'OpenAiGptImage2Settings',
     settingsKind: 'openai-gpt-image-2',
+    supportsTransparentBackground: false,
     lifecycle: 'current',
     description: 'OpenAI image generation and editing with custom dimensions, masks, and up to ten outputs.',
     maxReferenceImages: 16,
     referenceInputs: ['image'],
     supportsMask: true,
+    maskMode: 'alpha',
     supportsTextOutput: false,
     aspectRatios: [],
     imageSizes: [],

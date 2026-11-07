@@ -5,7 +5,7 @@ import { coordinationTransaction, getCoordinationPool, type CoordinationPool } f
 type QueueEntry = () => void
 
 const DEFAULT_CONCURRENCY = 3
-const DEFAULT_MAX_QUEUE = 25
+const DEFAULT_MAX_QUEUE = 50
 const MIN_STALE_TTL_MS = 60_000
 const DEFAULT_STALE_TTL_MS = 15 * 60_000
 const MAX_STALE_TTL_MS = 24 * 60 * 60_000
@@ -278,7 +278,9 @@ export async function reserveGenerationBatch(
     settings: GenerationRuntimeSettings,
     requestTimeoutMs: number,
     pool?: CoordinationPool,
+    externalSignal?: AbortSignal,
 ) {
+    externalSignal?.throwIfAborted()
     const store = new DurableGenerationStore(pool ?? await getCoordinationPool())
     // A frozen worker cannot free its running slot while the bounded provider
     // call may still be alive. Admission leases outlive the entire request.
@@ -290,6 +292,9 @@ export async function reserveGenerationBatch(
     // bounds decoded image/reference buffers even before a running lease.
     const memoryGate = getGenerationLimiter(settings.concurrency, settings.maxQueue)
     const workAbort = new AbortController()
+    const cancelExternal = () => workAbort.abort(externalSignal?.reason)
+    externalSignal?.addEventListener('abort', cancelExternal, {once: true})
+    if (externalSignal?.aborted) cancelExternal()
     const heartbeatStop = new AbortController()
     const deadline = setTimeout(() => workAbort.abort(new GenerationRequestTimeoutError()), requestTimeoutMs)
     deadline.unref?.()
@@ -335,6 +340,7 @@ export async function reserveGenerationBatch(
         },
         async close() {
             clearTimeout(deadline)
+            externalSignal?.removeEventListener('abort', cancelExternal)
             heartbeatStop.abort()
             await heartbeat
             await store.release(owner)

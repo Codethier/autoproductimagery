@@ -38,6 +38,15 @@ test('Same-origin batch sends each input once with one shared prompt and referen
   assert.deepEqual(composerSources('batch', null, base.batchInputs), base.batchInputs)
 })
 
+test('Same-origin batch accepts fifty independent one-output inputs, enforcing total outputs and reference limits', () => {
+  const batchInputs = Array.from({length: 50}, (_, index) => `/images/product-${index}.png`)
+  const request = buildComposerRequest({...base, mode: 'batch', batchInputs})
+  assert.deepEqual(request.inputImages, batchInputs)
+  assert.throws(() => buildComposerRequest({...base, mode: 'batch', batchInputs: [...batchInputs, '/images/extra.png']}))
+  assert.throws(() => buildComposerRequest({...base, mode: 'batch', batchInputs, model: 'openai/gpt-image-2', settings: {...createDefaultSettings('openai/gpt-image-2'), numberOfImages: 2}}))
+  assert.throws(() => buildComposerRequest({...base, mode: 'batch', batchInputs, sharedReferences: Array.from({length: 16}, (_, index) => `/images/ref-${index}.png`)}), /reference images/)
+})
+
 test('both workspaces require a source and never borrow the other workspace selection', () => {
   assert.throws(() => buildComposerRequest({ ...base, editSource: null }), /Choose an image to edit/)
   assert.throws(() => buildComposerRequest({ ...base, mode: 'batch', batchInputs: [] }), /Choose at least one input/)

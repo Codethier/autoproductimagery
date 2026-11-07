@@ -4,6 +4,7 @@ import {z} from 'zod'
 import {
     IMAGE_MODEL_PROFILES,
     ImageGenerationRequestSchema,
+    ImagePathSchema,
     isOpenAiImageSettings,
     isGeminiImageSettings,
     getImageModelProfile,
@@ -19,6 +20,10 @@ import {
 } from './gatewayMetadata'
 import { resolveGenerationTotalTokens } from './generationBilling'
 import { toBufferView } from './imageBuffer'
+import {extractConfirmedGatewayPrice} from '../../schemas/generation-billing'
+import {createBillingMetadataFetch} from './billingMetadataFetch'
+import {extractGatewayErrorGenerationId} from './billingGatewayError'
+import {LEGACY_PIPELINE_TEXT_MODEL_ID, PipelineTextModelIdSchema, PromptEnhancerConfigSchema, pipelineTextProviderOptions} from '../../schemas/pipeline-text-models'
 
 // Supported model types reported by the gateway /config endpoint.
 export type GatewayModelType = 'language' | 'image' | 'embedding' | 'reranking' | 'video'
@@ -99,6 +104,34 @@ export type GeneratedImage = {
     grounding?: NonNullable<OutputMetadata['grounding']>
 }
 
+export type ProviderCallStarted = () => void | Promise<void>
+
+// Utility nodes use a separate exact-ID language-model allowlist. They accept
+// text and validated images and return text, without expanding image generators.
+export const PIPELINE_TEXT_MODEL_ID = LEGACY_PIPELINE_TEXT_MODEL_ID
+const PipelineTextRequestSchema = z.object({
+    model: PipelineTextModelIdSchema,
+    prompt: z.string().trim().min(1).max(20_000),
+    system: z.string().trim().min(1).max(20_000).optional(),
+    imageUrls: z.array(ImagePathSchema).max(8).default([]),
+    maxOutputTokens: z.number().int().min(64).max(16384).optional(),
+    temperature: z.number().min(0).max(2).optional(),
+    reasoningEffort: z.enum(['none', 'low', 'medium', 'high', 'xhigh', 'max']).optional(),
+}).strict().transform((request, context) => {
+    const parsed = PromptEnhancerConfigSchema.safeParse({model: request.model,
+        ...(request.temperature === undefined ? {} : {temperature: request.temperature}),
+        ...(request.maxOutputTokens === undefined ? {} : {maxOutputTokens: request.maxOutputTokens}),
+        ...(request.reasoningEffort === undefined ? {} : {reasoningEffort: request.reasoningEffort})})
+    if (!parsed.success) {
+        for (const issue of parsed.error.issues) context.addIssue({...issue, code: 'custom'})
+        return z.NEVER
+    }
+    return {...parsed.data, prompt: request.prompt, imageUrls: request.imageUrls,
+        ...(request.system ? {system: request.system} : {})}
+})
+export type PipelineTextRequest = z.input<typeof PipelineTextRequestSchema>
+export type PipelineGeneratedText = {text: string; billing: ImageGenerationBilling; warnings: string[]}
+
 const googleSearchInputSchema = z.object({}).strict()
 type GoogleSearchArgs = {
     searchTypes: {
@@ -158,6 +191,8 @@ function redactString(value: string): string {
         .replace(/Bearer\s+[^\s,;]+/gi, 'Bearer [REDACTED]')
         .replace(/([?&](?:key|api_key|apiKey|token)=)[^&\s]+/gi, '$1[REDACTED]')
         .replace(/data:[^;,\s]+;base64,[A-Za-z0-9+/=]+/gi, '[REDACTED_DATA_URL]')
+        .replace(/[A-Za-z]:\\[^\r\n"'<>]*/g, '[REDACTED_INTERNAL_PATH]')
+        .replace(/\/(?:Users|home|var|tmp|app|workspace|data)\/[^\r\n"'<>]*/g, '[REDACTED_INTERNAL_PATH]')
     return redacted.length > 8_000 ? `${redacted.slice(0, 8_000)}...[truncated]` : redacted
 }
 
@@ -312,7 +347,7 @@ function getGateway() {
             statusMessage: 'AI Gateway API key is missing in runtimeConfig.AiGatewayApiKey (env NUXT_AI_GATEWAY_API_KEY)',
         })
     }
-    _gateway = createGateway({apiKey})
+    _gateway = createGateway({apiKey, fetch: createBillingMetadataFetch()})
     return _gateway
 }
 
@@ -434,9 +469,14 @@ export function enrichImageModelInfo(model: GatewayModelInfo): GatewayModelInfo 
     }
 }
 
-export async function useGateway() {
+type GenerationImageStorage = Pick<Awaited<ReturnType<typeof useFS>>, 'getImageFile'> & {
+    assertReadableImages?: (urls: readonly string[]) => Promise<void>
+}
+export async function useGateway(imageStorage?: GenerationImageStorage) {
     const gateway = getGateway()
-    const fs = await useFS()
+    // Generation APIs inject the account-authorized storage facade. Catalog
+    // and billing lookups do not read image sources.
+    const fs: GenerationImageStorage = imageStorage ?? await useFS()
 
     async function listModels(opts: ListModelsOpts = {}): Promise<GatewayModelInfo[]> {
         let models: GatewayModelInfo[]
@@ -487,7 +527,7 @@ export async function useGateway() {
     }
 
     function asNumber(value: unknown): number | undefined {
-        return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+        return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined
     }
 
     function normalizeUsage(usage: any): ImageGenerationUsage {
@@ -503,23 +543,25 @@ export async function useGateway() {
     }
 
     function getGatewayGenerationId(providerMetadata: any): string | undefined {
-        const direct = providerMetadata?.gateway?.generationId ?? providerMetadata?.gateway?.generation_id
-        if (typeof direct === 'string' && direct.length > 0) return direct
+        const validId = (value: unknown): value is string => typeof value === 'string' && /^gen_[A-Za-z0-9_-]{1,120}$/.test(value)
+        const metadata = providerMetadata?.gateway
+        const direct = metadata?.generationId ?? metadata?.generation_id
+        if (validId(direct)) return direct
         const seen = new Set<object>()
-        const visit = (value: unknown): string | undefined => {
-            if (!value || typeof value !== 'object') return undefined
+        const visit = (value: unknown, depth = 0): string | undefined => {
+            if (!value || typeof value !== 'object' || depth > 6 || seen.size >= 100) return undefined
             if (seen.has(value)) return undefined
             seen.add(value)
-            for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
-                if ((key === 'generationId' || key === 'generation_id' || key === 'id') && typeof nested === 'string' && nested.startsWith('gen_')) {
+            for (const [key, nested] of Object.entries(value as Record<string, unknown>).slice(0, 100)) {
+                if ((key === 'generationId' || key === 'generation_id' || key === 'id') && validId(nested)) {
                     return nested
                 }
-                const found = visit(nested)
+                const found = visit(nested, depth + 1)
                 if (found) return found
             }
             return undefined
         }
-        return visit(providerMetadata)
+        return visit(metadata)
     }
 
     function priceTokenCount(count: number | undefined, perTokenUsd: string | undefined): number {
@@ -538,24 +580,24 @@ export async function useGateway() {
             priceTokenCount(uncachedInputTokens, pricing.input) +
             priceTokenCount(cached, pricing.cachedInputTokens ?? pricing.input) +
             priceTokenCount(usage.outputTokens, pricing.output)
-        return total > 0 ? total.toFixed(8) : undefined
+        return total > 0 ? total.toFixed(12) : undefined
     }
 
     function estimateImageMeteredPriceUsd(info: GatewayModelInfo | undefined, outputImages = 1): string | undefined {
         const component = info?.pricingDetails?.components.find(c => c.kind === 'fixed-image' && c.amountUsd != null)
         if (!component?.amountUsd) return undefined
-        return (component.amountUsd * Math.max(1, outputImages)).toFixed(8)
+        return (component.amountUsd * Math.max(1, outputImages)).toFixed(12)
     }
 
     async function getActualGatewayBilling(generationId: string | undefined) {
-        if (!generationId || typeof (gateway as any).getGenerationInfo !== 'function') return undefined
+        if (!generationId || !/^gen_[A-Za-z0-9_-]{1,120}$/.test(generationId)) return undefined
         try {
             const lookup = gatewayMetadataPool.start(
                 `generation:${generationId}`,
-                () => (gateway as any).getGenerationInfo({id: generationId}) as Promise<any>,
+                () => gateway.getGenerationInfo({id: generationId}),
             )
             if (!lookup) return undefined
-            return await settleWithinMs<any>(
+            return await settleWithinMs(
                 lookup,
                 GATEWAY_METADATA_TIMEOUT_MS,
                 'Gateway billing lookup',
@@ -570,6 +612,7 @@ export async function useGateway() {
     async function getGenerationBilling(generationId: string | undefined, fallbackModel?: string): Promise<ImageGenerationBilling | undefined> {
         const gatewayBilling = await getActualGatewayBilling(generationId)
         if (!gatewayBilling) return undefined
+        const priceUsd = generationId ? extractConfirmedGatewayPrice(gatewayBilling, generationId) : undefined
         const inputTokens = asNumber(gatewayBilling.promptTokens)
         const outputTokens = asNumber(gatewayBilling.completionTokens)
         return {
@@ -579,12 +622,12 @@ export async function useGateway() {
             cachedInputTokens: asNumber(gatewayBilling.cachedTokens),
             reasoningTokens: asNumber(gatewayBilling.reasoningTokens),
             totalTokens: resolveGenerationTotalTokens(
-                asNumber(gatewayBilling.totalTokens ?? gatewayBilling.total_tokens),
+                undefined,
                 inputTokens,
                 outputTokens,
             ),
-            priceUsd: asNumber(gatewayBilling.totalCost)?.toFixed(8),
-            priceSource: 'gateway',
+            priceUsd,
+            priceSource: priceUsd !== undefined ? 'gateway' : 'unknown',
             gatewayGenerationId: generationId,
             usageJson: {gatewayBilling: sanitizeProviderMetadata(gatewayBilling)},
         }
@@ -613,7 +656,7 @@ export async function useGateway() {
         const cachedInputTokens = asNumber(gatewayBilling?.cachedTokens) ?? usage.cachedInputTokens
         const reasoningTokens = asNumber(gatewayBilling?.reasoningTokens) ?? usage.reasoningTokens
         const totalTokens = resolveGenerationTotalTokens(
-            asNumber(gatewayBilling?.totalTokens ?? gatewayBilling?.total_tokens) ?? usage.totalTokens,
+            gatewayBilling ? undefined : usage.totalTokens,
             inputTokens,
             outputTokens,
         )
@@ -625,7 +668,7 @@ export async function useGateway() {
             reasoningTokens,
         }, enrichedInfo?.pricing)
         const imageMeteredEstimate = estimateImageMeteredPriceUsd(enrichedInfo, outputImages)
-        const gatewayPrice = asNumber(gatewayBilling?.totalCost)?.toFixed(8)
+        const gatewayPrice = generationId ? extractConfirmedGatewayPrice(gatewayBilling, generationId) : undefined
 
         return {
             model: typeof gatewayBilling?.model === 'string' ? gatewayBilling.model : modelId,
@@ -635,7 +678,7 @@ export async function useGateway() {
             cachedInputTokens,
             reasoningTokens,
             priceUsd: gatewayPrice ?? estimatedPrice ?? imageMeteredEstimate,
-            priceSource: gatewayPrice ? 'gateway' : (estimatedPrice || imageMeteredEstimate ? 'estimate' : 'unknown'),
+            priceSource: gatewayPrice !== undefined ? 'gateway' : (estimatedPrice || imageMeteredEstimate ? 'estimate' : 'unknown'),
             gatewayGenerationId: generationId,
             usageJson: {
                 usage,
@@ -692,6 +735,16 @@ export async function useGateway() {
         return mask.buffer
     }
 
+    async function assertSourcesStillReadable(request: ImageGenerationRequest, abortSignal: AbortSignal) {
+        abortSignal.throwIfAborted()
+        const paths = [...new Set([...request.inputImages, ...request.modelImages, ...(request.maskImage ? [request.maskImage] : [])])]
+        // Earlier sources may be revoked while a later image is decoding.
+        // HTTP generation injects the account facade; recheck all bounded,
+        // validated paths at the paid-call boundary without rereading S3.
+        if (paths.length) await fs.assertReadableImages?.(paths)
+        abortSignal.throwIfAborted()
+    }
+
     function validationError(issues: z.core.$ZodIssue[]): never {
         const errorData: StoredGenerationError = {
             name: 'ValidationError',
@@ -714,8 +767,11 @@ export async function useGateway() {
         return parsed.data
     }
 
-    function throwGatewayError(prefix: string, error: unknown): never {
+    function throwGatewayError(prefix: string, error: unknown, billing?: ImageGenerationBilling): never {
         const errorData = serializeGatewayError(error)
+        const generationId = extractGatewayErrorGenerationId(error)
+        billing ??= generationId ? {gatewayGenerationId: generationId, priceSource: 'unknown'} : undefined
+        if (billing) errorData.details = {provider: errorData.details, billing}
         const upstreamStatus = errorData.statusCode
         throw createError({
             statusCode: upstreamStatus != null && upstreamStatus >= 400 && upstreamStatus <= 599
@@ -727,13 +783,18 @@ export async function useGateway() {
     }
 
     function throwGatewayTimeout(prefix: string, timeoutMs: number, error: unknown): never {
+        const generationId = extractGatewayErrorGenerationId(error)
         const errorData: StoredGenerationError = {
             name: 'ProviderCallTimeoutError',
             message: `${prefix} timed out after ${timeoutMs} ms.`,
             statusCode: 504,
             code: 'PROVIDER_CALL_TIMEOUT',
             retryable: true,
-            details: redactSerializable({timeoutMs, cause: error}),
+            details: {
+                timeoutMs,
+                cause: redactSerializable(error),
+                ...(generationId ? {billing: {gatewayGenerationId: generationId, priceSource: 'unknown'}} : {}),
+            },
         }
         throw createError({
             statusCode: 504,
@@ -742,7 +803,7 @@ export async function useGateway() {
         })
     }
 
-    function noImageError(model: string, finishReason: unknown, responseText?: string): never {
+    function noImageError(model: string, finishReason: unknown, responseText?: string, billing?: ImageGenerationBilling): never {
         const reason = typeof finishReason === 'string' && finishReason.length > 0
             ? finishReason
             : 'unknown'
@@ -755,6 +816,7 @@ export async function useGateway() {
             details: {
                 finishReason: reason,
                 ...(responseText ? {responseText: redactString(responseText)} : {}),
+                ...(billing ? {billing} : {}),
             },
         }
         throw createError({
@@ -802,7 +864,7 @@ export async function useGateway() {
      * Gemini image models are multimodal language models. Their exact profile,
      * not a Gateway catalog heuristic, determines this generateText path.
      */
-    async function generateImageViaLanguageModel(opts: ImageGenerationRequest, requestAbortSignal?: AbortSignal): Promise<GeneratedImage[]> {
+    async function generateImageViaLanguageModel(opts: ImageGenerationRequest, requestAbortSignal?: AbortSignal, onProviderStart?: ProviderCallStarted): Promise<GeneratedImage[]> {
         const request = validateGenerationRequest(opts)
         if (!isGeminiImageSettings(request.settings)) {
             validationError([{
@@ -886,7 +948,10 @@ export async function useGateway() {
                 : {prompt: request.prompt}),
         })
         let response: Awaited<ReturnType<typeof callGateway>>
+        await assertSourcesStillReadable(request, abortSignal)
         try {
+            await onProviderStart?.()
+            abortSignal.throwIfAborted()
             response = await callGateway()
         } catch (error) {
             if (requestAbortSignal?.aborted) throw requestAbortSignal.reason
@@ -897,14 +962,13 @@ export async function useGateway() {
         }
 
         const images = response.files.filter(file => file.mediaType?.startsWith('image/'))
-        if (images.length === 0) noImageError(request.model, response.finishReason, response.text)
-
         const billing = await buildBilling(
             response.response?.modelId || request.model,
             response.totalUsage,
             response.providerMetadata,
-            images.length,
+            Math.max(1, images.length),
         )
+        if (images.length === 0) noImageError(request.model, response.finishReason, response.text, billing)
         const warnings = mergeWarnings(profile.warnings, formatWarnings(response.warnings))
         const responseText = settings.includeText && response.text.length > 0
             ? response.text
@@ -932,7 +996,7 @@ export async function useGateway() {
      * Native image models use the Gateway image adapter. Only options validated
      * against the selected model settings schema are forwarded.
      */
-    async function generateImageViaImageModel(opts: ImageGenerationRequest, requestAbortSignal?: AbortSignal): Promise<GeneratedImage[]> {
+    async function generateImageViaImageModel(opts: ImageGenerationRequest, requestAbortSignal?: AbortSignal, onProviderStart?: ProviderCallStarted): Promise<GeneratedImage[]> {
         const request = validateGenerationRequest(opts)
         if (isGeminiImageSettings(request.settings)) {
             validationError([{
@@ -984,10 +1048,28 @@ export async function useGateway() {
             : AbortSignal.timeout(timeoutMs)
         abortSignal.throwIfAborted()
 
+        const nativeModel = gateway.imageModel(request.model)
+        let observedResponse: Awaited<ReturnType<typeof nativeModel.doGenerate>> | undefined
+        const trackedModel: typeof nativeModel = {
+            specificationVersion: nativeModel.specificationVersion,
+            provider: nativeModel.provider,
+            modelId: nativeModel.modelId,
+            maxImagesPerCall: nativeModel.maxImagesPerCall,
+            doGenerate: async options => {
+                const result = await nativeModel.doGenerate(options)
+                // Retain billing metadata even if AI SDK rejects an empty or
+                // malformed image response after a billable provider call.
+                observedResponse = result
+                return result
+            },
+        }
         let response: Awaited<ReturnType<typeof aiGenerateImage>>
+        await assertSourcesStillReadable(request, abortSignal)
         try {
+            await onProviderStart?.()
+            abortSignal.throwIfAborted()
             response = await aiGenerateImage({
-                model: gateway.imageModel(request.model),
+                model: trackedModel,
                 maxRetries: 0,
                 prompt,
                 n: settings.numberOfImages,
@@ -999,7 +1081,13 @@ export async function useGateway() {
             if (abortSignal.aborted || isTimeoutLikeError(error)) {
                 throwGatewayTimeout('Gateway image request', timeoutMs, error)
             }
-            throwGatewayError('Gateway image request failed', error)
+            const billing = observedResponse
+                ? await buildBilling(request.model, observedResponse.usage, observedResponse.providerMetadata, settings.numberOfImages)
+                : undefined
+            if (observedResponse && observedResponse.images.length === 0) {
+                noImageError(request.model, 'no image files', undefined, billing)
+            }
+            throwGatewayError('Gateway image request failed', error, billing)
         }
 
         if (response.images.length === 0) noImageError(request.model, 'no image files')
@@ -1021,13 +1109,79 @@ export async function useGateway() {
         }))
     }
 
-    async function generateAnyImage(opts: ImageGenerationRequest, requestAbortSignal?: AbortSignal): Promise<GeneratedImage[]> {
+    async function generateAnyImage(opts: ImageGenerationRequest, requestAbortSignal?: AbortSignal, onProviderStart?: ProviderCallStarted): Promise<GeneratedImage[]> {
         requestAbortSignal?.throwIfAborted()
         const request = validateGenerationRequest(opts)
         const profile = IMAGE_MODEL_PROFILES[request.model]
         return profile.adapter === 'gateway-language-image'
-            ? generateImageViaLanguageModel(request, requestAbortSignal)
-            : generateImageViaImageModel(request, requestAbortSignal)
+            ? generateImageViaLanguageModel(request, requestAbortSignal, onProviderStart)
+            : generateImageViaImageModel(request, requestAbortSignal, onProviderStart)
+    }
+
+    /** Awaited by a leased, account-billed pipeline step. No tools or public URLs. */
+    async function generatePipelineText(opts: PipelineTextRequest, requestAbortSignal?: AbortSignal, onProviderStart?: ProviderCallStarted): Promise<PipelineGeneratedText> {
+        requestAbortSignal?.throwIfAborted()
+        const parsed = PipelineTextRequestSchema.safeParse(opts)
+        if (!parsed.success) {
+            throw createError({statusCode: 400, statusMessage: 'Invalid pipeline text generation settings'})
+        }
+        const request = parsed.data
+        const files: Array<{buffer: Buffer; mediaType: string}> = []
+        let totalBytes = 0
+        for (const url of request.imageUrls) {
+            requestAbortSignal?.throwIfAborted()
+            const image = await fs.getImageFile(url)
+            requestAbortSignal?.throwIfAborted()
+            if (!['image/png', 'image/jpeg', 'image/webp'].includes(image.mimeType)) {
+                throw createError({statusCode: 415, statusMessage: 'Pipeline text nodes accept PNG, JPEG, and WebP images'})
+            }
+            totalBytes += image.buffer.byteLength
+            if (totalBytes > 100 * 1024 * 1024) {
+                throw createError({statusCode: 413, statusMessage: 'Pipeline reference images may total at most 100 MB'})
+            }
+            files.push({buffer: image.buffer, mediaType: image.mimeType})
+        }
+        const timeoutMs = getImageGenerationTimeoutMs()
+        const abortSignal = requestAbortSignal
+            ? AbortSignal.any([requestAbortSignal, AbortSignal.timeout(timeoutMs)])
+            : AbortSignal.timeout(timeoutMs)
+        abortSignal.throwIfAborted()
+        if (request.imageUrls.length) await fs.assertReadableImages?.([...new Set(request.imageUrls)])
+        abortSignal.throwIfAborted()
+        const callGateway = () => generateText({
+            model: gateway.languageModel(request.model),
+            maxRetries: 0,
+            abortSignal,
+            timeout: {totalMs: timeoutMs},
+            maxOutputTokens: request.maxOutputTokens,
+            ...(request.temperature === undefined ? {} : {temperature: request.temperature}),
+            ...(request.system ? {system: request.system} : {}),
+            providerOptions: pipelineTextProviderOptions(request),
+            ...(files.length ? {messages: [{role: 'user' as const, content: [
+                {type: 'text' as const, text: request.prompt},
+                ...files.map(file => ({type: 'file' as const, data: file.buffer, mediaType: file.mediaType})),
+            ]}]} : {prompt: request.prompt}),
+        })
+        let response: Awaited<ReturnType<typeof callGateway>>
+        try {
+            await onProviderStart?.()
+            abortSignal.throwIfAborted()
+            response = await callGateway()
+        } catch (error) {
+            if (requestAbortSignal?.aborted) throw requestAbortSignal.reason
+            if (abortSignal.aborted || isTimeoutLikeError(error)) throwGatewayTimeout('Gateway pipeline text request', timeoutMs, error)
+            throwGatewayError('Gateway pipeline text request failed', error)
+        } finally {
+            // Stop retaining references when the provider has consumed its input.
+            for (const file of files) file.buffer = Buffer.alloc(0)
+        }
+        const billing = await buildBilling(request.model, response.totalUsage, response.providerMetadata, 0)
+        const text = response.text.trim()
+        if (!text || text.length > 20_000 || response.files.length) {
+            throwGatewayError('Gateway pipeline text request returned an invalid result',
+                createError({statusCode: 502, statusMessage: 'The text model did not return a bounded text result'}), billing)
+        }
+        return {text, billing, warnings: formatWarnings(response.warnings)}
     }
 
     return {
@@ -1039,5 +1193,6 @@ export async function useGateway() {
         generateImageViaLanguageModel,
         generateImageViaImageModel,
         generateAnyImage,
+        generatePipelineText,
     }
 }

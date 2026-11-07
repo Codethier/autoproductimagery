@@ -46,7 +46,7 @@ function setOptionalNumber(key: keyof GeminiImageGenerationSettings['sampling'],
           <option :value="undefined">Default (model decides)</option>
           <option v-for="ratio in props.aspectRatios" :key="ratio" :value="ratio">{{ ratio }}</option>
         </select>
-        <p class="setting-help">Default matches the first reference image's ratio, or uses 1:1 without a reference.</p>
+        <p class="setting-help">The output shape: 1:1 is square, 16:9 is wide, and 9:16 is tall. Default follows the first reference’s ratio or uses 1:1 without a reference.</p>
       </div>
       <div class="setting-card">
         <UCheckbox v-model="settings.includeText" label="Return model text with the image" />
@@ -56,23 +56,27 @@ function setOptionalNumber(key: keyof GeminiImageGenerationSettings['sampling'],
 
     <details class="setting-section">
       <summary class="cursor-pointer text-sm font-semibold">Sampling controls</summary>
-      <p class="setting-help mt-1">Optional advanced controls. Blank values use the provider defaults.</p>
+      <p class="setting-help mt-1">Optional advanced controls. Start with blank values to use the provider defaults; tuning sampling can make instruction following less reliable.</p>
       <div class="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-5">
         <label class="setting-label">Temperature
           <input class="setting-input" type="number" min="0" max="2" step="0.01"
                  :value="settings.sampling.temperature ?? ''" @input="setOptionalNumber('temperature', $event)">
+          <span class="setting-help">Randomness in the model’s choices. Higher values can vary the result; this does not control resolution or image quality.</span>
         </label>
         <label class="setting-label">Top P
           <input class="setting-input" type="number" min="0" max="1" step="0.01"
                  :value="settings.sampling.topP ?? ''" @input="setOptionalNumber('topP', $event)">
+          <span class="setting-help">Limits choices by their combined probability. Leave blank unless you are deliberately comparing sampling settings.</span>
         </label>
         <label class="setting-label">Top K
           <input class="setting-input" type="number" min="1" max="1000" step="1"
                  :value="settings.sampling.topK ?? ''" @input="setOptionalNumber('topK', $event)">
+          <span class="setting-help">Limits the number of likely choices considered at each step, when supported by the provider.</span>
         </label>
         <label class="setting-label">Seed
           <input class="setting-input" type="number" min="-2147483648" max="2147483647" step="1"
                  :value="settings.sampling.seed ?? ''" @input="setOptionalNumber('seed', $event)">
+          <span class="setting-help">Optional starting value for randomness. The same seed does not guarantee the same picture or preserve a person’s identity.</span>
         </label>
         <label class="setting-label">Max output tokens
           <input class="setting-input" type="number" :min="minimumOutputTokens" :max="props.maxOutputTokens" step="1"

@@ -6,22 +6,61 @@ Generate product imagery through Vercel AI Gateway, using independent jobs for e
 
 ## Image workspace
 
-The app opens at **Edit** (`/edit`), with an image-only upload area and an Assets picker. Choose one product image to open the canvas, write a prompt, and attach optional shared reference images or a model-specific mask. The canvas supports zoom, download, replacement, and using a generated result as the next input. Model settings remain specific to each current model; favourites, New tags, warnings, reference limits and exact replay are preserved.
+The app opens at **Edit** (`/edit`), in a warm studio layout with top navigation and an image-only upload area. Choose one product image from your library or Shared with me to open the canvas, write a prompt, and attach optional shared reference images or a model-specific mask. The canvas supports zoom, download, replacement, and using a generated result as the next input. Model settings remain specific to each current model; favourites, New tags, warnings, reference limits and exact replay are preserved.
 
 **Same-origin batch** (`/same-origin-batch`) applies one prompt and the same shared references to each selected input image. Each input creates an independent generation job; selecting several references does not multiply the jobs. Edit and batch keep separate input selections while sharing the prompt and model settings. Active requests stay visible across workspace navigation, and generation history remains available in both views.
 
-**Assets** (`/assets`) provides the private image library, folder browsing, uploads, keyword search, previews, downloads, favourites and multi-selection. The reusable picker supplies Edit inputs, batch inputs, shared references and PNG masks. Favourites are a browser-local preference; image bytes and file management remain authenticated server operations. Listing and search use bounded S3 pagination, so large libraries can continue loading without reading every image into memory. The Generated images view shows the output folder; retention eligibility comes from generation records rather than this view.
+**Library** (`/assets`) provides each user's private images, folders, uploads, keyword search, previews, downloads, favourites and multi-selection. The reusable picker supplies Edit inputs, batch inputs, references and PNG masks. Favourites are browser-local preferences scoped to the organization and user. Listing and search paginate the authorized PostgreSQL asset registry; the browser never scans the bucket or discovers another user's private objects. Generated images are identified by stored metadata; retention eligibility comes from generation records.
+
+**People** (`/people`) keeps named people profiles with descriptions and multiple photos, private by default. Create a profile, generate its first photos from a description, or attach images you own from Library. Select existing photos as identity references when generating more views of the same person. The generator uses the current model selector and model-specific settings through Vercel AI Gateway; generation costs use the same credit accounting and exact-price confirmation as Edit. A generated photo appears only after its final price is confirmed. Person descriptions and reference photos guide consistency; a model may still vary the person's appearance between generations.
+
+Choose **People** under Reference images in Edit or Same-origin batch to select individual photos. In batch, those same person references accompany every product input. Model reference limits apply to the full selection. Removing a photo from a profile or deleting a profile preserves the underlying images and generation history in Library. Image retention still applies to generated person photos; a People profile does not extend their lifetime.
+
+Use **Share person** to give selected members of the same organization view-only access to a profile and its photos. Recipients find profiles in People’s **Shared with me** view or under **Shared with me → People**, grouped by sharer. They can download photos or select them as references for their own generations. They cannot edit the profile, change its pictures, reshare it, or add generated pictures to the owner's profile. Future confirmed pictures follow the profile grant automatically. Revoking the grant, unlinking a photo, removing the profile or disabling its owner withdraws profile-derived access; a separate file/folder share remains independent. Images stay private in S3 and pass the usual authorization and final-price checks on every read.
+
+**Shared with me** (`/shared`) groups shared files and folders by the person who shared them. A source is a member of the same organization. Shares provide view-only access: previews, downloads and using an image in a new generation; the resulting output belongs to the generating user. The original owner manages the contents and grants or revokes access. Folder grants apply to their logical descendants, including later uploads; revocation applies on the next server operation. Sharing is confined to the same organization. Shared generated images still expire under the retention policy.
+
+Folder badges show the number of visible items directly inside each folder, including child folders. Counts are independent of search and pagination; deleted, expired or unpriced generated images are excluded. Empty folders show `0`. Counts come from one grouped PostgreSQL query for each listing page, with the same organization and sharing checks as the library.
+
+## Organizations and accounts
+
+There are two roles: **organization owner** and **user**. Owners manage accounts in **Team** (`/team`): create usernames and initial passwords, choose roles, update display names, reset passwords, and disable or re-enable accounts. Users manage their own images and sharing, and can change their password in **Account** (`/account`). There is no public signup or email invitation service. The last enabled owner cannot be demoted or disabled.
+
+An owner manages membership but has no automatic access to another user's private images, prompts, billing or Gateway diagnostics. All image reads, upload destinations, sharing, generation inputs, masks, history, details and billing refreshes enforce the authenticated organization and user. Each generation stores trusted ownership; client-supplied IDs cannot select another user's account or history.
+
+After applying the account migration, existing global sessions are invalid and users sign in again. On an empty account database, the first successful sign-in with the configured `NUXT_AUTH_USER` and `NUXT_AUTH_PASSWORD` creates the original organization owner. Existing unclaimed generation history and Gateway logs are assigned to that owner. Once any account exists, environment credentials cannot bypass a changed account password or create another bootstrap owner. Imported image objects require the explicit adoption step below before appearing in a library.
+
+Passwords are individually salted and hashed with bounded asynchronous scrypt. Session cookies contain random opaque tokens; PostgreSQL stores only their hashes, expiry and account version. Sessions expire after 12 hours. Logout revokes the current session; password, role and enabled-state changes revoke the affected user's sessions. Cookies are `HttpOnly`, `SameSite=Lax`, and secure under HTTPS/production. Mutating browser requests require the same origin. Account switches clear in-memory inputs, pending work and private caches; tabs notify each other with an opaque change event so an old tab clears its previous account without revoking a new login.
 
 ## Storage and runtime
 
 - Uploaded and generated images are validated raster images in a **private S3-compatible bucket**. Railway Storage Buckets are supported.
-- PostgreSQL stores generation history, exact replay settings, output dimensions/MIME/bytes, billing, attempt diagnostics, and coordination leases.
+- PostgreSQL stores organizations, accounts, hashed sessions, logical assets and sharing grants, generation history, exact replay settings, output dimensions/MIME/bytes, billing, attempt diagnostics, and coordination leases.
 - The Nuxt app needs no persistent disk or app volume. Warm instances share PostgreSQL and S3; a fresh instance can serve images and replay stored generations.
-- Authenticated image routes proxy private objects through `/api/data/images/...`. Bucket credentials and object URLs are never sent to the browser.
-- Folder markers preserve empty folders. File listings use bounded cursor pagination; the file browser loads more pages on demand. Concurrent uploads use conditional object creation rather than overwriting a same-name image.
+- Authenticated image routes proxy private objects through `/api/data/images/...`. Bucket credentials and public/presigned object URLs are never sent to the browser.
+- New uploads have immutable UUID object paths under their organization and owner. Logical folders are separate registry metadata: deleting and re-uploading a filename cannot replace an old generation source or revive a revoked file grant. Folder deletion sends a bounded list of exact registered keys, never a recursive physical-prefix delete.
+- File listings use bounded cursor pagination bound to the account and filters; the file browser loads more pages on demand. Concurrent uploads use conditional creation and never overwrite existing image bytes.
+- Upload up to **50 images at a time**, with **25 MB per image** and **100 MB combined**. Same-origin batch accepts up to 50 independent inputs and at most 50 total outputs. The shared paid-work queue defaults to 50 waiting jobs with 3 running jobs; overload and request deadlines remain bounded.
+- In image pickers, click a picture and **Shift-click** another to select the visible range between them. Existing selections from other folders or People profiles stay selected. Each picker keeps its own model/reference limit, and changing accounts, filters or profiles resets the range anchor.
 - Generation admission, running limits, job ownership, and login throttling are coordinated across instances. Provider work is awaited within the request, with abortable timeouts and durable recovery of abandoned pending rows.
 
-This is an image-only application. PDF, video, audio, arbitrary file uploads, and external media URLs are unsupported. All AI requests use the Vercel AI SDK through Vercel AI Gateway.
+This is an image-only application. PDF, video, audio, arbitrary file uploads, and external media URLs are unsupported. Generative AI requests use the Vercel AI SDK through Vercel AI Gateway. Background removal uses the explicitly supported local CPU processors described below.
+
+## Background removal on the app server
+
+Choose **Remove background** in Edit or an image preview in Library. Batch inputs and selected Library images support up to five source images per submission. Choose **BiRefNet Lite** (default) or **BiRefNet (Full)**. Each source creates an independent durable job; its transparent PNG is saved to the requesting user's **Cutouts** folder, with the original unchanged. Shared images can be processed while their view grant remains valid; the new cutout belongs to the processing user.
+
+Both processors use pinned MIT-licensed [BiRefNet models](https://github.com/ZhengPeng7/BiRefNet) exported by [rembg](https://github.com/danielgatis/rembg). They run through ONNX Runtime's CPU backend in a separate Node process inside the existing app container. No additional Railway service, GPU, Python runtime, public model endpoint, or provider API key is required. These jobs have a known **$0 provider charge** and do not debit user credit; server CPU/RAM still incur hosting costs. Gateway generations retain their exact-price gate and credit accounting.
+
+PostgreSQL admits at most 20 waiting jobs globally and five outstanding jobs per user, with one running inference across app instances. A 90-second lease is renewed during work. Only expired leases can recover; jobs have at most two attempts. Processing has a ten-minute engine deadline, and shutdown/abort terminates the worker process. A selected model stays loaded for reuse, then the idle process exits to release native memory. Source authorization is repeated before inference and before publication. A cutout becomes visible only after its asset and successful job transition commit together; failed publication removes that exact staged S3 object.
+
+The worker is started on demand. Enqueue/status requests and app startup wake the durable queue; there is no idle PostgreSQL poller keeping Railway awake. A job continues when its dialog closes. After a hard container restart, a live old lease must expire before recovery; an authenticated status request can resume it. This requires a persistent Node container with process support, such as Railway's sleeping app mode. Request-lifetime-only functions and edge runtimes cannot run this local worker.
+
+`npm run build` includes the worker, native CPU runtime, and both model files in the deployable app image. Downloads use the fixed URLs, exact byte sizes and SHA-256 hashes in `schemas/background-removal-models.ts`; a missing or mismatched artifact fails the build. The ONNX exports are about **214 MiB for Lite** and **928 MiB for Full**, and runtime RAM exceeds these sizes. Model files are build artifacts outside the public directory, never committed to Git or stored as user images. Use `npm run build:background-removal` to prepare them before `npm run dev`. Git pushes rebuild this same worker with the app; no separate deployment step is needed.
+
+In local Linux Node 26.10 tests with two CPU cores and a 640×800 product fixture, Lite took about 19 seconds cold and 12 seconds warm, with a 7.34 GB peak; Full took about 39 seconds cold and 25 seconds warm, with an 8.83 GB peak. These are development measurements, not production latency guarantees. Both use a fixed 1024×1024 inference tensor. Keep native memory arenas and memory-pattern caching disabled: tests with them enabled retained substantially more RAM. The worker releases its model after 60 idle seconds; measured idle RSS was about 0.75 GB for Lite and 1.95 GB for Full.
+
+Allow roughly **12–16 GB of total app memory** for these CPU exports and the web server. Small 2–4 GB VMs are insufficient. Before creating a worker, the engine checks available process/cgroup memory: Lite requires at least 8 GiB free, Full at least 10 GiB free. Insufficient memory produces a clear job error without loading the model. A separate bounded startup check loads the packaged CPU libraries in the final runtime, verifies Linux Node shared libraries including `libatomic`, and does no inference.
 
 ## Requirements and configuration
 
@@ -31,7 +70,6 @@ Use Node.js 26.x, PostgreSQL, a private S3-compatible bucket, and a Vercel AI Ga
 NUXT_AI_GATEWAY_API_KEY=
 NUXT_AUTH_USER=
 NUXT_AUTH_PASSWORD=
-NUXT_AUTH_SESSION_SECRET=
 DATABASE_URL=postgresql://localhost:5432/autoproductimagery
 DATABASE_POOL_MAX=3
 S3_ENDPOINT=https://t3.storageapi.dev
@@ -43,7 +81,7 @@ S3_PREFIX=images
 S3_FORCE_PATH_STYLE=false
 ```
 
-Set a strong login password and a separate random session secret of at least 32 characters. Every app instance must use the same credentials and signing secret. Changing either invalidates existing sessions. Cookies are expiring, signed, `HttpOnly`, `SameSite`, and secure under HTTPS/production.
+Set strong initial owner credentials and keep them consistent across instances until the original owner has signed in. Subsequent authentication uses account password hashes and revocable sessions in PostgreSQL. The legacy `NUXT_AUTH_SESSION_SECRET` setting is no longer used by the account-session implementation and does not need to be rotated or changed for this upgrade.
 
 Railway buckets use virtual-host addressing, so `S3_FORCE_PATH_STYLE=false` is appropriate for Railway. Use the bucket's **base endpoint** and its S3 bucket name from the Credentials tab. The bucket's display name and S3 bucket name can differ. Other S3 services may require path addressing. Objects remain under `S3_PREFIX`; do not point unrelated applications at the same prefix.
 
@@ -92,22 +130,66 @@ Expired worker leases permit conservative pending-job recovery on subsequent req
 
 ## Production deployments from master
 
-The single Railway `production` environment runs the app, PostgreSQL, private image bucket and daily retention worker. Configure both the `app` and `image-retention` services with the GitHub source `Codethier/autoproductimagery`, branch `master`, automatic push deployments and **Wait for CI** enabled. The checked-in `.github/workflows/ci.yml` runs tests against disposable PostgreSQL, typechecks, builds both entry points, checks migrations and verifies Node's runtime libraries on every push to `master` and pull request targeting it. CI receives no application or deployment credentials.
+The single Railway `production` environment runs the app, PostgreSQL, private image bucket and daily retention worker. Configure both the `app` and `image-retention` services with the GitHub source `Codethier/autoproductimagery`, branch `master`, automatic push deployments and **Wait for CI** disabled. GitHub Actions CI is not configured for this repository. Run the local verification commands above before publishing an approved change.
 
 | Service | Build | Start | Pre-deploy |
 | --- | --- | --- | --- |
 | `app` | `npm run build` | `node .output/server/index.mjs` | `npm run drizzle:migrate` |
 | `image-retention` | `npm run build:retention` | `node .output/cleanup-generated-images.mjs --apply` | None; app applies reviewed migrations |
 
-The app uses the `/api/health` readiness check and Railway serverless/sleep mode. The retention service has the daily schedule documented below and no public domain. PostgreSQL and S3 remain private; their connection variables are Railway service references. Pushes deploy the committed repository snapshot after CI succeeds, so local ignored credentials and datasets are never part of the GitHub deployment source.
+The app uses the `/api/health` readiness check and Railway serverless/sleep mode. The retention service has the daily schedule documented below and no public domain. PostgreSQL and S3 remain private; their connection variables are Railway service references. Pushes deploy the committed repository snapshot directly, so local ignored credentials and datasets are never part of the GitHub deployment source.
 
 Before switching an existing installation, review every deployment target watching `master`. Disable any obsolete target's automatic deployment before pushing this PostgreSQL/S3 version if that target still uses the previous SQLite/filesystem configuration. Preserve its existing application and stored data until a separate cutover is authorized. Production environment changes and migrations still require the explicit confirmation in `AGENTS.md`.
+
+## User credit and confirmed image prices
+
+Each account has **available credit**, **confirmed spending**, and **outstanding charges** in USD. Credit defaults to **Unlimited**. Organization owners can open **Team → Balance & payments** to set a user's available credit, or restore Unlimited; changes are audited and limited to the owner's organization. This is an internal credit ledger, with no payment collection or checkout integration.
+
+Confirmed charges reduce finite credit once, transactionally. Outstanding estimated amounts are labeled separately, and charges without an amount have an unknown count; an unknown cost is never treated as zero. Finite accounts can run one unresolved batch at a time. Because the catalog estimate cannot guarantee the final price, that batch may take the remaining credit below zero; the next batch is blocked until the owner adds credit. Existing historical confirmed spending appears in totals without reducing newly assigned credit again.
+
+At zero or negative available credit, a new paid generation opens **More balance needed** instead of submitting provider work. The dialog directs the user to their organization owner and provides a link to Account. This applies to Edit, Same-origin batch, People, regenerate/refine, and new paid pipeline runs or retries. Balance checks refresh before submission, and the server rejects exhausted credit even when the browser's balance was stale. Unlimited accounts and known-free local processing remain available. Already accepted work and its charges are preserved.
+
+Generated images stay unavailable until the final Gateway generation record confirms the exact charge. Result cards appear only once that price is confirmed; previews, downloads, Assets, shared folders, favorites and generation references all enforce the same server check. A confirmed zero-cost result is valid. Each revealed result shows its confirmed price without rounding small positive costs to zero. Uploaded images remain usable immediately.
+
+History and balance reads reconcile a small number of provider calls, with PostgreSQL leases, retry backoff and bounded network timeouts. The client refreshes automatically while results await pricing; no manual price-check controls are shown. Multi-output calls share the provider total exactly, including charged outputs whose storage failed. Repeated refreshes cannot charge a user again or overwrite a confirmed price with an estimate. Prompts, prices and account charges remain after image retention deletes the bytes.
+
+Organization owners can open **Team → Balance & payments** for an Unlimited user and record a received USD payment. Each immutable entry includes a positive amount in cents, an optional note, the recording owner's identity, and its server timestamp. This is received-payment bookkeeping: it does not transfer money, alter generation prices, or top up available generation credit. Users can list their own payment history on **Account**; owners can list histories within their organization.
+
+Balances show **Total paid**, **Unpaid bills** (confirmed spending minus recorded payments, with a minimum of zero), and **Paid ahead** when payments exceed confirmed spending. Unpriced and estimated charges remain separate. A $10 confirmed bill with a $5 received payment therefore shows $5 paid and $5 unpaid while the account remains Unlimited. Payments and their history remain visible if the owner later switches the account to finite credit; new payment entries require Unlimited credit. Duplicate submissions safely replay the original receipt through a request key, and failed responses can retry that same payment. Entries are read-only; there are no payment edit or deletion endpoints.
+
+Only ordinary Gateway-funded prices can be fully confirmed. BYOK generation records remain held because Gateway's charge excludes the external provider invoice, and its upstream cost is a market estimate. See the [Vercel generation lookup reference](https://vercel.com/docs/ai-gateway/sdks-and-apis/rest-api#look-up-a-generation).
+
+## Image previews and private caching
+
+Library grids and image strips request bounded WebP previews (160 or 480 pixels); the editor and larger previews request up to 1600 pixels. Resize fits the image inside the requested square, preserves its proportions and transparency, applies orientation, and never upscales. Downloads and generation inputs always use the original validated bytes.
+
+The authenticated image endpoint supports only fixed `preview=160`, `480`, `960`, or `1600` presets; omitting the query returns the original. Successful responses use `Cache-Control: private, no-cache, must-revalidate`, `Vary: Cookie` and account/representation-scoped ETags. Browsers may retain the image and revalidate it with a bodyless `304`. Session, organization, sharing, deletion and confirmed-price checks run before every cache hit or `304`; errors use `no-store`. Images are never made public through a CDN or image optimizer.
+
+Each warm server instance retains at most 64 MiB of image bytes: 48 MiB of fully validated originals and 16 MiB of previews, with LRU eviction and a five-minute absolute lifetime. Identical concurrent reads coalesce. Original reads and preview transforms each have two active slots and a bounded queue; overload returns a retryable `429`. A serverless cold start begins with an empty memory cache. Full validation still runs when an original enters the cache, so corrupt images never become cached previews. The cache requires no disk, persistent app volume, database migration or new service variables.
+
+## Serverless app, database and pipeline runner
+
+The app and pipeline runner support Railway serverless mode alongside a sleeping PostgreSQL service. PostgreSQL retains the application state and durable queues, and the private S3 bucket retains image bytes; sleeping containers need no persistent app volume. Idle database clients close after five seconds. S3 connections are reused during image-loading bursts and close after five idle seconds, without imposing that idle deadline on an active image stream.
+
+Accepted pipeline runs, retries and per-job reruns send an authenticated private HTTP wake **after** their queue transaction commits. In Railway, the current worker service contract defaults to `http://pipeline-worker.railway.internal:8080/wake`; its listener supports both IPv6 and IPv4. Set the trusted server-only `PIPELINE_WORKER_URL` to override the service address for local development or a service rename. Both services derive a separate, versioned HMAC wake credential from their matching `NUXT_AI_GATEWAY_API_KEY`; the raw Gateway key is never sent in a wake. An optional matching `PIPELINE_WORKER_WAKE_SECRET` of at least 32 characters overrides that credential source. Wakes carry no graph, user-selected URL or provider parameters. [Railway private domains](https://docs.railway.com/networking/domains/working-with-domains) stay within the project environment and need no public worker domain or TCP proxy.
+
+The runner drains the saved queue with the existing bounded concurrency, claims, heartbeats and provider-start fences. PostgreSQL notifications accelerate work while it is active, and five-second fallback checks continue while unfinished work exists, including future pricing checks, local cutouts and unexpired running-step leases. Once work finishes, it releases `LISTEN`, shuts down idle inference children and S3 connections, and stops database polling. A subsequent private wake restarts the drain. Concurrent or repeated wakes cannot repeat accepted provider work or lose a job queued during the transition to idle. On startup, the app also checks once for saved unfinished work and wakes the runner if needed, recovering jobs accepted by an older app during a mixed Git rollout; this creates no idle polling loop. Local deployments without a worker wake address retain the previous durable polling fallback; configure `PIPELINE_WORKER_URL` to test idle sleep behavior locally.
+
+Cold starts can initially refuse a connection or return a proxy `502`. Database connection acquisition retries before any SQL begins, with ten-second attempts and a total budget of up to 60 seconds; dispatched queries, transactions and paid calls are never replayed by this mechanism. Private worker wakes retry with a 75-second default budget. If a wake cannot be acknowledged, the app still returns the committed run and shows that it is saved; an authorized live-run progress read safely tries waking the runner again. [Railway documents initial wake delays and possible `502` responses](https://docs.railway.com/deployments/serverless).
+
+Client reads allow one safe retry within a shared 90-second deadline. Mutations allow 180 seconds without automatic retries, including sign-in and pipeline queue changes; image-generation requests allow 360 seconds, People generation preserves its 600-second deadline, and image uploads allow 240 seconds. These client limits do not increase the server's provider-work budget. Network or startup failures preserve the session and show a retryable workspace recovery screen; only a current confirmed `401` signs the user out. A mutation response can be lost after it commits, so check saved history or progress before intentionally submitting another paid call.
+
+The explicit `npm run drizzle:migrate` command warms PostgreSQL with a bounded readiness read, closes that connection, then invokes Drizzle Kit **once**. Its 110-second wrapper deadline fits the existing 120-second pre-deploy timeout; migration failures require checking the recorded state before another invocation. Production app builds bundle the wrapper, while fresh local checkouts can build it on demand. No migration runs on an app or worker cold start.
+
+Actual sleeping remains a platform observation: queued work, pending exact-price checks and active progress requests keep services awake until that work settles or watching stops. Railway detects inactivity from outbound traffic and typically sleeps an inactive service after five to ten minutes. Enabling its serverless toggle applies to newly created containers; the displayed setting alone does not establish that an already-running container has applied it. Health checks run during deployment, rather than continually keeping idle services awake. See [Railway serverless behavior](https://docs.railway.com/deployments/serverless) and [healthcheck lifecycle](https://docs.railway.com/deployments/healthchecks).
 
 ## Generated image retention
 
 Set `GENERATED_IMAGE_RETENTION_DAYS` on the cleanup service to choose how long generated images are retained. The default is **180 days**. Use a whole number from 1 to 36500, or `0` to disable cleanup. Invalid or blank values fail without deleting anything. Changing the number applies to existing generated outputs on the next run: lowering it can make older images immediately eligible.
 
 Cleanup selects successful generation records older than the cutoff and deletes their exact, recognized S3 output objects. It does not expire uploaded product/reference/mask images, delete folders, or erase prompts, settings, billing, or Gateway logs. Age uses the generation's original `createdAt`, so refreshing billing does not extend retention. History shows **Image expired** after deletion. You can still regenerate from available original uploads; refinement or exact replay that needs an expired generated image reports why it is unavailable.
+
+The same daily job also expires completed background-removal cutouts under this setting. It checks the successful local job and its matching processed asset, organization, owner and immutable object URL. Both job completion and asset creation must be older than the cutoff. Original uploaded sources, the Cutouts folder and processing history remain. Deletions are exact and idempotent; a missing background-removal table safely skips this part during a release transition. A hard process kill between writing an output object and publishing its registry row can leave an unregistered object for later operational cleanup; the daily policy acts only on recorded outputs.
 
 Only the application's immutable UUID output names are managed automatically. Imported legacy names that cannot be verified as managed outputs are preserved. An output shared by an unexpired generation record is also preserved. Untracked orphan objects are outside this cleanup's scope.
 
@@ -134,6 +216,46 @@ On Railway, use a **separate cron service** named `image-retention` alongside th
 
 Reference the same PostgreSQL and private S3 variables as the app, including its storage prefix. The worker needs no Gateway key or login credentials. Apply reviewed database migrations through the app's explicit pre-deploy step before deploying the worker. It closes PostgreSQL and S3 connections when done, so it consumes no continuously running app process. Railway schedules are in UTC and may start a few minutes after the scheduled time. See [Railway cron documentation](https://docs.railway.com/cron-jobs).
 
+## Pipelines
+
+Open **Pipelines**, start with a template or a blank workflow, and add steps from the node palette. Connect matching image or text ports by clicking the output and then the input; the properties panel also provides a connection selector. Choosing the same source and target ports again removes that connection. Move nodes by dragging their header or using arrow keys. **Delete** disconnects all incoming and outgoing connections on the selected node while keeping its settings and position; on a selected connection, it removes that connection only. The trash button deletes the node. Pan, zoom, fit, the overview, undo/redo, and copy/duplicate/delete work on the saved graph. Edits save with a revision check; conflicting edits require reloading the saved version. JSON export/import contains the private graph and image paths, without credentials or image bytes.
+
+Supported steps include Image Input, People Input, Text Input, Static Image, Static Text, Generate Image, Remove Background, Crop, Resize, Upscale, Expand, Translate, Describe Image, Prompt Enhancer, LLM, Prompt Concatenator, Pipeline Output and Sticky Note. Generation, AI upscaling, expansion and image translation use the existing exact image-model profiles and their own settings. Standard 2×/4× upscaling uses Lanczos resampling. Describe Image and LLM retain the explicit `google/gemini-2.5-flash` Gateway text model; its multimodal input and text output are documented by [Google](https://ai.google.dev/gemini-api/docs/models/gemini-2.5-flash) and [Vercel](https://vercel.com/ai-gateway/models/gemini-2.5-flash/about). No direct provider SDKs are used.
+
+**Prompt Enhancer** offers GLM 5.3 Flash, GPT-6 Luna, and the existing Gemini 2.5 Flash profile. Its **Reasoning effort (attention level)** control shows only that model's verified levels; changing models resets incompatible settings while preserving instructions. Luna exposes temperature only with None. Thinking and the final text share the output-token cap, and text is held until Gateway confirms its exact charge. Saved runs retain their exact model, effort and settings. See [the utility-model integration notes](docs/pipeline-text-models.md) for supported options and official sources.
+
+Image model panels in Edit, Same-origin batch, People and Pipelines now include **How to use this model** guidance. OpenAI edit masks use transparent areas to guide changes and opaque areas to guide preservation; FLUX Fill instead uses white to replace and black to preserve. Input masks and transparent output are separate settings. The guidance describes this app's source/mask file requirements and each model's reference limits.
+
+**People Input** opens the People picker, where you can choose up to 16 exact pictures from your own or shared profiles. Connect its image output to **Generate Image → References** to reuse those pictures for every product in a batch. Each model's smaller reference limit still applies. The chosen pictures stay fixed for the run; adding a new photo to a profile does not change an existing run. If a photo is unlinked, deleted, or no longer shared with you, later steps cannot reuse it and it disappears from public pipeline/run previews. The On-model collection template includes this input.
+
+Use **Run pipeline** to choose the batch image-input node and up to 50 product pictures. Other image inputs, People references and text inputs are shared values for that run. Each batch picture has its own progress and results. Only the ancestors of Pipeline Output nodes run; **Run step** executes only the chosen node and its ancestors. Graphs are limited to 24 nodes, 80 connections, 50 image values per step, and 500 planned paid calls per run. Invalid graphs and excessive fanout are rejected before paid work. Cycles, video/audio, public media URLs and executable code are out of scope.
+
+Runs continue after the browser closes. The saved graph and input snapshot stay fixed even if the pipeline is edited later. Completed intermediates feed later steps only after exact Gateway costs are confirmed. Finite credit is checked for every new paid wave; local processing has a known $0 provider charge. Results show actual returned dimensions, because AI models do not guarantee exact canvas margins or upscale dimensions. Cancellation prevents later work and preserves accepted calls and charges. An interrupted paid call is not automatically repeated: the explicit retry dialog warns that a new call can incur another charge and may repeat earlier successful variants of that node. Images and earlier charged attempts remain recorded.
+
+Each completed input job has **Rerun job** in its existing results pane. It requeues every step for that input using the run's saved graph, original inputs, models, settings and run target, even if the current editor has changed. Other jobs keep their claims and results and can continue processing. New outputs replace the latest displayed attempt; earlier image assets and charges stay recorded. Repeating paid steps incurs new charges and requires fresh credit and source permission checks. The existing five-attempt limit applies to each step across retries and reruns; start a new run for further variations. Unfinished or unpriced jobs cannot be rerun, and failed/interrupted steps retain the separate Retry flow.
+
+Step lists, input selectors, result columns, expanded details and retry choices follow the saved canvas from left to right, then top to bottom for equal horizontal positions. Equal-position nodes retain their original order. This display order never changes dependency-based execution or mutates the workflow snapshot.
+
+**Download all** streams confirmed final images in a ZIP, preserving each original file's bytes. It rechecks access for every picture and limits an archive to 200 files and 256 MiB; larger runs retain individual downloads. Local pipeline outputs and prepared expansion canvases/masks expire through the existing daily processed-image policy. Uploaded sources, workflow definitions, prompts and charges are preserved.
+
+The dedicated `pipeline-worker` service follows `master` pushes, with these Railway service settings:
+
+| Setting | Value |
+| --- | --- |
+| Build | `npm run build:pipeline-worker` |
+| Start | `node .output/pipeline-worker.mjs` |
+| Health check | `/health` |
+| Worker concurrency | `PIPELINE_WORKER_CONCURRENCY=2` (bounded 1–3) |
+| Database pool | `DATABASE_POOL_MAX=6` |
+| Resources | 2 vCPU, 16 GB memory limit |
+| Scheduling | Authenticated private HTTP wake; notifications and fallback checks while work is active |
+| Network | No public domain or TCP proxy |
+| Restart / drain | On failure, up to 10 retries / 60 seconds |
+
+Reference the app's private PostgreSQL, S3 and `NUXT_AI_GATEWAY_API_KEY` variables. Login/bootstrap/session credentials are unnecessary. The worker needs memory above the pinned BiRefNet guards (8 GiB free for Lite, 10 GiB for Full) if it handles background-removal steps. It verifies final native libraries at startup, waits for the app's additive migration, and never applies migrations itself. Both app and worker can sleep when idle with Railway serverless enabled; the wake and connection behavior is documented above. Durable ownership leases, heartbeats, conditional step transitions and provider-start fences prevent a replacement worker from blindly repeating accepted paid work.
+
+Build and deploy commands are configured on the service; Git pushes rebuild it automatically. Railway no longer lets new services opt into `railway.toml`/`railway.json` Config as Code, so no inactive legacy config file is included. See [Railway's configuration policy](https://docs.railway.com/config-as-code).
+
 ## Migrations and existing local data
 
 Drizzle ORM and Kit stay pinned to `1.0.0-rc.4`. The PostgreSQL schema lives in `server/db/schema.ts`; its generated SQL and snapshots live in `drizzle/postgres/`. The earlier SQLite migration folders under `drizzle/` are retained intact as historical archives, and are not applied to PostgreSQL.
@@ -157,6 +279,14 @@ node --import ./tests/register-typescript.mjs scripts/import-local-images.ts --s
 node --import ./tests/register-typescript.mjs scripts/import-sqlite-to-postgres.ts --sqlite=./sqlite/drizzle.db --dry-run
 ```
 
-To apply to an empty development target, first configure the development bucket credentials, set `APP_ENV=development`, and run the image importer with `--confirm-development` instead of `--dry-run`. Then set `IMPORT_DATABASE_URL` explicitly and run the database importer with `--apply --environment=development`. The image importer preserves paths, validates content, resumes identical existing objects, and refuses conflicting overwrites. The database importer preserves IDs, JSON, timestamps, billing, and log relationships transactionally, and refuses a populated generation/history target.
+To apply to an empty development target, first configure the development bucket credentials, set `APP_ENV=development`, and run the image importer with `--confirm-development` instead of `--dry-run`. Then set `IMPORT_DATABASE_URL` explicitly and run the database importer with `--apply --environment=development`. The image importer preserves paths, validates content, resumes identical existing objects, and refuses conflicting overwrites. The database importer preserves IDs, JSON, timestamps, billing, and log relationships transactionally, and refuses a populated generation/history target. Complete imports before the first owner sign-in so bootstrap can assign the unclaimed history.
+
+After the original owner is initialized, review a bounded plan for registering imported legacy image objects in that owner's library:
+
+```sh
+node --import ./tests/register-typescript.mjs scripts/adopt-legacy-assets.ts --organization-id <uuid> --owner-id <uuid> --max-entries 1000
+```
+
+To apply the reviewed plan, add `--apply --confirm-owner-id <same-owner-uuid>`. The command is restricted to the original bootstrap owner, validates every newly registered image, preserves existing URLs and ownership, and writes metadata only. It never modifies S3 bytes. Objects in the new organizations namespace and deleted registry entries cannot be adopted as legacy files. The default limit is 1000 entries, with an upper bound of 10000; folders are bounded to 32 levels. Legacy objects remain inaccessible through application routes until explicitly registered. Adoption against production requires separate exact confirmation.
 
 The local `private-agents.md` stores the selected Railway project/development IDs and is ignored. Real `.env` files, databases, and `.codex/artifacts/` reports are also ignored; `.env.example` contains no credentials.

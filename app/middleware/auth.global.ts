@@ -1,3 +1,5 @@
+import {fetchStatusCode} from '../utils/serverlessRequests'
+
 export default defineNuxtRouteMiddleware(async (to) => {
   // Do not guard the login page itself
   if (to.path === '/login') return
@@ -5,21 +7,23 @@ export default defineNuxtRouteMiddleware(async (to) => {
   // The session cookie is HttpOnly, so the browser must never inspect it.
   // SSR's request fetch forwards the incoming cookie; browser fetches include
   // same-origin cookies automatically.
-  const authenticated = useState<boolean | undefined>('auth-session', () => undefined)
-  if (authenticated.value === true) return
+  const session = useAccount()
+  if (session.account.value) return
+  const epoch = session.epoch.value
+  const redirect = to.fullPath && to.fullPath !== '/' ? `?redirect=${encodeURIComponent(to.fullPath)}` : ''
 
   try {
-    const requestFetch = useRequestFetch()
-    const ok = await requestFetch<boolean>('/api/testCredentials')
-    if (ok === true) {
-      authenticated.value = true
-      return
+    if (await session.load()) return
+  } catch (error) {
+    if (epoch !== session.epoch.value) return abortNavigation()
+    if (fetchStatusCode(error) === 401) {
+      session.clear()
+      return navigateTo(`/login${redirect}`)
     }
-  } catch {
-    authenticated.value = false
+    throw createError({statusCode: 503, statusMessage: 'The workspace is starting. Please try again shortly.', data: {workspaceWarmup: true, retryPath: to.fullPath}})
   }
+  if (epoch !== session.epoch.value) return abortNavigation()
 
   // Any authenticated path returned above.
-  const redirect = to.fullPath && to.fullPath !== '/' ? `?redirect=${encodeURIComponent(to.fullPath)}` : ''
   return navigateTo(`/login${redirect}`)
 })

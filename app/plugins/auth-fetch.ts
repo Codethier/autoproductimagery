@@ -1,18 +1,20 @@
+import {prepareServerlessRequest, SERVERLESS_MUTATION_TIMEOUT_MS} from '../utils/serverlessRequests'
+
 export default defineNuxtPlugin(() => {
   if (!import.meta.client) return
 
   const router = useRouter()
-  const authenticated = useState<boolean | undefined>('auth-session', () => undefined)
+  const session = useAccount()
   const baseFetch = $fetch
   let loggingOut = false
 
-  async function logout(reason: 'unauthorized' | 'forbidden') {
+  async function logout() {
     if (loggingOut) return
     loggingOut = true
-    authenticated.value = false
+    session.clear()
 
     // Only the server can clear the HttpOnly session cookie.
-    await baseFetch('/api/logout', { method: 'POST' }).catch(() => undefined)
+    await baseFetch('/api/logout', {method: 'POST', retry: 0, timeout: SERVERLESS_MUTATION_TIMEOUT_MS}).catch(() => undefined)
 
     const current = router.currentRoute.value
     if (current.path === '/login') {
@@ -24,7 +26,7 @@ export default defineNuxtPlugin(() => {
       const toast = useToast()
       toast.add({
         title: 'Signed out',
-        description: reason === 'forbidden' ? 'Access denied.' : 'Your session is no longer valid. Please sign in again.',
+        description: 'Your session is no longer valid. Please sign in again.',
         color: 'warning'
       })
     } catch {}
@@ -35,10 +37,13 @@ export default defineNuxtPlugin(() => {
   }
 
   globalThis.$fetch = baseFetch.create({
-    onResponseError({ response }) {
+    onRequest({options}) {
+      prepareServerlessRequest(options, session.epoch.value)
+    },
+    onResponseError({ response, options }) {
+      if ((options as typeof options & {workspaceAccountEpoch?: number}).workspaceAccountEpoch !== session.epoch.value) return
       const status = response?.status
-      if (status === 401) return logout('unauthorized')
-      if (status === 403) return logout('forbidden')
+      if (status === 401 && router.currentRoute.value.path !== '/login') return logout()
     }
   })
 })

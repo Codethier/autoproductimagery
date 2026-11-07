@@ -3,7 +3,7 @@ import { installBoundedRawBody } from "../utils/boundedRequestBody"
 import {CreateImageFolderSchema} from '~~/schemas/image-storage'
 
 export default defineEventHandler(async (event) => {
-    useAuth(event)
+    const actor = await useAuth(event)
     assertMethod(event, "POST")
 
     await installBoundedRawBody(event, 16 * 1024)
@@ -13,7 +13,7 @@ export default defineEventHandler(async (event) => {
     }
     const body = parsed.data
 
-    const fs = await useFS()
-    await fs.createFolder(body.path ?? "/", body.name)
-    return { ok: true }
+    const fs = await useUserFS(actor)
+    const folder = await fs.createFolder(body.path ?? "/", body.name)
+    return { ok: true, folder }
 })

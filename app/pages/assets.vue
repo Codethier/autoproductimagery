@@ -6,7 +6,7 @@ const initialPath = computed(() => typeof route.query.folder === 'string' && rou
 function onNavigate(path: string) {
   void router.replace({path: '/assets', query: path === '/' ? {} : {folder: path}})
 }
-useHead({title: 'Assets · Product Imagery'})
+useHead({title: 'Library · Product Imagery'})
 </script>
 
 <template>

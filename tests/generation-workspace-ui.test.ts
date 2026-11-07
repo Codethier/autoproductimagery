@@ -8,6 +8,7 @@ import { renderToString } from '@vue/server-renderer'
 import { createRenderer, createSSRApp, h, nextTick, reactive, ref } from 'vue'
 import { IMAGE_MODEL_PROFILES, createDefaultSettings } from '../schemas/image-generation.ts'
 import type { PendingGeneration } from '../app/utils/generationComposer.ts'
+import {createGenerationCreditController, initialGenerationCreditState} from '../app/utils/generationCredit.ts'
 
 const root = new URL('../', import.meta.url)
 const formUrl = new URL('app/components/GeminiForm.vue', root).href
@@ -25,18 +26,21 @@ registerHooks({
     if (url === formUrl || (url.startsWith(settingsDirectory) && url.endsWith('.vue'))) {
       const filename = fileURLToPath(url)
       let source = readFileSync(filename, 'utf8')
-      if (url === formUrl) source = source.replace('</script>', 'defineExpose({ submit, sourceImages, data, pickerKind, confirmPicker, previewOutput, canSubmit, prompt, pendingGenerations, activeGenerationCount })\n</script>')
+      if (url === formUrl) source = source.replace('</script>', 'defineExpose({ submit, uploadFiles, loadMoreHistory, sourceImages, data, pickerKind, confirmPicker, previewOutput, previewResult, recentImages, canSubmit, prompt, pendingGenerations, activeGenerationCount, errorMsg, uploading, displayedHistory, historyOpen, confirmedHistory, backgroundRemovalSources, openBackgroundRemoval, useCutout, openPeoplePicker, peoplePickerOpen, peoplePickerSelection, confirmPeople, sharedReferenceAllowance })\n</script>')
       const { descriptor } = parse(source, { filename })
       const compiled = compileScript(descriptor, { id: filename, inlineTemplate: true })
       const nuxtServices = url === formUrl ? `
         const useDataStore = () => globalThis.${environmentKey}.store;
-        const useFetch = (url) => globalThis.${environmentKey}.useFetch(url);
+        const useAccount = () => globalThis.${environmentKey}.account;
+        const useAccountBalance = () => globalThis.${environmentKey}.accountBalance;
+        const useGenerationCredit = () => globalThis.${environmentKey}.credit ??= globalThis.${environmentKey}.createCredit();
+        const useFetch = (...args) => globalThis.${environmentKey}.useFetch(...args);
         const useRoute = () => globalThis.${environmentKey}.route;
         const $fetch = (...args) => globalThis.${environmentKey}.fetch(...args);
         const refreshNuxtData = async () => {};
       ` : ''
       return { format: 'module', shortCircuit: true,
-        source: stripTypeScriptTypes(`import { computed, ref, watch, toRef, toRaw, onBeforeUnmount } from 'vue';\n${nuxtServices}\n${compiled.content}`) }
+        source: stripTypeScriptTypes(`import { computed, ref, watch, toRef, toRaw, onMounted, onBeforeUnmount } from 'vue';\n${nuxtServices}\n${compiled.content}`) }
     }
     return nextLoad(url, context)
   },
@@ -62,17 +66,21 @@ async function renderWorkspace(mode: 'edit' | 'batch', overrides: Partial<Store>
   })
   const environment: any = {
     store, route: reactive({ query: {} }), exposed: null,
-    useFetch(url: string) {
+    account: {epoch: ref(1), identity: ref('org.alice')}, refreshes: [], fetchKeys: [], history: ref({ok: true, count: 0, items: []}),
+    accountBalance: {balance: ref({unlimited: true, actualBalanceUsd: null, outstandingCount: 0}), refresh: async function () {return this.balance.value}},
+    useFetch(url: string, options: {key?: unknown}) {
+      this.fetchKeys.push({url, key: options.key})
       const data = url === '/api/image-models'
         ? { ok: true, items: Object.values(IMAGE_MODEL_PROFILES).map(profile => ({ id: profile.id, profile, available: true, catalogStatus: 'available' })) }
         : { ok: true, count: 0, items: [] }
-      return { data: ref(data), status: ref('success'), error: ref(null), refresh: async () => undefined }
+      return { data: url === '/api/systemprompts' ? this.history : ref(data), status: ref('success'), error: ref(null), refresh: async () => { this.refreshes.push(url) } }
     },
     async fetch(url: string, options: { body?: unknown }) {
       requests.push({ url, options })
-      return { ok: true, obj: [{ outputImage: '/images/output/result.png', errors: null }] }
+      return { ok: true, obj: [{id: 1, status: 'succeeded', outputImage: '/images/output/result.png', errors: null, priceUsd: '0.04500000', priceSource: 'gateway', billingState: 'confirmed'}] }
     },
   }
+  environment.createCredit = () => createGenerationCreditController(environment.account, environment.accountBalance, ref(initialGenerationCreditState()))
   ;(globalThis as any)[environmentKey] = environment
   const { default: Form } = await import(formUrl)
   const originalSetup = Form.setup
@@ -97,7 +105,13 @@ function registerUiPrimitives(app: ReturnType<typeof createSSRApp>) {
   app.component('UIcon', { render: () => h('span', { 'aria-hidden': 'true' }) })
   app.component('UModal', { render: () => null })
   app.component('AssetBrowser', { render: () => null })
-  app.component('system-promp', { render: () => h('article') })
+  app.component('PeopleBrowser', { render: () => null })
+  app.component('BackgroundRemovalPanel', { render: () => null })
+  app.component('ModelGuidance', { props: ['modelId', 'settings', 'context'], setup: (props: any) => () => h('aside', {'data-model-guidance': props.modelId, 'data-guidance-kind': props.settings?.kind}) })
+  // The parent must not mount result components until their exact prices exist.
+  // A marked stub makes that boundary observable independently of the child's
+  // defensive visibility gate tested in generated-image-retention-ui.test.ts.
+  app.component('system-promp', { props: ['data'], setup: (props: any) => () => h('article', {'data-history-result': props.data.id}, props.data.TextPrompt) })
 }
 
 type MemoryNode = { tag: string; text: string; children: MemoryNode[]; parent: MemoryNode | null; props: Record<string, unknown>; [key: string]: any }
@@ -120,6 +134,12 @@ const memoryRenderer = createRenderer<MemoryNode, MemoryNode>({
   parentNode: node => node.parent, nextSibling: node => node.parent?.children[node.parent.children.indexOf(node) + 1] ?? null,
   patchProp(node, key, _old, value) { node.props[key] = value; node[key] = value },
 })
+function descendants(node: MemoryNode): MemoryNode[] { return [node, ...node.children.flatMap(descendants)] }
+function historyResultIds(node: MemoryNode): number[] {
+  return descendants(node).filter(item => item.tag === 'article' && item.props['data-history-result'] !== undefined)
+    .map(item => item.props['data-history-result'] as number)
+}
+function renderedText(node: MemoryNode): string { return descendants(node).map(item => item.text).join(' ') }
 
 async function mountWorkspace(mode: 'edit' | 'batch', environment: any) {
   ;(globalThis as any)[environmentKey] = environment
@@ -144,7 +164,7 @@ async function mountWorkspace(mode: 'edit' | 'batch', environment: any) {
 
 test('Edit renders a photo-only upload landing while existing batch sources stay selected', async () => {
   const workspace = await renderWorkspace('edit', { inputImages: ['/images/batch-a.png', '/images/batch-b.png'] })
-  assert.match(workspace.html, /Drop a photo to edit/)
+  assert.match(workspace.html, /Start with a product photo/)
   assert.match(workspace.html, /Upload image/)
   assert.doesNotMatch(workspace.html, /studio-composer"/)
   assert.deepEqual(workspace.store.inputImages, ['/images/batch-a.png', '/images/batch-b.png'])
@@ -155,6 +175,8 @@ test('Edit renders the canvas and submits only the independent Edit source throu
   assert.match(workspace.html, /Image being edited/)
   assert.match(workspace.html, /Model settings/)
   assert.match(workspace.html, /Zoom in/)
+  assert.match(workspace.html, /src="\/api\/data\/images\/edit\.png\?preview=1600"/)
+  assert.match(workspace.html, /src="\/api\/data\/images\/reference\.png\?preview=160"/)
   assert.equal(workspace.exposed.canSubmit.value, true)
   await workspace.exposed.submit()
   assert.equal(workspace.requests.length, 1)
@@ -173,6 +195,9 @@ test('Same-origin batch renders per-input cards and submits one bounded request 
   assert.match(workspace.html, /Same-origin batch/)
   assert.match(workspace.html, /2 inputs/)
   assert.match(workspace.html, /Input 2: batch-b.png/)
+  assert.match(workspace.html, /src="\/api\/data\/images\/batch-a\.png\?preview=480"/)
+  assert.match(workspace.html, /src="\/api\/data\/images\/batch-b\.png\?preview=480"/)
+  assert.match(workspace.html, /src="\/api\/data\/images\/reference-a\.png\?preview=160"/)
   await workspace.exposed.submit()
   assert.equal(workspace.requests.length, 1)
   const body = workspace.requests[0]!.options.body as any
@@ -194,6 +219,286 @@ test('the Asset picker replaces only the active workspace selection', async () =
   assert.equal(workspace.store.editSource, '/images/new.png')
 })
 
+test('the editor and batch expose local background removal without changing Gateway model settings or originals', async () => {
+  const editor = await renderWorkspace('edit', {editSource: '/images/original.png'})
+  assert.match(editor.html, /Remove background/)
+  const settings = JSON.stringify(editor.store.generationSettings)
+  editor.exposed.openBackgroundRemoval(['/images/original.png'])
+  assert.deepEqual(editor.exposed.backgroundRemovalSources.value, ['/images/original.png'])
+  assert.equal(editor.store.editSource, '/images/original.png')
+  assert.equal(JSON.stringify(editor.store.generationSettings), settings)
+  await editor.exposed.useCutout('/images/cutout.png')
+  assert.equal(editor.store.editSource, '/images/cutout.png')
+  assert.deepEqual(editor.exposed.backgroundRemovalSources.value, [])
+  assert.equal(editor.requests.length, 0)
+  const batch = await renderWorkspace('batch', {inputImages: ['/images/first.png', '/images/second.png']})
+  assert.match(batch.html, /Remove backgrounds/)
+  batch.exposed.openBackgroundRemoval(batch.exposed.sourceImages.value)
+  assert.deepEqual(batch.exposed.backgroundRemovalSources.value, ['/images/first.png', '/images/second.png'])
+})
+
+for (const mode of ['edit', 'batch'] as const) {
+  test(`${mode} chooses people portraits as shared references and preserves the source, prompt, settings, and existing references`, async () => {
+    const workspace = await renderWorkspace(mode, {editSource: '/images/product-edit.png', inputImages: ['/images/product-a.png', '/images/product-b.png'], models: ['/images/light-reference.png']})
+    assert.match(workspace.html, /class="studio-people-picker"/)
+    const settings = JSON.stringify(workspace.store.generationSettings)
+    const prompt = workspace.store.composerPrompt
+    workspace.exposed.openPeoplePicker()
+    assert.equal(workspace.exposed.peoplePickerOpen.value, true)
+    assert.deepEqual(workspace.exposed.peoplePickerSelection.value, ['/images/light-reference.png'])
+    assert.notEqual(workspace.exposed.peoplePickerSelection.value, workspace.store.models, 'cancelling a picker must not mutate the composer selection')
+    workspace.exposed.confirmPeople.value(['/images/light-reference.png', '/images/people/nora-front.png', '/images/people/nora-side.png', '/images/people/nora-front.png'])
+    assert.deepEqual(workspace.store.models, ['/images/light-reference.png', '/images/people/nora-front.png', '/images/people/nora-side.png'])
+    assert.equal(workspace.exposed.peoplePickerOpen.value, false)
+    assert.equal(workspace.store.editSource, '/images/product-edit.png')
+    assert.deepEqual(workspace.store.inputImages, ['/images/product-a.png', '/images/product-b.png'])
+    assert.equal(workspace.store.composerPrompt, prompt)
+    assert.equal(JSON.stringify(workspace.store.generationSettings), settings)
+    await workspace.exposed.submit()
+    const body = workspace.requests[0]!.options.body as any
+    assert.deepEqual(body.modelImages, workspace.store.models, 'people photos use the existing validated Gateway reference-image path')
+    assert.deepEqual(body.inputImages, mode === 'edit' ? ['/images/product-edit.png'] : ['/images/product-a.png', '/images/product-b.png'])
+  })
+}
+
+test('people references obey the current model limit including the per-job product source, reject public URLs, and disable models with no allowance', async () => {
+  const limited = Object.values(IMAGE_MODEL_PROFILES).find(profile => profile.maxReferenceImages > 1 && profile.maxReferenceImages < 14)!
+  const workspace = await renderWorkspace('edit', {editSource: '/images/product.png', selectedModel: limited.id, generationSettings: createDefaultSettings(limited.id), models: ['/images/existing.png']})
+  assert.equal(workspace.exposed.sharedReferenceAllowance.value, limited.maxReferenceImages - 1)
+  workspace.exposed.openPeoplePicker()
+  workspace.exposed.confirmPeople.value(Array.from({length: limited.maxReferenceImages}, (_, index) => `/images/people/portrait-${index}.png`))
+  assert.deepEqual(workspace.store.models, ['/images/existing.png'])
+  assert.equal(workspace.exposed.peoplePickerOpen.value, true)
+  assert.match(workspace.exposed.errorMsg.value, /shared reference images/)
+  workspace.exposed.confirmPeople.value(['https://example.com/portrait.png'])
+  assert.deepEqual(workspace.store.models, ['/images/existing.png'])
+  assert.match(workspace.exposed.errorMsg.value, /valid images from People/)
+  workspace.exposed.confirmPeople.value(['/images/people/portrait.png'])
+  assert.deepEqual(workspace.store.models, ['/images/people/portrait.png'])
+
+  const noReferences = Object.values(IMAGE_MODEL_PROFILES).find(profile => profile.maxReferenceImages === 1)!
+  const single = await renderWorkspace('batch', {inputImages: ['/images/product.png'], selectedModel: noReferences.id, generationSettings: createDefaultSettings(noReferences.id)})
+  assert.match(single.html, /class="studio-people-picker" disabled/)
+  single.exposed.openPeoplePicker()
+  assert.equal(single.exposed.peoplePickerOpen.value, false)
+})
+
+test('an old people picker cannot assign portraits after an account switch, including when the new account opens its own picker', async () => {
+  const workspace = await renderWorkspace('edit', {editSource: '/images/alice-product.png', models: ['/images/alice-reference.png']})
+  const previousWindow = (globalThis as any).window
+  const mounted = await mountWorkspace('edit', workspace.environment)
+  try {
+    mounted.exposed.openPeoplePicker()
+    const aliceConfirmation = mounted.exposed.confirmPeople.value
+    workspace.environment.account.epoch.value += 1
+    workspace.environment.account.identity.value = 'org.bob'
+    workspace.store.models = ['/images/bob-reference.png']
+    await nextTick()
+    assert.equal(mounted.exposed.peoplePickerOpen.value, false)
+    assert.deepEqual(mounted.exposed.peoplePickerSelection.value, [])
+    aliceConfirmation(['/images/alice-portrait.png'])
+    assert.deepEqual(workspace.store.models, ['/images/bob-reference.png'])
+    mounted.exposed.openPeoplePicker()
+    aliceConfirmation(['/images/alice-portrait.png'])
+    assert.deepEqual(workspace.store.models, ['/images/bob-reference.png'])
+    assert.equal(mounted.exposed.peoplePickerOpen.value, true)
+    mounted.exposed.confirmPeople.value(['/images/bob-reference.png', '/images/bob-portrait.png'])
+    assert.deepEqual(workspace.store.models, ['/images/bob-reference.png', '/images/bob-portrait.png'])
+  } finally {
+    mounted.app.unmount()
+    ;(globalThis as any).window = previousWindow
+  }
+})
+
+test('cancelling people selection preserves existing references and invalidates the old modal confirmation', async () => {
+  const workspace = await renderWorkspace('edit', {editSource: '/images/product.png', models: ['/images/existing.png']})
+  const previousWindow = (globalThis as any).window
+  const mounted = await mountWorkspace('edit', workspace.environment)
+  try {
+    mounted.exposed.openPeoplePicker()
+    const cancelledConfirmation = mounted.exposed.confirmPeople.value
+    mounted.exposed.peoplePickerSelection.value.push('/images/cancelled-portrait.png')
+    assert.deepEqual(workspace.store.models, ['/images/existing.png'])
+    mounted.exposed.peoplePickerOpen.value = false
+    await nextTick()
+    assert.deepEqual(mounted.exposed.peoplePickerSelection.value, [])
+    mounted.exposed.openPeoplePicker()
+    cancelledConfirmation(['/images/cancelled-portrait.png'])
+    assert.deepEqual(workspace.store.models, ['/images/existing.png'])
+    assert.deepEqual(mounted.exposed.peoplePickerSelection.value, ['/images/existing.png'])
+    assert.equal(mounted.exposed.peoplePickerOpen.value, true)
+  } finally {
+    mounted.app.unmount()
+    ;(globalThis as any).window = previousWindow
+  }
+})
+
+test('the editor withholds generated previews until confirmed billing arrives in account history', async () => {
+  const workspace = await renderWorkspace('edit', {editSource: '/images/edit.png'})
+  const pending = {id: 7, status: 'succeeded', TextPrompt: 'Waiting for a final cost', outputImage: '/images/output/unconfirmed.png',
+    priceUsd: '0.03000000', priceSource: 'estimate', billingState: 'pending'}
+  workspace.environment.fetch = async () => ({ok: true, obj: [pending]})
+  const previousWindow = (globalThis as any).window
+  const mounted = await mountWorkspace('edit', workspace.environment)
+  try {
+    await mounted.exposed.submit()
+    await nextTick()
+    assert.equal(mounted.exposed.previewOutput.value, null)
+    const imageSources = (node: MemoryNode): unknown[] => [node.props.src, ...node.children.flatMap(imageSources)].filter(Boolean)
+    assert.equal(imageSources(mounted.rootNode).some(src => String(src).startsWith(`/api/data${pending.outputImage}`)), false)
+    assert.equal(imageSources(mounted.rootNode).includes('/api/data/images/edit.png?preview=1600'), true, 'the original input remains visible through a bounded preview while generated output awaits its final price')
+    assert.doesNotMatch(renderedText(mounted.rootNode), /confirming price|Pending confirmation|Result ·|Check prices?/)
+    workspace.environment.history.value = {count: 1, items: [pending]}
+    await nextTick()
+    assert.equal(mounted.exposed.recentImages.value.length, 0)
+    assert.equal(mounted.exposed.previewOutput.value, null)
+    workspace.environment.history.value = {count: 1, items: [{...pending, priceUsd: '0.00000000', priceSource: 'gateway', billingState: 'confirmed'}]}
+    await nextTick()
+    assert.equal(mounted.exposed.previewOutput.value, pending.outputImage)
+    assert.equal(mounted.exposed.recentImages.value.length, 1)
+    assert.equal(imageSources(mounted.rootNode).includes(`/api/data${pending.outputImage}?preview=1600`), true, 'the active editor uses a larger bounded preview')
+    workspace.store.editSource = null
+    await nextTick()
+    assert.equal(imageSources(mounted.rootNode).includes(`/api/data${pending.outputImage}?preview=160`), true, 'recent images on the empty editor landing use small thumbnails')
+    workspace.environment.account.identity.value = 'org.bob'
+    workspace.environment.account.epoch.value += 1
+    workspace.store.editSource = '/images/bob.png'
+    workspace.environment.history.value = {count: 0, items: []}
+    await nextTick()
+    assert.equal(mounted.exposed.previewOutput.value, null)
+    assert.equal(mounted.exposed.previewResult.value, null)
+  } finally {
+    mounted.app.unmount()
+    ;(globalThis as any).window = previousWindow
+  }
+})
+
+test('history mounts only exact-priced result cards and automatically reveals later confirmations without a price-check control', async () => {
+  const workspace = await renderWorkspace('edit', {editSource: '/images/edit.png'})
+  const rows = [
+    {id: 11, status: 'succeeded', TextPrompt: 'Estimated result', outputImage: '/images/output/estimated.png',
+      priceUsd: '0.01000000', priceSource: 'estimate', billingState: 'awaiting'},
+    {id: 12, status: 'succeeded', TextPrompt: 'Gateway price still pending', outputImage: '/images/output/pending.png',
+      priceUsd: '0.01000000', priceSource: 'gateway', billingState: 'awaiting'},
+    {id: 13, status: 'succeeded', TextPrompt: 'Confirmed free result', outputImage: '/images/output/free.png',
+      priceUsd: '0.000000000000', priceSource: 'gateway', billingState: 'confirmed'},
+    {id: 14, status: 'succeeded', TextPrompt: 'Small confirmed charge', outputImage: '/images/output/tiny.png',
+      priceUsd: '0.000000000001', priceSource: 'gateway', billingState: 'confirmed'},
+    {id: 15, status: 'succeeded', TextPrompt: 'Invalid confirmed price', outputImage: '/images/output/invalid.png',
+      priceUsd: '-0.01000000', priceSource: 'gateway', billingState: 'confirmed'},
+    {id: 16, status: 'succeeded', TextPrompt: 'Incomplete BYOK price', outputImage: '/images/output/byok.png',
+      priceUsd: '0.01000000', priceSource: 'gateway', billingState: 'confirmed', usageJson: {gatewayBilling: {isByok: true}}},
+  ]
+  workspace.environment.history.value = {ok: true, count: rows.length, items: rows}
+  const previousWindow = (globalThis as any).window
+  const mounted = await mountWorkspace('edit', workspace.environment)
+  try {
+    mounted.exposed.historyOpen.value = true
+    await nextTick()
+    assert.deepEqual(historyResultIds(mounted.rootNode), [13, 14])
+    assert.deepEqual(mounted.exposed.recentImages.value.map((row: any) => row.id), [13, 14])
+    assert.equal(mounted.exposed.displayedHistory.value.length, rows.length, 'unpriced metadata must remain available for automatic reconciliation and raw pagination')
+    assert.doesNotMatch(renderedText(mounted.rootNode), /Check prices?|Estimated result|Gateway price still pending|Invalid confirmed price|Incomplete BYOK price/)
+    workspace.environment.history.value = {ok: true, count: rows.length, items: rows.map(row => row.id === 11
+      ? {...row, priceUsd: '0.034000000001', priceSource: 'gateway', billingState: 'confirmed'} : row)}
+    await nextTick()
+    assert.deepEqual(historyResultIds(mounted.rootNode), [11, 13, 14])
+    assert.deepEqual(mounted.exposed.recentImages.value.map((row: any) => row.id), [11, 13, 14])
+    assert.doesNotMatch(renderedText(mounted.rootNode), /Check prices?|confirming price/)
+    assert.deepEqual(workspace.requests, [], 'history prop updates must not trigger a manual billing or generation request')
+  } finally {
+    mounted.app.unmount()
+    ;(globalThis as any).window = previousWindow
+  }
+})
+
+test('price polling is bounded and finite-credit accounts wait for outstanding prices to settle', async () => {
+  const workspace = await renderWorkspace('edit', {editSource: '/images/edit.png'})
+  workspace.environment.history.value = {count: 1, items: [{id: 9, status: 'succeeded', outputImage: null, priceUsd: null, priceSource: null, billingState: 'pending'}]}
+  workspace.environment.accountBalance.balance.value = {unlimited: false, actualBalanceUsd: '2.000000000000', outstandingCount: 1}
+  const timers: Array<() => Promise<void>> = []
+  const originalTimeout = globalThis.setTimeout
+  const originalDocument = (globalThis as any).document
+  const previousWindow = (globalThis as any).window
+  ;(globalThis as any).setTimeout = (fn: () => Promise<void>, delay: number, ...args: any[]) => delay === 10_000 ? (timers.push(fn), timers.length) : originalTimeout(fn, delay, ...args)
+  ;(globalThis as any).document = {visibilityState: 'visible'}
+  let mounted: Awaited<ReturnType<typeof mountWorkspace>> | undefined
+  try {
+    mounted = await mountWorkspace('edit', workspace.environment)
+    assert.equal(mounted.exposed.canSubmit.value, false)
+    for (let attempt = 0; attempt < 30; attempt++) { const next = timers.shift(); assert.ok(next); await next() }
+    assert.equal(timers.length, 0)
+    assert.equal(workspace.environment.refreshes.filter((url: string) => url === '/api/systemprompts').length, 30)
+    workspace.environment.accountBalance.balance.value = {unlimited: false, actualBalanceUsd: '2.000000000000', outstandingCount: 0}
+    await nextTick()
+    assert.equal(mounted.exposed.canSubmit.value, true)
+    workspace.environment.accountBalance.balance.value = {unlimited: false, actualBalanceUsd: '2.000000000000', outstandingCount: 1, generationBlockedByOutstanding: false}
+    await nextTick()
+    assert.equal(mounted.exposed.canSubmit.value, true, 'historical unpriced entries without a retryable charge do not block new finite-credit generations')
+    workspace.environment.accountBalance.balance.value = {unlimited: false, actualBalanceUsd: '-0.005000000001', outstandingCount: 0}
+    await nextTick()
+    assert.equal(mounted.exposed.canSubmit.value, true, 'exhausted credit keeps the valid button clickable so it can explain the refusal')
+    workspace.environment.accountBalance.balance.value = {unlimited: true, actualBalanceUsd: null, outstandingCount: 1}
+    await nextTick()
+    assert.equal(mounted.exposed.canSubmit.value, true)
+  } finally {
+    mounted?.app.unmount()
+    globalThis.setTimeout = originalTimeout
+    ;(globalThis as any).document = originalDocument
+    ;(globalThis as any).window = previousWindow
+  }
+})
+
+test('Edit and batch refuse fresh zero or overdrawn credit with a balance popup before a paid POST', async () => {
+  for (const mode of ['edit', 'batch'] as const) for (const amount of ['0', '0.000000000000', '-0.000000000001']) {
+    const value = await renderWorkspace(mode, {editSource: '/images/edit.png', inputImages: ['/images/batch.png']})
+    let checks = 0
+    value.environment.accountBalance.balance.value = {unlimited: false, actualBalanceUsd: '4', outstandingCount: 0}
+    value.environment.accountBalance.refresh = async (options: {force?: boolean}) => {
+      assert.equal(options.force, true); checks++
+      const fresh = {unlimited: false, actualBalanceUsd: amount, outstandingCount: 0}
+      value.environment.accountBalance.balance.value = fresh
+      return fresh
+    }
+    assert.equal(value.exposed.canSubmit.value, true)
+    await value.exposed.submit()
+    assert.equal(checks, 1); assert.equal(value.requests.length, 0)
+    assert.equal(value.environment.credit.open.value, true)
+    assert.equal(value.exposed.errorMsg.value, null)
+    assert.equal(value.store.composerPrompt, 'Place on a clean studio background')
+    assert.deepEqual(value.store.pendingGenerations, [])
+  }
+})
+
+test('fresh positive or unlimited credit admits generation; an authoritative 402 opens only the credit popup', async () => {
+  for (const fresh of [{unlimited: false, actualBalanceUsd: '0.000000000001', outstandingCount: 0}, {unlimited: true, actualBalanceUsd: null, outstandingCount: 7}]) {
+    const value = await renderWorkspace('edit', {editSource: '/images/edit.png'})
+    value.environment.accountBalance.balance.value = {unlimited: false, actualBalanceUsd: '0', outstandingCount: 0}
+    value.environment.accountBalance.refresh = async () => {value.environment.accountBalance.balance.value = fresh; return fresh}
+    await value.exposed.submit(); assert.equal(value.requests.length, 1); assert.equal(value.environment.credit.open.value, false)
+  }
+  const refused = await renderWorkspace('edit', {editSource: '/images/edit.png'})
+  refused.environment.fetch = async () => {throw {statusCode: 402, data: {data: {code: 'CREDIT_EXHAUSTED'}}}}
+  await refused.exposed.submit()
+  assert.equal(refused.environment.credit.open.value, true)
+  assert.equal(refused.exposed.errorMsg.value, null)
+  assert.deepEqual(refused.store.pendingGenerations, [], 'refused admission must not leave a false failed generation card')
+})
+
+test('failed balance refresh and outstanding-price errors refuse work without showing an exhausted-credit popup', async () => {
+  const unavailable = await renderWorkspace('edit', {editSource: '/images/edit.png'})
+  unavailable.environment.accountBalance.balance.value = {unlimited: false, actualBalanceUsd: '0', outstandingCount: 0}
+  unavailable.environment.accountBalance.refresh = async () => null
+  await unavailable.exposed.submit()
+  assert.equal(unavailable.requests.length, 0); assert.equal(unavailable.environment.credit.open.value, false)
+  assert.match(unavailable.exposed.errorMsg.value, /Could not confirm your available credit/)
+  const outstanding = await renderWorkspace('edit', {editSource: '/images/edit.png'})
+  outstanding.environment.fetch = async () => {throw {statusCode: 409, data: {statusMessage: 'Previous prices must settle'}}}
+  await outstanding.exposed.submit()
+  assert.equal(outstanding.environment.credit.open.value, false)
+  assert.match(outstanding.exposed.errorMsg.value, /Previous prices must settle/)
+})
+
 test('navigation unmounts and remounts the editor without losing an in-flight request or permitting a duplicate', async () => {
   const workspace = await renderWorkspace('edit', { editSource: '/images/edit.png', inputImages: ['/images/batch-a.png', '/images/batch-b.png'] })
   let resolveProvider!: (value: unknown) => void
@@ -209,7 +514,7 @@ test('navigation unmounts and remounts the editor without losing an in-flight re
   try {
     first = await mountWorkspace('edit', workspace.environment)
     request = first.exposed.submit()
-    await nextTick()
+    await new Promise(resolve => setImmediate(resolve)); await nextTick()
     assert.equal(workspace.requests.length, 1)
     assert.equal(first.exposed.activeGenerationCount.value, 1)
     first.app.unmount()
@@ -238,6 +543,120 @@ test('navigation unmounts and remounts the editor without losing an in-flight re
     await request
     first?.app.unmount()
     remounted?.app.unmount()
+    ;(globalThis as any).window = previousWindow
+  }
+})
+
+test('uploads select the server-assigned immutable image URL instead of rebuilding it from a filename', async () => {
+  const workspace = await renderWorkspace('edit')
+  const url = '/images/organizations/11111111-1111-4111-8111-111111111111/users/22222222-2222-4222-8222-222222222222/objects/33333333-3333-4333-8333-333333333333/product.png'
+  let uploadOptions: any
+  workspace.environment.fetch = async (_url: string, options: any) => {uploadOptions = options; return {saved: ['product.png'], savedFiles: [{name: 'product.png', url}], failed: []}}
+  await workspace.exposed.uploadFiles([new File(['test'], 'product.png', {type: 'image/png'})])
+  assert.equal(workspace.store.editSource, url)
+  assert.equal(workspace.exposed.errorMsg.value, null)
+  assert.equal(uploadOptions.timeout, 240_000)
+  assert.equal(uploadOptions.retry, 0)
+})
+
+test('Same-origin batch uploads fifty images with shared preflight and rejects fifty-one before sending', async () => {
+  const workspace = await renderWorkspace('batch')
+  const savedFiles = Array.from({length: 50}, (_, index) => ({url: `/images/product-${index}.png`}))
+  const requests: FormData[] = []
+  workspace.environment.fetch = async (_url: string, options: {body: FormData}) => {requests.push(options.body); return {savedFiles, failed: []}}
+  const files = Array.from({length: 50}, (_, index) => new File(['test'], `product-${index}.png`, {type: 'image/png'}))
+  await workspace.exposed.uploadFiles([...files, files[0]!])
+  assert.equal(requests.length, 0)
+  assert.match(workspace.exposed.errorMsg.value, /50 input images/)
+  await workspace.exposed.uploadFiles(files)
+  assert.equal(requests.length, 1)
+  assert.equal(requests[0]!.getAll('files').length, 50)
+  assert.equal(workspace.store.inputImages.length, 50)
+  await workspace.exposed.uploadFiles([files[0]!])
+  assert.equal(requests.length, 1)
+})
+
+test('Same-origin batch assets selection accepts fifty independent inputs and rejects fifty-one', async () => {
+  const workspace = await renderWorkspace('batch')
+  const files = Array.from({length: 50}, (_, index) => ({name: `${index}.png`, url: `/images/${index}.png`}))
+  workspace.exposed.pickerKind.value = 'source'
+  workspace.exposed.confirmPicker(files)
+  assert.equal(workspace.store.inputImages.length, 50)
+  workspace.exposed.confirmPicker([...files, {name: 'extra.png', url: '/images/extra.png'}])
+  assert.equal(workspace.store.inputImages.length, 50)
+  assert.match(workspace.exposed.errorMsg.value, /50 input images/)
+})
+
+for (const outcome of ['success', 'failure'] as const) {
+  test(`a generation ${outcome} arriving after an account switch cannot change the next user's workspace`, async () => {
+    const workspace = await renderWorkspace('edit', {editSource: '/images/alice.png'})
+    let resolve!: (value: unknown) => void
+    let reject!: (error: unknown) => void
+    workspace.environment.fetch = () => new Promise((yes, no) => { resolve = yes; reject = no })
+    const previousWindow = (globalThis as any).window
+    const mounted = await mountWorkspace('edit', workspace.environment)
+    const request = mounted.exposed.submit()
+    await new Promise(resolve => setImmediate(resolve))
+    try {
+      assert.equal(workspace.store.pendingGenerations.length, 1)
+      workspace.environment.account.epoch.value += 1
+      workspace.environment.account.identity.value = 'org.bob'
+      workspace.store.editSource = '/images/bob.png'
+      workspace.store.composerPrompt = 'Bob private prompt'
+      const bobJob: PendingGeneration = {id: 'bob-active', prompt: 'Bob private prompt', model: workspace.store.selectedModel,
+        inputImages: ['/images/bob.png'], modelImages: [], startedAt: Date.now(), status: 'pending'}
+      workspace.store.pendingGenerations = [bobJob]
+      await nextTick()
+      if (outcome === 'success') resolve({ok: true, obj: [{outputImage: '/images/output/alice.png', errors: 'Alice private error'}]})
+      else reject({data: {statusMessage: 'Alice private failure'}})
+      await request
+      assert.equal(workspace.store.editSource, '/images/bob.png')
+      assert.equal(workspace.store.composerPrompt, 'Bob private prompt')
+      assert.deepEqual(workspace.store.pendingGenerations, [bobJob])
+      assert.equal(mounted.exposed.previewOutput.value, null)
+      assert.equal(mounted.exposed.errorMsg.value, null)
+      assert.deepEqual(workspace.environment.refreshes, [], 'a stale request must not refresh a new account history')
+      const privateKeys = workspace.environment.fetchKeys.filter((entry: any) => entry.url !== '/api/image-models')
+      assert.ok(privateKeys.every((entry: any) => entry.key.value.endsWith(':org.bob:2')))
+    } finally {
+      resolve({ok: true, obj: []})
+      await request
+      mounted.app.unmount()
+      ;(globalThis as any).window = previousWindow
+    }
+  })
+}
+
+test('late upload and paginated history results are discarded after an account switch', async () => {
+  const workspace = await renderWorkspace('edit', {editSource: '/images/alice.png'})
+  const originalUseFetch = workspace.environment.useFetch
+  workspace.environment.useFetch = function(url: string, options: any) {
+    const result = originalUseFetch.call(this, url, options)
+    if (url === '/api/systemprompts') result.data.value = {count: 2, items: [{id: 1, TextPrompt: 'Alice previous', outputImage: null}]}
+    return result
+  }
+  const responses: Array<(value: unknown) => void> = []
+  workspace.environment.fetch = () => new Promise(resolve => { responses.push(resolve) })
+  const previousWindow = (globalThis as any).window
+  const mounted = await mountWorkspace('edit', workspace.environment)
+  const upload = mounted.exposed.uploadFiles([new File(['test'], 'product.png', {type: 'image/png'})])
+  const history = mounted.exposed.loadMoreHistory()
+  try {
+    assert.equal(responses.length, 2)
+    workspace.environment.account.epoch.value += 1
+    workspace.environment.account.identity.value = 'org.bob'
+    workspace.store.editSource = '/images/bob.png'
+    responses[0]!({savedFiles: [{url: '/images/alice-new.png'}], failed: [{filename: 'private.png', reason: 'Alice error'}]})
+    responses[1]!({count: 2, items: [{id: 2, TextPrompt: 'Alice private history', outputImage: '/images/alice-output.png'}]})
+    await Promise.all([upload, history])
+    assert.equal(workspace.store.editSource, '/images/bob.png')
+    assert.equal(mounted.exposed.errorMsg.value, null)
+    assert.equal(mounted.exposed.uploading.value, false)
+    assert.equal(mounted.exposed.displayedHistory.value.some((item: any) => item.id === 2), false)
+  } finally {
+    responses.forEach(resolve => resolve({savedFiles: [], failed: [], count: 0, items: []}))
+    await Promise.all([upload, history])
+    mounted.app.unmount()
     ;(globalThis as any).window = previousWindow
   }
 })

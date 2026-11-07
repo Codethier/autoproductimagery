@@ -1,4 +1,5 @@
 import type { GenerationBilling } from '~~/server/utils/useDB'
+import {allocateUsdUnits, formatUsdUnits, parseUsdUnits} from '../../schemas/account-billing'
 
 export function resolveGenerationTotalTokens(
     reportedTotal: number | undefined,
@@ -20,11 +21,9 @@ function splitInteger(value: number | undefined, index: number, count: number) {
 
 function splitPrice(value: string | undefined, index: number, count: number) {
     if (value == null) return undefined
-    const price = Number(value)
-    if (!Number.isFinite(price)) return value
-    const fixedUnits = Math.round(price * 100_000_000)
-    const allocatedUnits = splitInteger(fixedUnits, index, count)
-    return allocatedUnits == null ? value : (allocatedUnits / 100_000_000).toFixed(8)
+    const fixedUnits = parseUsdUnits(value)
+    if (fixedUnits === undefined) return undefined
+    return formatUsdUnits(allocateUsdUnits(fixedUnits, index, count))
 }
 
 function allocateCoupledTotal(
@@ -66,6 +65,8 @@ export function allocateGenerationBilling(
     index: number,
     count: number,
 ): GenerationBilling {
+    if (!Number.isSafeInteger(index) || !Number.isSafeInteger(count)
+        || count < 1 || index < 0 || index >= count) throw new Error('Invalid generation billing allocation')
     if (count <= 1) return billing
     const inputTokens = splitInteger(billing.inputTokens, index, count)
     const outputTokens = splitInteger(billing.outputTokens, index, count)
@@ -84,7 +85,7 @@ export function allocateGenerationBilling(
         ),
         cachedInputTokens: splitInteger(billing.cachedInputTokens, index, count),
         reasoningTokens,
-        // Allocate integer 1e-8 USD units so the row values always add back
+        // Allocate integer 1e-12 USD units so the row values always add back
         // to the exact stored batch total.
         priceUsd: splitPrice(billing.priceUsd, index, count),
         usageJson: {
@@ -99,9 +100,10 @@ export function readGenerationAllocation(value: unknown) {
     const allocation = (value as Record<string, unknown>).allocation
     if (!allocation || typeof allocation !== 'object') return undefined
     const record = allocation as Record<string, unknown>
-    const outputIndex = Number(record.outputIndex)
-    const outputCount = Number(record.outputCount)
-    if (!Number.isInteger(outputIndex) || !Number.isInteger(outputCount)
+    const outputIndex = record.outputIndex
+    const outputCount = record.outputCount
+    if (typeof outputIndex !== 'number' || typeof outputCount !== 'number'
+        || !Number.isSafeInteger(outputIndex) || !Number.isSafeInteger(outputCount)
         || outputIndex < 0 || outputCount <= 1 || outputIndex >= outputCount) {
         return undefined
     }

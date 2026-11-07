@@ -35,7 +35,7 @@ export default defineNuxtConfig({
          authPassword: '',
          authSessionSecret: '',
          imageGenerationConcurrency: 3,
-         imageGenerationMaxQueue: 25,
+         imageGenerationMaxQueue: 50,
          imageGenerationTimeoutMs: 180_000,
          imageGenerationStaleTtlMs: 15 * 60_000,
          imageGenerationRequestTimeoutMs: 270_000,
