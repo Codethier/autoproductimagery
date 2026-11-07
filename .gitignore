@@ -19,7 +19,7 @@ logs
 .idea
 
 # Local Codex reports and audit tools
-/.codex/artifacts/
+.codex
 /private-agents.md
 
 # Local env files
