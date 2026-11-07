@@ -22,6 +22,9 @@ logs
 .codex
 /private-agents.md
 
+# Local agent reports, screenshots and one-off scripts
+/.ai/
+
 # Local env files
 .env
 .env.*
