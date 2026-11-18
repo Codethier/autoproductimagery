@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {AssetListingQuerySchema} from '../schemas/image-storage.ts'
-import {assetFromImageUrl, assetSelectionLimit, createAssetFavourites, MAX_ASSET_FAVOURITES, parseAssetFavourites, toggleAssetSelection, validateAssetUploads} from '../app/utils/assetPreferences.ts'
+import {ASSET_UPLOAD_MESSAGES_EN, assetFromImageUrl, assetSelectionLimit, assetUploadIssue, createAssetFavourites, MAX_ASSET_FAVOURITES, parseAssetFavourites, toggleAssetSelection, validateAssetUploads} from '../app/utils/assetPreferences.ts'
+import {hasMessage, localeMessages, useI18n} from './i18n-test-helpers.ts'
 import {MAX_UPLOAD_FILES, MAX_UPLOAD_FILE_BYTES, MAX_UPLOAD_AGGREGATE_BYTES} from '../server/utils/uploadPolicy.ts'
 
 test('asset queries reject unknown fields, multi-value parameters and unbounded scans', () => {
@@ -70,4 +71,21 @@ test('client upload preflight matches streaming limits and rejects non-image upl
     assert.match(validateAssetUploads([{...image, size: MAX_UPLOAD_FILE_BYTES + 1}])!, /25 MB/)
     assert.match(validateAssetUploads(Array(5).fill({...image, size: MAX_UPLOAD_AGGREGATE_BYTES / 5 + 1}))!, /100 MB/)
     for (const file of [{...image, name: 'image.svg', type: 'image/svg+xml'}, {...image, name: 'movie.mp4', type: 'video/mp4'}, {...image, type: 'application/pdf'}, {...image, size: 0}]) assert.ok(validateAssetUploads([file]))
+})
+
+test('upload preflight messages are localized message keys with an English fallback that matches the locale file', () => {
+    const image = {name: 'product.png', type: 'image/png', size: 100}
+    const english = (localeMessages('en') as any).library.upload.validation
+    assert.deepEqual(english, {...ASSET_UPLOAD_MESSAGES_EN})
+    const cases = [[], Array(51).fill(image), [{...image, size: MAX_UPLOAD_FILE_BYTES + 1}], [{...image, size: 0}], [{...image, name: 'image.svg', type: 'image/svg+xml'}]]
+    for (const files of cases) {
+        const issue = assetUploadIssue(files)!
+        assert.ok(hasMessage(issue.key, 'en') && hasMessage(issue.key, 'hu'), issue.key)
+        assert.equal(validateAssetUploads(files), useI18n('en').t(issue.key, issue.params))
+        const hungarian = validateAssetUploads(files, useI18n('hu').t)!
+        assert.notEqual(hungarian, validateAssetUploads(files))
+        if ('name' in issue.params) assert.ok(hungarian.includes(String(issue.params.name)))
+    }
+    assert.match(validateAssetUploads(Array(51).fill(image), useI18n('hu').t)!, /50/)
+    assert.equal(assetUploadIssue([image]), undefined)
 })

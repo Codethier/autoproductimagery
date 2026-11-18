@@ -4,10 +4,14 @@ import {ImagePathSchema} from '../../schemas/image-generation'
 import {BACKGROUND_REMOVAL_MODELS, getBackgroundRemovalModel} from '../../schemas/background-removal-models'
 import {imageDownloadUrl, imagePreviewUrl} from '../utils/imageDelivery'
 import {imageName} from '../utils/generationComposer'
+import {createModelText} from '../utils/modelText'
 
 const props = defineProps<{sourceUrls: string[]}>()
 const emit = defineEmits<{close: []; completed: [job: BackgroundRemovalJob]; 'use-output': [url: string]}>()
 const account = useAccount()
+const i18n = useI18n()
+const {t} = i18n
+const {modelText} = createModelText(i18n)
 const requestFetch = useRequestFetch()
 const initialAccount = {epoch: account.epoch.value, identity: account.identity.value}
 const model = ref<BackgroundRemovalModel>('birefnet-lite')
@@ -16,7 +20,9 @@ const submitting = ref(false)
 const loading = ref(false)
 const historyReady = ref(false)
 const panelElement = ref<HTMLElement>()
-const errorMessage = ref('')
+// Store the message key so a language switch re-translates a visible error.
+const errorKey = ref('')
+const errorMessage = computed(() => errorKey.value ? t(errorKey.value) : '')
 const pollingPaused = ref(false)
 const unavailable = ref(new Set<string>())
 const sources = computed(() => initialAccount.epoch === account.epoch.value && initialAccount.identity === account.identity.value
@@ -26,8 +32,7 @@ const waitingSources = computed(() => new Set(activeJobs.value.map(job => job.so
 const readySources = computed(() => sources.value.filter(url => !waitingSources.value.has(url)))
 const canStart = computed(() => sources.value.length > 0 && sources.value.length <= 5 && readySources.value.length > 0 && historyReady.value && !submitting.value && !loading.value)
 const modelName = (id: BackgroundRemovalModel) => getBackgroundRemovalModel(id).label
-const statusName = (job: BackgroundRemovalJob) => job.status === 'succeeded' && job.outputExpired ? 'Image removed or expired'
-  : ({queued: 'Queued', running: 'Removing background', succeeded: 'Ready', failed: 'Could not process', cancelled: 'Cancelled'})[job.status]
+const statusName = (job: BackgroundRemovalJob) => t(`generation.cutout.status.${job.status === 'succeeded' && job.outputExpired ? 'expired' : job.status}`)
 const output = (job: BackgroundRemovalJob) => job.status === 'succeeded' && !job.outputExpired && job.outputUrl && ImagePathSchema.safeParse(job.outputUrl).success ? job.outputUrl : null
 const attemptKeys = new Map<string, string>()
 const requests = new Set<AbortController>()
@@ -41,13 +46,14 @@ let focusBeforeDialog: HTMLElement | null = null
 
 function snapshot() { return {epoch: account.epoch.value, identity: account.identity.value, revision} }
 function current(value: ReturnType<typeof snapshot>) { return value.epoch === account.epoch.value && value.identity === account.identity.value && value.revision === revision }
-function safeMessage(error: unknown, fallback: string) {
+/** Returns a `generation.cutout.errors.*` message key; raw server diagnostics are never shown. */
+function safeMessageKey(error: unknown, fallback: 'refreshFailed' | 'loadFailed' | 'queueFailed') {
   const status = (error as {statusCode?: number; status?: number; response?: {status?: number}})?.statusCode
     ?? (error as {status?: number})?.status ?? (error as {response?: {status?: number}})?.response?.status
-  if (status === 429) return 'The processing queue is full. Wait for a current job to finish, then try again.'
-  if (status === 403 || status === 404) return 'One of these images is no longer available to your account.'
-  if (status === 503) return 'Background removal is temporarily unavailable. Please try again later.'
-  return fallback
+  const reason = status === 429 ? 'queueFull'
+    : status === 403 || status === 404 ? 'imageUnavailable'
+      : status === 503 ? 'serviceUnavailable' : fallback
+  return `generation.cutout.errors.${reason}`
 }
 async function fetchRequest<T>(url: string, options: {method?: 'POST'; body?: CreateBackgroundRemoval; query?: Record<string, number>} = {}) {
   const controller = new AbortController()
@@ -85,7 +91,7 @@ async function pollJobs() {
     if (!current(value)) return
     for (const response of result) {
       if (response.status === 'fulfilled') record(response.value.job)
-      else errorMessage.value = safeMessage(response.reason, 'Could not refresh processing progress. Your jobs remain saved; try checking again.')
+      else errorKey.value = safeMessageKey(response.reason, 'refreshFailed')
     }
   } finally { if (current(value)) { polling = false; schedulePoll() } }
 }
@@ -98,7 +104,7 @@ async function loadJobs() {
     for (const job of result.jobs) record(job, false)
     historyReady.value = true
     schedulePoll()
-  } catch (error) { if (current(value)) errorMessage.value = safeMessage(error, 'Could not load recent processing jobs. Refresh progress before starting another job.') }
+  } catch (error) { if (current(value)) errorKey.value = safeMessageKey(error, 'loadFailed') }
   finally { if (current(value)) loading.value = false }
 }
 async function start() {
@@ -106,7 +112,7 @@ async function start() {
   const value = snapshot()
   const selectedModel = model.value
   const pending = [...readySources.value]
-  submitting.value = true; errorMessage.value = ''; pollingPaused.value = false; pollAttempts = 0
+  submitting.value = true; errorKey.value = ''; pollingPaused.value = false; pollAttempts = 0
   try {
     for (const sourceUrl of pending) {
       if (!current(value)) return
@@ -118,10 +124,10 @@ async function start() {
       record(result.job)
       attemptKeys.delete(key)
     }
-  } catch (error) { if (current(value)) errorMessage.value = safeMessage(error, 'Could not queue this image. Try again; accepted jobs will keep processing.') }
+  } catch (error) { if (current(value)) errorKey.value = safeMessageKey(error, 'queueFailed') }
   finally { if (current(value)) { submitting.value = false; schedulePoll() } }
 }
-function resume() { pollAttempts = 0; pollingPaused.value = false; errorMessage.value = ''; if (activeJobs.value.length) void pollJobs(); else void loadJobs() }
+function resume() { pollAttempts = 0; pollingPaused.value = false; errorKey.value = ''; if (activeJobs.value.length) void pollJobs(); else void loadJobs() }
 function visibilityChanged() { if (document.visibilityState === 'visible' && !pollingPaused.value) schedulePoll() }
 function onKeydown(event: KeyboardEvent) {
   if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); emit('close') }
@@ -132,24 +138,24 @@ function onKeydown(event: KeyboardEvent) {
     else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus() }
   }
 }
-watch(account.epoch, () => { stopRequests(); jobs.value = []; attemptKeys.clear(); completedIds.clear(); unavailable.value = new Set(); errorMessage.value = ''; submitting.value = false; loading.value = false; historyReady.value = false }, {flush: 'sync'})
-watch(() => props.sourceUrls, () => { stopRequests(); jobs.value = []; errorMessage.value = ''; loading.value = false; submitting.value = false; historyReady.value = false; pollAttempts = 0; pollingPaused.value = false; if (mounted) void loadJobs() }, {deep: true})
+watch(account.epoch, () => { stopRequests(); jobs.value = []; attemptKeys.clear(); completedIds.clear(); unavailable.value = new Set(); errorKey.value = ''; submitting.value = false; loading.value = false; historyReady.value = false }, {flush: 'sync'})
+watch(() => props.sourceUrls, () => { stopRequests(); jobs.value = []; errorKey.value = ''; loading.value = false; submitting.value = false; historyReady.value = false; pollAttempts = 0; pollingPaused.value = false; if (mounted) void loadJobs() }, {deep: true})
 onMounted(() => { mounted = true; focusBeforeDialog = document.activeElement instanceof HTMLElement ? document.activeElement : null; panelElement.value?.querySelector<HTMLButtonElement>('button')?.focus(); void loadJobs(); document.addEventListener('visibilitychange', visibilityChanged); window.addEventListener('keydown', onKeydown, {capture: true}) })
 onBeforeUnmount(() => { mounted = false; stopRequests(); document.removeEventListener('visibilitychange', visibilityChanged); window.removeEventListener('keydown', onKeydown, {capture: true}); if (focusBeforeDialog?.isConnected) focusBeforeDialog.focus() })
 </script>
 
 <template>
   <section ref="panelElement" class="cutout-panel" role="dialog" aria-modal="true" aria-labelledby="cutout-title">
-    <header class="cutout-heading"><div><span class="cutout-eyebrow">A cleaner starting point</span><h2 id="cutout-title">Remove background</h2></div><button class="cutout-icon" type="button" aria-label="Close background removal" @click="emit('close')"><UIcon name="i-lucide-x" /></button></header>
-    <p class="cutout-description">Create a transparent PNG. Your original stays in place; the cutout is saved to your own library.</p>
-    <div class="cutout-sources"><img v-for="source in sources.slice(0, 5)" :key="source" :src="imagePreviewUrl(source, 160)" :alt="imageName(source)" loading="lazy" decoding="async"><span>{{ sources.length }} image{{ sources.length === 1 ? '' : 's' }}</span></div>
-    <fieldset class="cutout-models"><legend>Background removal model</legend><label v-for="profile in BACKGROUND_REMOVAL_MODELS" :key="profile.id" class="cutout-model" :class="{'cutout-model--selected': model === profile.id}"><input v-model="model" type="radio" name="background-removal-model" :value="profile.id" :disabled="submitting"><span><strong>{{ profile.label }} <small v-if="profile.supportsTransparentBackground" class="cutout-transparency-badge model-transparent-badge" title="Outputs a transparent PNG." aria-label="Supports transparent image output">Transparent</small><small v-if="profile.id === 'birefnet-lite'">Recommended</small></strong><span>{{ profile.description }}</span></span></label></fieldset>
-    <div class="cutout-start"><div><strong>$0 provider charge</strong><small>Runs on this server · one image at a time</small></div><button class="cutout-button" type="button" :disabled="!canStart" @click="start"><UIcon :name="submitting ? 'i-lucide-loader-circle' : 'i-lucide-scissors'" :class="{'cutout-spin': submitting}" />{{ submitting ? 'Queueing…' : sources.length > 1 ? 'Remove backgrounds' : 'Remove background' }}</button></div>
-    <p v-if="sources.length > 5" class="cutout-error" role="alert">Select up to 5 images for background removal at a time.</p><p v-else-if="!sources.length" class="cutout-error" role="alert">Choose an image from your library first.</p>
-    <p v-if="errorMessage" class="cutout-error" role="alert">{{ errorMessage }} <button v-if="!historyReady" class="cutout-text-button" type="button" :disabled="loading" @click="resume">Retry loading jobs</button></p>
-    <div v-if="loading" class="cutout-progress" role="status">Loading recent cutouts…</div>
-    <section v-if="jobs.length" class="cutout-results" aria-label="Background removal jobs"><div class="cutout-results-heading"><h3>Recent cutouts</h3><button type="button" class="cutout-text-button" :disabled="loading || polling" @click="resume">Check progress</button></div><article v-for="job in jobs.slice(0, 20)" :key="job.id" class="cutout-result"><div v-if="output(job)" class="cutout-result-image"><img v-if="!unavailable.has(job.id)" :src="imagePreviewUrl(output(job)!, 480)" :alt="`Cutout of ${imageName(job.sourceUrl)}`" loading="lazy" decoding="async" @error="unavailable = new Set([...unavailable, job.id])"><span v-else>Preview unavailable</span></div><div class="cutout-result-details"><strong>{{ imageName(job.sourceUrl) }}</strong><small>{{ modelName(job.model) }} · $0 provider charge</small><span class="cutout-status" :class="{'cutout-status--ready': job.status === 'succeeded' && !job.outputExpired}" role="status"><UIcon v-if="job.status === 'running'" name="i-lucide-loader-circle" class="cutout-spin" />{{ statusName(job) }}</span><p v-if="job.status === 'failed'" class="cutout-job-error">{{ job.error?.message || 'This image could not be processed. Try again.' }}</p><div v-if="output(job)" class="cutout-result-actions"><a class="cutout-text-button" :href="imageDownloadUrl(output(job)!)" :download="imageName(output(job)!)"><UIcon name="i-lucide-download" />Download PNG</a><button type="button" class="cutout-text-button" @click="emit('use-output', output(job)!)">Use in editor<UIcon name="i-lucide-arrow-right" /></button></div></div></article></section>
-    <p v-if="pollingPaused && activeJobs.length" class="cutout-description" role="status">Your jobs are still saved. Check progress to continue watching, or find completed cutouts in your library.</p><p class="cutout-footnote">You can close this panel while processing continues. Full BiRefNet can take several minutes on a CPU.</p>
+    <header class="cutout-heading"><div><span class="cutout-eyebrow">{{ t('generation.cutout.eyebrow') }}</span><h2 id="cutout-title">{{ t('generation.cutout.title') }}</h2></div><button class="cutout-icon" type="button" :aria-label="t('generation.cutout.close')" @click="emit('close')"><UIcon name="i-lucide-x" /></button></header>
+    <p class="cutout-description">{{ t('generation.cutout.description') }}</p>
+    <div class="cutout-sources"><img v-for="source in sources.slice(0, 5)" :key="source" :src="imagePreviewUrl(source, 160)" :alt="imageName(source)" loading="lazy" decoding="async"><span>{{ t(sources.length === 1 ? 'generation.cutout.imagesOne' : 'generation.cutout.imagesOther', {count: sources.length}) }}</span></div>
+    <fieldset class="cutout-models"><legend>{{ t('generation.cutout.modelLegend') }}</legend><label v-for="profile in BACKGROUND_REMOVAL_MODELS" :key="profile.id" class="cutout-model" :class="{'cutout-model--selected': model === profile.id}"><input v-model="model" type="radio" name="background-removal-model" :value="profile.id" :disabled="submitting"><span><strong>{{ profile.label }} <small v-if="profile.supportsTransparentBackground" class="cutout-transparency-badge model-transparent-badge" :title="t('generation.cutout.transparentTitle')" :aria-label="t('generation.composer.transparentAria')">{{ t('generation.composer.transparent') }}</small><small v-if="profile.id === 'birefnet-lite'">{{ t('generation.composer.recommended') }}</small></strong><span>{{ modelText(profile.description) }}</span></span></label></fieldset>
+    <div class="cutout-start"><div><strong>{{ t('generation.cutout.providerCharge') }}</strong><small>{{ t('generation.cutout.runsLocally') }}</small></div><button class="cutout-button" type="button" :disabled="!canStart" @click="start"><UIcon :name="submitting ? 'i-lucide-loader-circle' : 'i-lucide-scissors'" :class="{'cutout-spin': submitting}" />{{ submitting ? t('generation.cutout.queueing') : sources.length > 1 ? t('generation.cutout.removeBackgrounds') : t('generation.cutout.removeBackground') }}</button></div>
+    <p v-if="sources.length > 5" class="cutout-error" role="alert">{{ t('generation.cutout.tooMany') }}</p><p v-else-if="!sources.length" class="cutout-error" role="alert">{{ t('generation.cutout.noSource') }}</p>
+    <p v-if="errorMessage" class="cutout-error" role="alert">{{ errorMessage }} <button v-if="!historyReady" class="cutout-text-button" type="button" :disabled="loading" @click="resume">{{ t('generation.cutout.retryLoading') }}</button></p>
+    <div v-if="loading" class="cutout-progress" role="status">{{ t('generation.cutout.loading') }}</div>
+    <section v-if="jobs.length" class="cutout-results" :aria-label="t('generation.cutout.jobsLabel')"><div class="cutout-results-heading"><h3>{{ t('generation.cutout.recent') }}</h3><button type="button" class="cutout-text-button" :disabled="loading || polling" @click="resume">{{ t('generation.cutout.checkProgress') }}</button></div><article v-for="job in jobs.slice(0, 20)" :key="job.id" class="cutout-result"><div v-if="output(job)" class="cutout-result-image"><img v-if="!unavailable.has(job.id)" :src="imagePreviewUrl(output(job)!, 480)" :alt="t('generation.cutout.cutoutAlt', {name: imageName(job.sourceUrl)})" loading="lazy" decoding="async" @error="unavailable = new Set([...unavailable, job.id])"><span v-else>{{ t('generation.cutout.previewUnavailable') }}</span></div><div class="cutout-result-details"><strong>{{ imageName(job.sourceUrl) }}</strong><small>{{ t('generation.cutout.modelCharge', {model: modelName(job.model)}) }}</small><span class="cutout-status" :class="{'cutout-status--ready': job.status === 'succeeded' && !job.outputExpired}" role="status"><UIcon v-if="job.status === 'running'" name="i-lucide-loader-circle" class="cutout-spin" />{{ statusName(job) }}</span><p v-if="job.status === 'failed'" class="cutout-job-error">{{ job.error?.message || t('generation.cutout.jobFailed') }}</p><div v-if="output(job)" class="cutout-result-actions"><a class="cutout-text-button" :href="imageDownloadUrl(output(job)!)" :download="imageName(output(job)!)"><UIcon name="i-lucide-download" />{{ t('generation.cutout.downloadPng') }}</a><button type="button" class="cutout-text-button" @click="emit('use-output', output(job)!)">{{ t('generation.cutout.useInEditor') }}<UIcon name="i-lucide-arrow-right" /></button></div></div></article></section>
+    <p v-if="pollingPaused && activeJobs.length" class="cutout-description" role="status">{{ t('generation.cutout.pollingPaused') }}</p><p class="cutout-footnote">{{ t('generation.cutout.footnote') }}</p>
   </section>
 </template>
 

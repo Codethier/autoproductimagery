@@ -9,6 +9,7 @@ import {computed, createRenderer, createSSRApp, h, nextTick, ref} from 'vue'
 import {IMAGE_MODEL_PROFILES, SUPPORTED_IMAGE_MODEL_IDS, createDefaultSettings, type ImageModelId} from '../schemas/image-generation.ts'
 import type {Person, PersonPhoto} from '../schemas/people.ts'
 import {createGenerationCreditController, initialGenerationCreditState} from '../app/utils/generationCredit.ts'
+import {i18nTestHelpersUrl} from './i18n-test-helpers.ts'
 
 const root = new URL('../', import.meta.url)
 const browserUrl = new URL('app/components/PeopleBrowser.vue', root).href
@@ -36,6 +37,7 @@ registerHooks({
       const compiled = compileScript(descriptor, {id: filename, inlineTemplate: true})
       return {format: 'module', shortCircuit: true, source: stripTypeScriptTypes(`import {computed, ref, watch, onMounted, onBeforeUnmount, onServerPrefetch, nextTick, toRaw} from 'vue';
         import {usePeopleGenerationProgress} from '${progressUrl}';
+        import {useI18n} from '${i18nTestHelpersUrl}';
         const useAccount = () => globalThis.${key}.account;
         const useRequestFetch = () => (...args) => globalThis.${key}.fetch(...args);
         const useAccountBalance = () => globalThis.${key}.balance;
@@ -71,6 +73,7 @@ function registerComponents(app: any) {
   app.component('AssetBrowser', {render: () => h('div')})
   app.component('PersonGenerator', {render: () => h('div')})
   app.component('ModelGuidance', {render: () => null})
+  app.component('SaveFormatSetting', {render: () => null})
 }
 async function renderComponent(url: string, options: {env?: ReturnType<typeof environment>; props?: Record<string, unknown>; initialize?: (value: any) => void} = {}) {
   const env = options.env ?? environment(); (globalThis as any)[key] = env

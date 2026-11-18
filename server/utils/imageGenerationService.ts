@@ -27,6 +27,7 @@ import {useUserFS} from './useUserFS'
 import {extractGatewayErrorBilling} from './billingGatewayError'
 import {publicGeneration} from './generationVisibility'
 import {createPeopleRepository} from './peopleRepository'
+import {prepareOutputForStorage} from './generatedImageFormat'
 
 import type {AuthContext} from './accountSession'
 
@@ -168,6 +169,7 @@ export async function runAccountImageGeneration(
         settings: request.settings,
         maskImage: request.maskImage,
         storeInputImages: request.storeInputImages,
+        saveFormat: request.saveFormat,
     }
 
     function pendingRowData(inputImage: string | null) {
@@ -389,16 +391,18 @@ export async function runAccountImageGeneration(
                         if (!pendingRow) throw new Error(`Missing pending row at output index ${outputIndex}`)
                         let saved: Awaited<ReturnType<typeof imageFs.saveGeneratedImage>> | undefined
                         try {
-                            saved = await imageFs.saveGeneratedImage(image.buffer, image.mimeType)
+                            const stored = await prepareOutputForStorage(image.buffer, image.mimeType, request.saveFormat)
+                            saved = await imageFs.saveGeneratedImage(stored.buffer, stored.mimeType)
                             savedOutputUrls.set(outputIndex, saved.url)
                             const outputMetadata: OutputMetadata = {
                                 mimeType: saved.mimeType,
                                 bytes: saved.bytes,
                                 width: saved.width,
                                 height: saved.height,
+                                ...(stored.converted ?? {}),
                                 responseText: image.responseText || undefined,
                                 reasoningText: image.reasoningText || undefined,
-                                warnings: Array.isArray(image.warnings) ? image.warnings : [],
+                                warnings: [...(Array.isArray(image.warnings) ? image.warnings : []), ...(stored.warning ? [stored.warning] : [])],
                                 grounding: image.grounding,
                             }
                             const completion = await database.completeGeneration(pendingRow.id, {

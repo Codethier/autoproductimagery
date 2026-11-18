@@ -17,6 +17,8 @@ const props = withDefaults(defineProps<{
   previewSize: 480
 })
 
+const {t} = useI18n()
+
 const emit = defineEmits<{
   (e: 'download', filename: string): void
 }>()
@@ -100,7 +102,7 @@ function onKeydown(e: KeyboardEvent) {
 <template>
   <span
     class="relative inline-block group select-none"
-    :aria-label="alt || 'image'"
+    :aria-label="alt || t('generation.image.download')"
     :title="alt"
     role="button"
     tabindex="0"

@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import {IMAGE_MODEL_PROFILES, ImagePathSchema} from '../../schemas/image-generation'
 definePageMeta({layout: 'workspace', colorMode: 'dark'})
-useHead({title: 'Shared with me · Product Imagery'})
+const {t} = useI18n()
+useHead({title: computed(() => t('library.sharedPageTitle'))})
 const data = useDataStore()
 const account = useAccount()
 const initialAccount = {epoch: account.epoch.value, identity: account.identity.value}
@@ -25,16 +26,16 @@ async function usePeopleReferences(urls: string[]) {
 watch([account.epoch, account.identity], () => {view.value = 'images'; selectedUrls.value = []}, {flush: 'sync'})
 </script>
 <template>
-  <section class="shared-workspace" aria-label="Shared with me">
-    <div class="shared-tabs" role="tablist" aria-label="Shared collections"
+  <section class="shared-workspace" :aria-label="t('library.shared.workspaceLabel')">
+    <div class="shared-tabs" role="tablist" :aria-label="t('library.shared.tabsLabel')"
          @keydown.right.prevent="switchTab(view === 'images' ? 'people' : 'images')"
          @keydown.left.prevent="switchTab(view === 'images' ? 'people' : 'images')"
          @keydown.home.prevent="switchTab('images')" @keydown.end.prevent="switchTab('people')">
-      <button id="shared-images-tab" ref="imageTab" type="button" role="tab" :aria-selected="view === 'images'" aria-controls="shared-image-content" :tabindex="view === 'images' ? 0 : -1" @click="view = 'images'"><UIcon name="i-lucide-images" />Images</button>
-      <button id="shared-people-tab" ref="peopleTab" type="button" role="tab" :aria-selected="view === 'people'" aria-controls="shared-people-content" :tabindex="view === 'people' ? 0 : -1" @click="view = 'people'"><UIcon name="i-lucide-contact-round" />People</button>
+      <button id="shared-images-tab" ref="imageTab" type="button" role="tab" :aria-selected="view === 'images'" aria-controls="shared-image-content" :tabindex="view === 'images' ? 0 : -1" @click="view = 'images'"><UIcon name="i-lucide-images" />{{ t('library.shared.images') }}</button>
+      <button id="shared-people-tab" ref="peopleTab" type="button" role="tab" :aria-selected="view === 'people'" aria-controls="shared-people-content" :tabindex="view === 'people' ? 0 : -1" @click="view = 'people'"><UIcon name="i-lucide-contact-round" />{{ t('library.shared.people') }}</button>
     </div>
     <div v-if="view === 'images'" id="shared-image-content" role="tabpanel" aria-labelledby="shared-images-tab">
-      <AssetBrowser title="Shared with me" initial-scope="shared" shared-only />
+      <AssetBrowser :title="t('library.shared.title')" initial-scope="shared" shared-only />
     </div>
     <div v-else id="shared-people-content" role="tabpanel" aria-labelledby="shared-people-tab">
       <PeopleBrowser v-model:selected-urls="selectedUrls" :max-selection="referenceLimit" shared-only @confirm="usePeopleReferences" />

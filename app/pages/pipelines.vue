@@ -4,7 +4,8 @@ definePageMeta({
   colorMode: "dark",
   key: "pipeline-workspace",
 });
-useHead({ title: "Pipelines · Product Imagery" });
+const { t } = useI18n();
+useHead({ title: () => t("pipelines.pageTitle") });
 </script>
 
 <template><PipelinesWorkspace /></template>

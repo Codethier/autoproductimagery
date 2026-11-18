@@ -6,6 +6,7 @@ import {isNewImageModel, orderImageModels} from '../../schemas/image-model-disco
 import {parseUsdUnits} from '../../schemas/account-billing'
 import {hasConfirmedGenerationPrice} from '../../schemas/generation-billing'
 import {useImageModelFavourites} from '../composables/useImageModelFavourites'
+import {useImageSaveFormat} from '../composables/useImageSaveFormat'
 import {formatBalanceUsd} from '../utils/generationPrice'
 import {imagePreviewUrl} from '../utils/imageDelivery'
 import {selectImageRange} from '../utils/imageSelection'
@@ -21,6 +22,7 @@ import CatalogImageSettings from './generation-settings/CatalogImageSettings.vue
 const props = defineProps<{person: Person; photos: PersonPhoto[]; selectedUrls?: string[]}>()
 const emit = defineEmits<{close: []; generated: []}>()
 const account = useAccount()
+const {t} = useI18n()
 const balance = useAccountBalance()
 const generationCredit = useGenerationCredit()
 const generationProgress = usePeopleGenerationProgress()
@@ -34,13 +36,19 @@ const scene = ref('A natural studio portrait, neutral background, soft light, re
 const pictureCount = ref(1)
 const referenceUrls = ref<string[]>([])
 const referenceAnchor = ref('')
-const referenceSelectionNotice = ref('')
+// Notices are stored as keys so a runtime language switch re-renders them.
+type UiMessage = {key: string; params?: Record<string, unknown>} | {text: string}
+function messageText(message: UiMessage | null) { return !message ? '' : 'text' in message ? message.text : t(message.key, message.params ?? {}) }
+const referenceSelectionNoticeKey = ref<UiMessage | null>(null)
+const referenceSelectionNotice = computed(() => messageText(referenceSelectionNoticeKey.value))
 const models = ref<Array<{id: string; catalogStatus: 'available' | 'unavailable' | 'unknown'; availabilityNote?: string}>>([])
 const loadingModels = ref(false)
 const generating = ref(false)
 const running = computed(() => generating.value || generationProgress.running(props.person.id))
-const errorMessage = ref('')
+const errorMessageKey = ref<UiMessage | null>(null)
+const errorMessage = computed(() => messageText(errorMessageKey.value))
 const panel = ref<HTMLElement>()
+const { saveFormat, setSaveFormat } = useImageSaveFormat()
 const profile = computed(() => IMAGE_MODEL_PROFILES[model.value])
 const eligiblePhotos = computed(() => currentAccount.value ? props.photos.filter(photo => photo.generationId === null || hasConfirmedGenerationPrice(photo)) : [])
 const selectedReferences = computed(() => referenceUrls.value.filter(url => eligiblePhotos.value.some(photo => photo.url === url)))
@@ -50,8 +58,8 @@ const orderedModels = computed(() => orderImageModels(SUPPORTED_IMAGE_MODEL_IDS,
 const creditBlockReason = computed(() => {
   const value = balance.balance.value
   if (!value || value.unlimited) return ''
-  if (!value.actualBalanceUsd || value.actualBalanceUsd.startsWith('-') || parseUsdUnits(value.actualBalanceUsd) === 0n) return 'Your credit is used up. Ask an organization owner to add credit.'
-  if (value.generationBlockedByOutstanding ?? value.outstandingCount > 0) return 'Your previous image prices must settle before another generation can use your credit.'
+  if (!value.actualBalanceUsd || value.actualBalanceUsd.startsWith('-') || parseUsdUnits(value.actualBalanceUsd) === 0n) return t('people.generator.errors.creditUsedUp')
+  if (value.generationBlockedByOutstanding ?? value.outstandingCount > 0) return t('people.generator.errors.outstanding')
   return ''
 })
 const canGenerate = computed(() => currentAccount.value && modelAvailable.value && !profile.value.requiresMask && !running.value && !generationCredit.checking.value && !!scene.value.trim() && selectedReferences.value.length <= profile.value.maxReferenceImages && totalPictures.value <= 4 && !generationCredit.outstandingBlocked.value)
@@ -71,7 +79,7 @@ async function request<T>(url: string, options: {method?: 'POST'; body?: Record<
 async function loadModels() {
   const value = snapshot(); loadingModels.value = true
   try { const response = await request<{items: typeof models.value}>('/api/image-models'); if (current(value)) models.value = response.items }
-  catch { if (current(value)) errorMessage.value = 'Could not load image models. Try again.' }
+  catch { if (current(value)) errorMessageKey.value = {key: 'people.generator.errors.loadModels'} }
   finally { if (current(value)) loadingModels.value = false }
 }
 function toggleReference(url: string, event?: Pick<MouseEvent, 'shiftKey'>) {
@@ -81,7 +89,7 @@ function toggleReference(url: string, event?: Pick<MouseEvent, 'shiftKey'>) {
   })
   referenceUrls.value = result.selection
   referenceAnchor.value = result.anchor
-  referenceSelectionNotice.value = result.limited ? `This model accepts up to ${profile.value.maxReferenceImages} identity references. Only pictures that fit were selected.` : ''
+  referenceSelectionNoticeKey.value = result.limited ? {key: 'people.generator.referenceLimited', params: {count: profile.value.maxReferenceImages}} : null
 }
 function generationPrompt() {
   return [selectedReferences.value.length ? 'Create a new photograph of the same adult person shown in the reference images. Preserve their facial identity and distinctive features.' : 'Create a fictional adult person for a product photography reference.', `Person: ${props.person.name}.`, props.person.description.trim() ? `Appearance and character: ${props.person.description.trim()}` : '', `Photograph: ${scene.value.trim()}`].filter(Boolean).join('\n\n')
@@ -89,11 +97,11 @@ function generationPrompt() {
 async function generate() {
   if (!canGenerate.value) return
   let body: ReturnType<typeof ImageGenerationRequestSchema.parse>
-  try { body = ImageGenerationRequestSchema.parse({personId: props.person.id, personPictureCount: pictureCount.value, prompt: generationPrompt(), model: model.value, settings: structuredClone(toRaw(settings.value)), inputImages: [], modelImages: [...selectedReferences.value], storeInputImages: true}) }
-  catch { errorMessage.value = 'Check the model settings and reference limit before generating.'; return }
-  const value = snapshot(); errorMessage.value = ''
+  try { body = ImageGenerationRequestSchema.parse({personId: props.person.id, personPictureCount: pictureCount.value, prompt: generationPrompt(), model: model.value, settings: structuredClone(toRaw(settings.value)), inputImages: [], modelImages: [...selectedReferences.value], storeInputImages: true, saveFormat: saveFormat.value}) }
+  catch { errorMessageKey.value = {key: 'people.generator.errors.invalidRequest'}; return }
+  const value = snapshot(); errorMessageKey.value = null
   if (!await generationCredit.ensureCredit()) {
-    if (current(value) && !generationCredit.open.value) errorMessage.value = generationCredit.blockedReason.value
+    if (current(value) && !generationCredit.open.value) errorMessageKey.value = {text: generationCredit.blockedReason.value}
     return
   }
   if (!current(value)) return
@@ -104,7 +112,7 @@ async function generate() {
   try {
     const response = await requestFetch<{ok: boolean; obj?: Array<{errors?: string | null}>}>('/api/image-generate', {method: 'POST', body, timeout: 600_000, signal: controller.signal})
     if (!current(value)) return
-    if (response.obj?.some(row => row.errors)) errorMessage.value = 'Some pictures could not be generated. Saved results will appear when their exact price is confirmed.'
+    if (response.obj?.some(row => row.errors)) errorMessageKey.value = {key: 'people.generator.errors.partial'}
     emit('generated')
     await balance.refresh()
   } catch (error) {
@@ -112,7 +120,7 @@ async function generate() {
     if (await generationCredit.handleError(error)) return
     if (!current(value)) return
     const status = (error as {statusCode?: number; status?: number})?.statusCode ?? (error as {status?: number})?.status
-    errorMessage.value = status === 429 ? 'The generation queue is busy. Try again after the current work finishes.' : 'Could not finish this generation. Refresh the person’s pictures before trying again; accepted work stays in your history.'
+    errorMessageKey.value = {key: status === 429 ? 'people.generator.errors.busy' : 'people.generator.errors.failed'}
     emit('generated'); await balance.refresh()
   } finally { generationRequests.delete(controller); generationProgress.release(token); if (current(value)) generating.value = false }
 }
@@ -127,11 +135,11 @@ function keydown(event: KeyboardEvent) {
     else if (!event.shiftKey && document.activeElement === elements.at(-1)) { event.preventDefault(); elements[0]?.focus() }
   }
 }
-watch(model, () => { settings.value = createDefaultSettings(model.value); errorMessage.value = ''; referenceAnchor.value = ''; referenceSelectionNotice.value = '' }, {flush: 'sync'})
-watch(() => props.person.id, () => { referenceAnchor.value = ''; referenceSelectionNotice.value = '' }, {flush: 'sync'})
+watch(model, () => { settings.value = createDefaultSettings(model.value); errorMessageKey.value = null; referenceAnchor.value = ''; referenceSelectionNoticeKey.value = null }, {flush: 'sync'})
+watch(() => props.person.id, () => { referenceAnchor.value = ''; referenceSelectionNoticeKey.value = null }, {flush: 'sync'})
 watch(eligiblePhotos, photos => { if (!photos.some(photo => photo.url === referenceAnchor.value)) referenceAnchor.value = '' }, {flush: 'sync'})
-watch([account.epoch, account.identity], () => { referenceAnchor.value = ''; referenceSelectionNotice.value = '' }, {flush: 'sync'})
-watch([account.epoch, account.identity], () => { cancelRequests(); for (const controller of generationRequests) controller.abort(); models.value = []; referenceUrls.value = []; scene.value = ''; model.value = DEFAULT_IMAGE_MODEL_ID; settings.value = createDefaultSettings(DEFAULT_IMAGE_MODEL_ID); pictureCount.value = 1; errorMessage.value = ''; generating.value = false; loadingModels.value = false }, {flush: 'sync'})
+watch([account.epoch, account.identity], () => { referenceAnchor.value = ''; referenceSelectionNoticeKey.value = null }, {flush: 'sync'})
+watch([account.epoch, account.identity], () => { cancelRequests(); for (const controller of generationRequests) controller.abort(); models.value = []; referenceUrls.value = []; scene.value = ''; model.value = DEFAULT_IMAGE_MODEL_ID; settings.value = createDefaultSettings(DEFAULT_IMAGE_MODEL_ID); pictureCount.value = 1; errorMessageKey.value = null; generating.value = false; loadingModels.value = false }, {flush: 'sync'})
 onMounted(() => {
   const supplied = (props.selectedUrls ?? []).filter(url => eligiblePhotos.value.some(photo => photo.url === url))
   referenceUrls.value = supplied.length ? supplied.slice(0, profile.value.maxReferenceImages) : eligiblePhotos.value.slice(0, 1).map(photo => photo.url)
@@ -145,18 +153,19 @@ onBeforeUnmount(() => { cancelRequests(); document.removeEventListener('keydown'
 
 <template>
   <section ref="panel" class="person-generator" role="dialog" aria-modal="true" aria-labelledby="person-generator-title">
-    <header><div><span class="person-eyebrow">People factory</span><h2 id="person-generator-title">Photograph {{ currentAccount ? person.name : 'a person' }}</h2></div><button type="button" class="person-icon" aria-label="Close person generator" @click="close"><UIcon name="i-lucide-x" /></button></header>
-    <p class="person-muted">Create their first portrait or explore new looks with the same person as a reference. Pictures join this profile once their exact cost is confirmed.</p>
-    <label class="person-label" for="person-scene">Scene, pose & styling</label><textarea id="person-scene" v-model="scene" class="person-input" rows="3" maxlength="12000" :disabled="generating" />
-    <fieldset v-if="eligiblePhotos.length" class="person-identity"><legend>Identity references <span>{{ selectedReferences.length }}/{{ profile.maxReferenceImages }}</span></legend><div><button v-for="photo in eligiblePhotos" :key="photo.id" class="person-reference" :class="{'is-selected': selectedReferences.includes(photo.url)}" type="button" :aria-pressed="selectedReferences.includes(photo.url)" :aria-label="`Use ${photo.name} as identity reference`" :disabled="generating" @click="toggleReference(photo.url, $event)"><img :src="imagePreviewUrl(photo.url, 160)" :alt="photo.name" loading="lazy" decoding="async"><span v-if="selectedReferences.includes(photo.url)"><UIcon name="i-lucide-check" /></span></button></div><p class="person-muted">Selected pictures help preserve identity. Click a picture, then Shift-click another to select a range. Different angles and lighting can still vary.</p><p v-if="referenceSelectionNotice" class="person-muted" role="status">{{ referenceSelectionNotice }}</p></fieldset>
-    <div class="person-model-row"><div><label class="person-label" for="person-model">Image model</label><div class="person-model-select"><select id="person-model" v-model="model" class="person-input" :disabled="generating || loadingModels"><option v-for="item in orderedModels" :key="item.id" :value="item.id" :disabled="item.disabled">{{ favouriteSet.has(item.id) ? '♥ ' : '' }}{{ item.profile.shortName }}{{ isNewImageModel(item.id) ? ' · New' : '' }}{{ item.profile.supportsTransparentBackground ? ' · Transparent' : '' }}{{ item.profile.requiresMask ? ' · mask required' : item.disabled ? ' · unavailable' : '' }}</option></select><button type="button" class="person-icon" :disabled="!favouritesReady || generating" :aria-pressed="favouriteSet.has(model)" :aria-label="`${favouriteSet.has(model) ? 'Remove' : 'Add'} ${profile.shortName} ${favouriteSet.has(model) ? 'from' : 'to'} favourites`" @click="toggleFavourite(model)"><UIcon name="i-lucide-heart" :class="{'person-heart': favouriteSet.has(model)}" /></button></div></div><div><label class="person-label" for="person-picture-count">Variations</label><select id="person-picture-count" v-model.number="pictureCount" class="person-input" :disabled="generating"><option v-for="count in 4" :key="count" :value="count">{{ count }}</option></select></div></div>
+    <header><div><span class="person-eyebrow">{{ t('people.generator.eyebrow') }}</span><h2 id="person-generator-title">{{ currentAccount ? t('people.generator.title', {name: person.name}) : t('people.generator.titleFallback') }}</h2></div><button type="button" class="person-icon" :aria-label="t('people.generator.close')" @click="close"><UIcon name="i-lucide-x" /></button></header>
+    <p class="person-muted">{{ t('people.generator.intro') }}</p>
+    <label class="person-label" for="person-scene">{{ t('people.generator.scene') }}</label><textarea id="person-scene" v-model="scene" class="person-input" rows="3" maxlength="12000" :disabled="generating" />
+    <fieldset v-if="eligiblePhotos.length" class="person-identity"><legend>{{ t('people.generator.identityReferences') }} <span>{{ selectedReferences.length }}/{{ profile.maxReferenceImages }}</span></legend><div><button v-for="photo in eligiblePhotos" :key="photo.id" class="person-reference" :class="{'is-selected': selectedReferences.includes(photo.url)}" type="button" :aria-pressed="selectedReferences.includes(photo.url)" :aria-label="t('people.generator.useAsReference', {name: photo.name})" :disabled="generating" @click="toggleReference(photo.url, $event)"><img :src="imagePreviewUrl(photo.url, 160)" :alt="photo.name" loading="lazy" decoding="async"><span v-if="selectedReferences.includes(photo.url)"><UIcon name="i-lucide-check" /></span></button></div><p class="person-muted">{{ t('people.generator.identityHelp') }}</p><p v-if="referenceSelectionNotice" class="person-muted" role="status">{{ referenceSelectionNotice }}</p></fieldset>
+    <div class="person-model-row"><div><label class="person-label" for="person-model">{{ t('people.generator.imageModel') }}</label><div class="person-model-select"><select id="person-model" v-model="model" class="person-input" :disabled="generating || loadingModels"><option v-for="item in orderedModels" :key="item.id" :value="item.id" :disabled="item.disabled">{{ favouriteSet.has(item.id) ? '♥ ' : '' }}{{ item.profile.shortName }}{{ isNewImageModel(item.id) ? t('people.generator.suffixNew') : '' }}{{ item.profile.supportsTransparentBackground ? t('people.generator.suffixTransparent') : '' }}{{ item.profile.requiresMask ? t('people.generator.suffixMaskRequired') : item.disabled ? t('people.generator.suffixUnavailable') : '' }}</option></select><button type="button" class="person-icon" :disabled="!favouritesReady || generating" :aria-pressed="favouriteSet.has(model)" :aria-label="t(favouriteSet.has(model) ? 'people.generator.removeFavourite' : 'people.generator.addFavourite', {model: profile.shortName})" @click="toggleFavourite(model)"><UIcon name="i-lucide-heart" :class="{'person-heart': favouriteSet.has(model)}" /></button></div></div><div><label class="person-label" for="person-picture-count">{{ t('people.generator.variations') }}</label><select id="person-picture-count" v-model.number="pictureCount" class="person-input" :disabled="generating"><option v-for="count in 4" :key="count" :value="count">{{ count }}</option></select></div></div>
     <ModelGuidance :model-id="model" :settings="settings" context="people" />
-    <p v-if="!favouritesPersistent" class="person-muted" role="status">Favourites last for this visit because browser storage is unavailable.</p><p v-if="profile.requiresMask" class="person-error" role="alert">This model requires a mask and cannot create person portraits here.</p>
-    <details class="person-settings"><summary>Model settings <span>{{ profile.shortName }}<small v-if="profile.supportsTransparentBackground" class="person-transparency-badge model-transparent-badge" title="Supports transparent image output; enable it in model settings." aria-label="Supports transparent image output">Transparent</small><small v-if="isNewImageModel(model)">New</small></span></summary><div><p v-if="profile.supportsTransparentBackground" class="person-transparency-help">For a transparent image, choose Background → Transparent and use PNG or WebP.</p><NuxtErrorBoundary :key="model"><component :is="component" v-model="settings" /><template #error><p class="person-error">Settings could not load. <button type="button" @click="settings = createDefaultSettings(model)">Restore defaults</button></p></template></NuxtErrorBoundary></div></details>
-    <p v-if="totalPictures > 4" class="person-error" role="alert">Choose fewer variations or reduce the model’s number of images. A person batch can contain up to 4 pictures.</p><p v-if="selectedReferences.length > profile.maxReferenceImages" class="person-error" role="alert">This model accepts up to {{ profile.maxReferenceImages }} reference pictures. Remove some selections.</p>
-    <p v-if="creditBlockReason || errorMessage" class="person-error" role="alert">{{ errorMessage || creditBlockReason }} <button v-if="!models.length" type="button" :disabled="loadingModels" @click="loadModels">Reload models</button></p>
-    <footer><div><strong>{{ totalPictures }} picture{{ totalPictures === 1 ? '' : 's' }}</strong><span>Available credit: {{ balance.balance.value ? balance.balance.value.unlimited ? 'Unlimited' : formatBalanceUsd(balance.balance.value.actualBalanceUsd) : 'loading…' }}</span><small>Final price appears with each picture.</small></div><button type="button" class="person-primary" :disabled="!canGenerate" @click="generate"><UIcon :name="generating ? 'i-lucide-loader-circle' : 'i-lucide-sparkles'" :class="{'person-spin': generating}" />{{ generating ? 'Generating…' : 'Generate pictures' }}</button></footer>
-    <p v-if="running" class="person-muted" role="status">This person’s generation is running. You can close the panel; accepted pictures are saved to this profile after price confirmation.</p>
+    <p v-if="!favouritesPersistent" class="person-muted" role="status">{{ t('people.generator.favouritesNotPersistent') }}</p><p v-if="profile.requiresMask" class="person-error" role="alert">{{ t('people.generator.maskRequired') }}</p>
+    <details class="person-settings"><summary>{{ t('people.generator.modelSettings') }} <span>{{ profile.shortName }}<small v-if="profile.supportsTransparentBackground" class="person-transparency-badge model-transparent-badge" :title="t('people.generator.transparentTitle')" :aria-label="t('people.generator.transparentLabel')">{{ t('people.generator.transparent') }}</small><small v-if="isNewImageModel(model)">{{ t('people.generator.new') }}</small></span></summary><div><p v-if="profile.supportsTransparentBackground" class="person-transparency-help">{{ t('people.generator.transparentHelp') }}</p><NuxtErrorBoundary :key="model"><component :is="component" v-model="settings" /><template #error><p class="person-error">{{ t('people.generator.settingsFailed') }} <button type="button" @click="settings = createDefaultSettings(model)">{{ t('people.generator.restoreDefaults') }}</button></p></template></NuxtErrorBoundary></div></details>
+    <SaveFormatSetting class="person-save-format" :model-value="saveFormat" @update:model-value="setSaveFormat" />
+    <p v-if="totalPictures > 4" class="person-error" role="alert">{{ t('people.generator.tooManyPictures') }}</p><p v-if="selectedReferences.length > profile.maxReferenceImages" class="person-error" role="alert">{{ t('people.generator.tooManyReferences', {count: profile.maxReferenceImages}) }}</p>
+    <p v-if="creditBlockReason || errorMessage" class="person-error" role="alert">{{ errorMessage || creditBlockReason }} <button v-if="!models.length" type="button" :disabled="loadingModels" @click="loadModels">{{ t('people.generator.reloadModels') }}</button></p>
+    <footer><div><strong>{{ t(totalPictures === 1 ? 'people.generator.picturesOne' : 'people.generator.picturesOther', {count: totalPictures}) }}</strong><span>{{ t('people.generator.availableCredit', {amount: balance.balance.value ? balance.balance.value.unlimited ? t('people.generator.unlimited') : formatBalanceUsd(balance.balance.value.actualBalanceUsd) : t('people.generator.creditLoading')}) }}</span><small>{{ t('people.generator.finalPrice') }}</small></div><button type="button" class="person-primary" :disabled="!canGenerate" @click="generate"><UIcon :name="generating ? 'i-lucide-loader-circle' : 'i-lucide-sparkles'" :class="{'person-spin': generating}" />{{ generating ? t('people.generator.generating') : t('people.generator.generate') }}</button></footer>
+    <p v-if="running" class="person-muted" role="status">{{ t('people.generator.running') }}</p>
   </section>
 </template>
 

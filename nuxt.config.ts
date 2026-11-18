@@ -19,6 +19,10 @@ try {
     }
 } catch { /* no-op */ }
 
+// One message file per UI area, merged for each locale. Keep both locales in
+// sync; tests/i18n-locales.test.ts checks that every key exists in both.
+const I18N_NAMESPACES = ['common', 'account', 'generation', 'models', 'library', 'people', 'pipelines', 'pipelineEditor']
+
 export default defineNuxtConfig({
     future: {
         compatibilityVersion: 4,
@@ -49,7 +53,26 @@ export default defineNuxtConfig({
             enabled: true,
         },
     },
-    modules: ['@nuxt/image', '@nuxt/scripts', '@nuxt/ui', '@pinia/nuxt'],
+    modules: ['@nuxt/image', '@nuxt/scripts', '@nuxt/ui', '@pinia/nuxt', '@nuxtjs/i18n'],
+    i18n: {
+        // Routes stay language-neutral. The chosen language is a non-sensitive
+        // device preference kept in its own cookie; English is the fallback.
+        strategy: 'no_prefix',
+        defaultLocale: 'en',
+        locales: (['en', 'hu'] as const).map(code => ({
+            code,
+            language: code === 'en' ? 'en-US' : 'hu-HU',
+            name: code === 'en' ? 'English' : 'Magyar',
+            files: I18N_NAMESPACES.map(namespace => `${code}/${namespace}.json`),
+        })),
+        detectBrowserLanguage: {
+            useCookie: true,
+            cookieKey: 'i18n_locale',
+            redirectOn: 'no prefix',
+            alwaysRedirect: false,
+            fallbackLocale: 'en',
+        },
+    },
     css: [
         '~/assets/css/main.css',
         // 'vue-json-pretty/lib/styles.css'

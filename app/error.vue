@@ -1,21 +1,34 @@
 <script setup lang="ts">
 import type {NuxtError} from '#app'
 const props = defineProps<{error: NuxtError<{workspaceWarmup?: boolean; retryPath?: string}>}>()
+// The recovery screen must still render if an error happens before i18n is
+// available, so it falls back to English copy instead of failing again.
+const english: Record<string, string> = {
+  'common.appName': 'Product imagery',
+  'common.actions.retry': 'Try again',
+  'account.recovery.pageTitle': 'Workspace unavailable · Product Imagery',
+  'account.recovery.warmupTitle': 'Your workspace is waking up',
+  'account.recovery.failedTitle': 'Your workspace could not load',
+  'account.recovery.warmupBody': 'The first request after being idle can take longer while the app and database start. Your session is preserved. Wait a moment, then try again.',
+  'account.recovery.failedBody': 'Please try loading your workspace again.',
+}
+let t: (key: string) => string
+try { const i18n = useI18n(); t = key => i18n.t(key) } catch { t = key => english[key] ?? key }
 const warmup = computed(() => props.error.data?.workspaceWarmup === true)
 const retryPath = computed(() => {
   const path = props.error.data?.retryPath
   return typeof path === 'string' && path.startsWith('/') && !path.startsWith('//') && !/[\\\u0000-\u001f\u007f]/.test(path) ? path : '/edit'
 })
 async function retry() {await clearError({redirect: retryPath.value})}
-useHead({title: 'Workspace unavailable · Product Imagery', htmlAttrs: {class: 'dark'}})
+useHead({title: computed(() => t('account.recovery.pageTitle')), htmlAttrs: {class: 'dark'}})
 </script>
 
 <template>
   <main class="workspace-recovery">
-    <span class="workspace-eyebrow">Product imagery</span>
-    <h1>{{ warmup ? 'Your workspace is waking up' : 'Your workspace could not load' }}</h1>
-    <p>{{ warmup ? 'The first request after being idle can take longer while the app and database start. Your session is preserved. Wait a moment, then try again.' : 'Please try loading your workspace again.' }}</p>
-    <button type="button" @click="retry">Try again</button>
+    <span class="workspace-eyebrow">{{ t('common.appName') }}</span>
+    <h1>{{ warmup ? t('account.recovery.warmupTitle') : t('account.recovery.failedTitle') }}</h1>
+    <p>{{ warmup ? t('account.recovery.warmupBody') : t('account.recovery.failedBody') }}</p>
+    <button type="button" @click="retry">{{ t('common.actions.retry') }}</button>
   </main>
 </template>
 

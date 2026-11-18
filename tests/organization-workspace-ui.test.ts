@@ -11,6 +11,8 @@ import {createAssetFavourites} from '../app/utils/assetPreferences.ts'
 import {createImageModelFavourites} from '../app/utils/imageModelFavourites.ts'
 import type {AssetFile, AssetFolder} from '../schemas/image-storage.ts'
 import {prepareServerlessRequest, serverlessFetchOptions, SERVERLESS_MUTATION_TIMEOUT_MS} from '../app/utils/serverlessRequests.ts'
+import {i18nTestHelpersUrl} from './i18n-test-helpers.ts'
+import {useI18n as useTestI18n} from './i18n-test-helpers.ts'
 
 const root = new URL('../', import.meta.url)
 const browserUrl = new URL('app/components/AssetBrowser.vue', root).href
@@ -49,7 +51,7 @@ registerHooks({
       const $fetch = (...args) => globalThis.${environmentKey}.fetch(...args);
       const useAssetFavourites = () => ({urls: ref([]), persistent: ref(true), toggle: () => undefined, remove: () => undefined});
     `
-    return {format: 'module', shortCircuit: true, source: stripTypeScriptTypes(`import {computed, ref, reactive, watch, nextTick, onMounted, onBeforeUnmount, onServerPrefetch, provide} from 'vue';\n${services}\n${compiled.content}`)}
+    return {format: 'module', shortCircuit: true, source: stripTypeScriptTypes(`import {computed, ref, reactive, watch, nextTick, onMounted, onBeforeUnmount, onServerPrefetch, provide} from 'vue';\nimport {useI18n} from '${i18nTestHelpersUrl}';\n${services}\n${compiled.content}`)}
   },
 })
 
@@ -320,7 +322,7 @@ test('a late balance response cannot populate or override another user’s activ
   const state = ref<any>({identity: '', epoch: -1, balance: null, pending: false, error: ''})
   const account = {identity: ref('org.alice'), epoch: ref(1)}
   const completions: Array<(response: unknown) => void> = []
-  const useBalance = new Function('computed', 'watch', 'useAccount', 'useState', 'useRequestFetch', 'serverlessFetchOptions', source)(computed, watch, () => account, () => state, () => () => new Promise(resolve => completions.push(resolve)), serverlessFetchOptions)
+  const useBalance = new Function('computed', 'watch', 'useAccount', 'useState', 'useRequestFetch', 'serverlessFetchOptions', 'useI18n', source)(computed, watch, () => account, () => state, () => () => new Promise(resolve => completions.push(resolve)), serverlessFetchOptions, () => useTestI18n())
   const balance = useBalance()
   const alice = balance.refresh()
   account.identity.value = 'org.bea'; account.epoch.value += 1

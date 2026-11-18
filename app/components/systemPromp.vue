@@ -2,6 +2,7 @@
 import { refreshNuxtData } from '#app'
 import {hasConfirmedGenerationPrice} from '~~/schemas/generation-billing'
 import {formatUsd} from '../utils/generationPrice'
+import {replaySaveFormat} from '../utils/imageSaveFormat'
 import {
   ImageModelIdSchema,
   isOpenAiImageSettings,
@@ -38,6 +39,7 @@ type SystemPrompt = {
 }
 
 const props = defineProps<{ data: SystemPrompt }>()
+const { t, locale } = useI18n()
 const account = useAccount()
 const generationCredit = useGenerationCredit()
 // A history card belongs to the account that created this component. Do not
@@ -54,7 +56,7 @@ const outputMetadata = computed(() => detailData.value?.outputMetadata ?? props.
 
 const createdAt = computed(() => {
   const d = props.data?.createdAt ? new Date(props.data.createdAt) : null
-  return d ? d.toLocaleString() : ''
+  return d ? d.toLocaleString(locale.value) : ''
 })
 
 const generationModelText = computed(() => props.data?.generationModel || '')
@@ -78,14 +80,14 @@ const replayConfig = computed<StoredGenerationConfig | null>(() => {
 const isLegacyConfig = computed(() => !StoredGenerationConfigSchema.safeParse(props.data?.generationConfig).success)
 const replayUnavailableReason = computed(() => {
   const config = replayConfig.value
-  if (!config) return 'The original model is no longer in the curated catalog.'
+  if (!config) return t('generation.card.replayModelMissing')
   const storedInputs = Array.isArray(props.data?.serverImages) ? props.data.serverImages : []
   const sharedInputs = Array.isArray(props.data?.modelImages) ? props.data.modelImages : []
   if (!config.storeInputImages
       && storedInputs.length === 0
       && sharedInputs.length === 0
       && !props.data?.parentSystemPromptId) {
-    return 'The original source image was not retained, so this edit cannot be replayed exactly.'
+    return t('generation.card.replaySourceMissing')
   }
   return ''
 })
@@ -93,15 +95,15 @@ const settingsSummary = computed(() => {
   const settings = replayConfig.value?.settings
   if (!settings) return ''
   if (isOpenAiImageSettings(settings)) {
-    return `${settings.size || 'auto size'} · ${settings.quality} · ${settings.outputFormat.toUpperCase()}`
+    return `${settings.size || t('generation.card.autoSize')} · ${settings.quality} · ${settings.outputFormat.toUpperCase()}`
   }
   if (!isGeminiImageSettings(settings)) {
     return [('size' in settings ? settings.size : undefined) || ('aspectRatio' in settings ? settings.aspectRatio : undefined),
       'resolution' in settings ? settings.resolution : undefined,
-      'outputFormat' in settings ? settings.outputFormat.toUpperCase() : undefined].filter(Boolean).join(' · ') || 'Model defaults'
+      'outputFormat' in settings ? settings.outputFormat.toUpperCase() : undefined].filter(Boolean).join(' · ') || t('generation.card.modelDefaults')
   }
   const size = 'imageSize' in settings ? settings.imageSize : '1K'
-  return `${settings.aspectRatio || 'input/default ratio'} · ${size}`
+  return `${settings.aspectRatio || t('generation.card.inputRatio')} · ${size}`
 })
 const outputDimensions = computed(() => {
   const metadata = outputMetadata.value
@@ -119,9 +121,9 @@ const tokenUsageText = computed(() => {
   const output = props.data?.outputTokens
   if (total == null && input == null && output == null) return ''
   const parts: string[] = []
-  if (total != null) parts.push(`${total.toLocaleString()} total`)
-  if (input != null) parts.push(`${input.toLocaleString()} in`)
-  if (output != null) parts.push(`${output.toLocaleString()} out`)
+  if (total != null) parts.push(t('generation.card.tokensTotal', { count: total.toLocaleString(locale.value) }))
+  if (input != null) parts.push(t('generation.card.tokensIn', { count: input.toLocaleString(locale.value) }))
+  if (output != null) parts.push(t('generation.card.tokensOut', { count: output.toLocaleString(locale.value) }))
   return parts.join(' / ')
 })
 const priceText = computed(() => {
@@ -142,8 +144,8 @@ async function loadOutputDetails() {
   } catch (error: any) {
     if (!cardIsCurrent.value) return
     toast.add({
-      title: 'Could not load output details',
-      description: error?.data?.statusMessage || error?.message || 'Try again later.',
+      title: t('generation.card.toast.detailsFailed'),
+      description: error?.data?.statusMessage || error?.message || t('generation.card.toast.tryLater'),
       color: 'warning',
     })
   } finally {
@@ -160,7 +162,7 @@ const currentImage = computed(() => cardIsCurrent.value && priceConfirmed.value 
   ? currentResult.value.outputImage || null : null)
 const outputImageExpired = computed(() => !!currentResult.value.outputImageDeletedAt && !currentImage.value)
 const outputImageDeletedAt = computed(() => props.data?.outputImageDeletedAt
-  ? new Date(props.data.outputImageDeletedAt).toLocaleString()
+  ? new Date(props.data.outputImageDeletedAt).toLocaleString(locale.value)
   : '')
 
 watch(cardIsCurrent, current => {
@@ -183,8 +185,8 @@ async function sendRefine() {
   if (!cardIsCurrent.value || !text || chatLoading.value || generationCredit.checking.value) return
   if (!currentImage.value) {
     toast.add({
-      title: 'No image to refine',
-      description: outputImageExpired.value ? 'This generated image expired under the retention policy.' : undefined,
+      title: t('generation.card.toast.noImage'),
+      description: outputImageExpired.value ? t('generation.card.toast.noImageExpired') : undefined,
       color: 'warning',
     })
     return
@@ -192,13 +194,13 @@ async function sendRefine() {
   const sourceImage = currentImage.value
   const config = replayConfig.value
   if (!config) {
-    toast.add({ title: 'Original model is unavailable', description: 'This legacy item cannot be refined safely without choosing a replacement explicitly.', color: 'warning' })
+    toast.add({ title: t('generation.card.toast.modelUnavailable'), description: t('generation.card.toast.modelUnavailableBody'), color: 'warning' })
     return
   }
   chatLoading.value = true
   try {
     if (!await generationCredit.ensureCredit() || !cardIsCurrent.value) {
-      if (cardIsCurrent.value && !generationCredit.open.value && generationCredit.blockedReason.value) toast.add({title: 'Generation unavailable', description: generationCredit.blockedReason.value, color: 'warning'})
+      if (cardIsCurrent.value && !generationCredit.open.value && generationCredit.blockedReason.value) toast.add({title: t('generation.card.toast.generationUnavailable'), description: generationCredit.blockedReason.value, color: 'warning'})
       return
     }
     chatInput.value = ''
@@ -216,21 +218,22 @@ async function sendRefine() {
         // Refinement is intentionally a single-output derivative. Regenerate
         // below preserves the stored output-count setting exactly.
         settings: singleOutputDerivativeSettings(config.settings),
+        saveFormat: replaySaveFormat(config.saveFormat),
         parentSystemPromptId: props.data.id,
       },
     })
     if (!cardIsCurrent.value) return
     const row = res?.obj?.[0]
     if (row && !row.errors && (row.status === 'succeeded' || row.outputImage)) {
-      toast.add({ title: hasConfirmedGenerationPrice(row) ? 'Refinement created' : 'Refinement created · price pending' })
+      toast.add({ title: hasConfirmedGenerationPrice(row) ? t('generation.card.toast.refinementCreated') : t('generation.card.toast.refinementCreatedPending') })
       await refreshNuxtData(historyKey)
     } else {
-      toast.add({ title: 'Refinement failed', description: row?.errors || 'Unknown error', color: 'warning' })
+      toast.add({ title: t('generation.card.toast.refinementFailed'), description: row?.errors || t('generation.card.toast.unknownError'), color: 'warning' })
     }
   } catch (e: any) {
     if (!cardIsCurrent.value) return
     if (await generationCredit.handleError(e)) { if (cardIsCurrent.value && !chatInput.value) chatInput.value = text; return }
-    if (cardIsCurrent.value) toast.add({ title: 'Refinement failed', description: e?.data?.statusMessage || e?.message || 'Request failed', color: 'warning' })
+    if (cardIsCurrent.value) toast.add({ title: t('generation.card.toast.refinementFailed'), description: e?.data?.statusMessage || e?.message || t('generation.card.toast.requestFailed'), color: 'warning' })
   } finally {
     if (cardIsCurrent.value) chatLoading.value = false
   }
@@ -252,8 +255,8 @@ async function regenerate() {
     const config = replayConfig.value
     if (!config || replayUnavailableReason.value) {
       toast.add({
-        title: 'Cannot regenerate',
-        description: replayUnavailableReason.value || 'The original generation configuration is unavailable.',
+        title: t('generation.card.toast.cannotRegenerate'),
+        description: replayUnavailableReason.value || t('generation.card.toast.configUnavailable'),
         color: 'warning',
       })
       return
@@ -271,10 +274,10 @@ async function regenerate() {
       }
       if (!parent?.outputImage || parent.outputImageDeletedAt || !hasConfirmedGenerationPrice(parent)) {
         toast.add({
-          title: 'Cannot reproduce this refinement',
+          title: t('generation.card.toast.cannotReproduce'),
           description: parent?.outputImageDeletedAt
-            ? 'Its generated source image expired under the retention policy. Exact replay is unavailable.'
-            : 'Its exact source image is no longer available.',
+            ? t('generation.card.toast.sourceExpired')
+            : t('generation.card.toast.sourceGone'),
           color: 'warning',
         })
         return
@@ -286,13 +289,13 @@ async function regenerate() {
         : undefined
 
     if (!await generationCredit.ensureCredit() || !cardIsCurrent.value) {
-      if (cardIsCurrent.value && !generationCredit.open.value && generationCredit.blockedReason.value) toast.add({title: 'Generation unavailable', description: generationCredit.blockedReason.value, color: 'warning'})
+      if (cardIsCurrent.value && !generationCredit.open.value && generationCredit.blockedReason.value) toast.add({title: t('generation.card.toast.generationUnavailable'), description: generationCredit.blockedReason.value, color: 'warning'})
       return
     }
 
     // Ask the user to edit/confirm the prompt before regenerating
     const currentPrompt = props.data?.TextPrompt || ''
-    const editedPrompt = typeof window !== 'undefined' ? window.prompt('Edit prompt before regenerating:', currentPrompt) : currentPrompt
+    const editedPrompt = typeof window !== 'undefined' ? window.prompt(t('generation.card.editPrompt'), currentPrompt) : currentPrompt
     if (!cardIsCurrent.value || editedPrompt === null) {
       // User cancelled
       return
@@ -304,7 +307,7 @@ async function regenerate() {
     for (let i = 0; i < count; i++) {
       if (!cardIsCurrent.value) return
       if (!await generationCredit.ensureCredit() || !cardIsCurrent.value) {
-        if (cardIsCurrent.value && !generationCredit.open.value && generationCredit.blockedReason.value) toast.add({title: 'Generation unavailable', description: generationCredit.blockedReason.value, color: 'warning'})
+        if (cardIsCurrent.value && !generationCredit.open.value && generationCredit.blockedReason.value) toast.add({title: t('generation.card.toast.generationUnavailable'), description: generationCredit.blockedReason.value, color: 'warning'})
         return
       }
       const res = await $fetch<{ ok: boolean; obj: SystemPrompt[] }>('/api/image-generate', {
@@ -318,6 +321,7 @@ async function regenerate() {
           model: config.effectiveModel,
           settings: config.settings,
           storeInputImages: true,
+          saveFormat: replaySaveFormat(config.saveFormat),
           parentSystemPromptId: props.data.id,
         }
       })
@@ -328,18 +332,18 @@ async function regenerate() {
         // charge is pending. History adds the new card when it is confirmed.
         if (hasConfirmedGenerationPrice(row)) currentResult.value = row
       } else {
-        throw new Error(row?.errors || 'Unknown generation error')
+        throw new Error(row?.errors || t('generation.card.toast.unknownGenerationError'))
       }
     }
 
-    toast.add({ title: 'Regeneration started', description: `Created ${count} job${count > 1 ? 's' : ''}.` })
+    toast.add({ title: t('generation.card.toast.regenerationStarted'), description: t(count > 1 ? 'generation.card.toast.regenerationCreatedOther' : 'generation.card.toast.regenerationCreatedOne', { count }) })
   } catch (e: any) {
     if (!cardIsCurrent.value) return
     if (await generationCredit.handleError(e)) return
     if (!cardIsCurrent.value) return
     toast.add({
-      title: 'Regeneration failed',
-      description: e?.data?.statusMessage || e?.statusMessage || e?.message || 'Request failed',
+      title: t('generation.card.toast.regenerationFailed'),
+      description: e?.data?.statusMessage || e?.statusMessage || e?.message || t('generation.card.toast.requestFailed'),
       color: 'warning',
     })
   } finally {
@@ -357,20 +361,20 @@ async function regenerate() {
       <DownloadableImage
         :src="currentImage"
         :preview-size="480"
-        :alt="props.data?.TextPrompt || 'Output image'"
+        :alt="props.data?.TextPrompt || t('generation.card.outputAlt')"
         class="generation-preview-image"
       />
-      <span class="generation-output-badge">Output</span>
+      <span class="generation-output-badge">{{ t('generation.card.outputBadge') }}</span>
     </div>
     <div v-else-if="outputImageExpired" role="status" class="generation-empty-preview">
       <UIcon name="i-lucide-image-off" class="size-7" aria-hidden="true" />
-      <span>Image expired</span>
-      <p>Automatically deleted under the generated-image retention policy on {{ outputImageDeletedAt }}.</p>
-      <p>Your prompt and settings are retained. Regenerate if the original images are still available.</p>
+      <span>{{ t('generation.card.expired') }}</span>
+      <p>{{ t('generation.card.expiredDeleted', { date: outputImageDeletedAt }) }}</p>
+      <p>{{ t('generation.card.expiredRetained') }}</p>
     </div>
     <div v-else role="status" class="generation-empty-preview generation-empty-error">
       <UIcon name="i-lucide-image-off" class="size-7" aria-hidden="true" />
-      <span>No output image</span>
+      <span>{{ t('generation.card.noOutput') }}</span>
     </div>
 
     <div class="generation-card-content">
@@ -378,27 +382,27 @@ async function regenerate() {
 
       <div class="generation-facts">
         <div class="generation-final-price" data-generation-price>
-          <span>Final price</span>
+          <span>{{ t('generation.card.finalPrice') }}</span>
           <strong>{{ priceText }}</strong>
         </div>
         <dl class="generation-metadata">
           <div v-if="generationModelText">
-            <dt>Model</dt>
+            <dt>{{ t('generation.card.model') }}</dt>
             <dd>{{ generationModelText }}</dd>
           </div>
           <div v-if="settingsSummary">
-            <dt>Settings</dt>
+            <dt>{{ t('generation.card.settings') }}</dt>
             <dd>
               {{ settingsSummary }}
-              <span v-if="isLegacyConfig" class="generation-warning-note">Legacy defaults inferred</span>
+              <span v-if="isLegacyConfig" class="generation-warning-note">{{ t('generation.card.legacyDefaults') }}</span>
             </dd>
           </div>
           <div v-if="outputDimensions">
-            <dt>Output</dt>
+            <dt>{{ t('generation.card.output') }}</dt>
             <dd>{{ outputDimensions }}</dd>
           </div>
           <div v-if="tokenUsageText">
-            <dt>Tokens</dt>
+            <dt>{{ t('generation.card.tokens') }}</dt>
             <dd>{{ tokenUsageText }}</dd>
           </div>
         </dl>
@@ -418,7 +422,7 @@ async function regenerate() {
         :loading="detailLoading"
         @click="loadOutputDetails"
       >
-        Load output details
+        {{ t('generation.card.loadDetails') }}
         <UIcon name="i-lucide-chevron-down" class="size-3.5" aria-hidden="true" />
       </UButton>
 
@@ -427,19 +431,19 @@ async function regenerate() {
       </div>
 
       <details v-if="outputMetadata?.reasoningText" class="generation-details">
-        <summary>Thought summary</summary>
+        <summary>{{ t('generation.card.thoughtSummary') }}</summary>
         <div class="generation-output-text">{{ outputMetadata.reasoningText }}</div>
       </details>
 
       <details v-if="outputMetadata?.warnings?.length" class="generation-details generation-provider-warnings">
-        <summary>Provider warnings ({{ outputMetadata.warnings.length }})</summary>
+        <summary>{{ t('generation.card.providerWarnings', { count: outputMetadata.warnings.length }) }}</summary>
         <ul>
           <li v-for="warning in outputMetadata.warnings" :key="warning">{{ warning }}</li>
         </ul>
       </details>
 
       <div v-if="grounding" class="generation-grounding">
-        <div class="generation-section-label">Google Search grounding</div>
+        <div class="generation-section-label">{{ t('generation.card.grounding') }}</div>
         <div v-if="grounding.sources.length" class="generation-grounding-sources">
           <a
             v-for="source in grounding.sources"
@@ -453,34 +457,34 @@ async function regenerate() {
           v-if="grounding.searchEntryPointHtml"
           :srcdoc="grounding.searchEntryPointHtml"
           sandbox="allow-popups allow-popups-to-escape-sandbox"
-          title="Google Search suggestions"
+          :title="t('generation.card.groundingFrame')"
           class="generation-grounding-frame"
         />
       </div>
 
       <div v-if="props.data?.serverImages?.length" class="generation-sources">
-        <div class="generation-section-label">Input images</div>
+        <div class="generation-section-label">{{ t('generation.card.inputImages') }}</div>
         <div class="generation-source-grid">
           <DownloadableImage
             v-for="(source, index) in props.data.serverImages"
             :key="source"
             :src="source"
             :preview-size="160"
-            :alt="`Input image ${index + 1}`"
+            :alt="t('generation.card.inputImageAlt', { index: index + 1 })"
             class="generation-source-image"
           />
         </div>
       </div>
 
       <div v-if="props.data?.modelImages?.length" class="generation-sources">
-        <div class="generation-section-label">Reference images</div>
+        <div class="generation-section-label">{{ t('generation.card.referenceImages') }}</div>
         <div class="generation-source-grid">
           <DownloadableImage
             v-for="(source, index) in props.data.modelImages"
             :key="source"
             :src="source"
             :preview-size="160"
-            :alt="`Reference image ${index + 1}`"
+            :alt="t('generation.card.referenceImageAlt', { index: index + 1 })"
             class="generation-source-image"
           />
         </div>
@@ -496,7 +500,7 @@ async function regenerate() {
             @click="regenerate"
           >
             <UIcon name="i-lucide-rotate-cw" class="size-3.5" aria-hidden="true" />
-            Regenerate
+            {{ t('generation.card.regenerate') }}
           </UButton>
           <label class="generation-replay-count">
             <span>×</span>
@@ -505,7 +509,7 @@ async function regenerate() {
               type="number"
               size="xs"
               class="generation-count-input"
-              aria-label="Number of regenerations"
+              :aria-label="t('generation.card.regenerationCount')"
               min="1"
               max="50"
               :disabled="regenLoading"
@@ -516,12 +520,12 @@ async function regenerate() {
       </div>
 
       <div v-if="currentImage" class="generation-refinement">
-        <label :for="`generation-refine-${props.data.id}`" class="generation-section-label">Refine this image</label>
+        <label :for="`generation-refine-${props.data.id}`" class="generation-section-label">{{ t('generation.card.refineLabel') }}</label>
         <div class="generation-refinement-controls">
           <UTextarea
             :id="`generation-refine-${props.data.id}`"
             v-model="chatInput"
-            placeholder="Describe a refinement…"
+            :placeholder="t('generation.card.refinePlaceholder')"
             class="generation-refinement-input"
             :rows="2"
             autoresize
@@ -536,7 +540,7 @@ async function regenerate() {
             @click="sendRefine"
           >
             <UIcon name="i-lucide-arrow-up" class="size-4" aria-hidden="true" />
-            <span>Send</span>
+            <span>{{ t('generation.card.send') }}</span>
           </UButton>
         </div>
       </div>

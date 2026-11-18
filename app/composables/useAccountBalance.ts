@@ -1,16 +1,18 @@
 import type {AccountBalance} from '../../schemas/account-billing'
 import {serverlessFetchOptions} from '../utils/serverlessRequests'
 
+// `error` holds an i18n key in shared state; the computed value is localized.
 type BalanceState = {identity: string; epoch: number; request: number; balance: AccountBalance | null; pending: boolean; error: string}
 
 export function useAccountBalance() {
   const account = useAccount()
   const requestFetch = useRequestFetch()
+  const {t} = useI18n()
   const state = useState<BalanceState>('workspace-account-balance', () => ({identity: '', epoch: -1, request: 0, balance: null, pending: false, error: ''}))
   const current = computed(() => state.value.identity === account.identity.value && state.value.epoch === account.epoch.value)
   const balance = computed(() => current.value ? state.value.balance : null)
   const pending = computed(() => current.value && state.value.pending)
-  const error = computed(() => current.value ? state.value.error : '')
+  const error = computed(() => current.value && state.value.error ? t(state.value.error) : '')
   watch([account.epoch, account.identity], () => {
     if (!current.value) state.value = {identity: '', epoch: -1, request: 0, balance: null, pending: false, error: ''}
   }, {flush: 'sync'})
@@ -28,7 +30,7 @@ export function useAccountBalance() {
       const response = await requestFetch<AccountBalance>('/api/account/balance', serverlessFetchOptions({}, epoch))
       if (stillCurrent()) { state.value.balance = response; return response }
     } catch {
-      if (stillCurrent()) state.value.error = 'Could not load your balance. Try again.'
+      if (stillCurrent()) state.value.error = 'account.balance.loadFailed'
     } finally {
       if (stillCurrent()) state.value.pending = false
     }

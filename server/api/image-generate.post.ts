@@ -56,6 +56,7 @@ function parseRequest(raw: RawBody) {
         modelImages: raw.modelImages ?? [],
         maskImage: raw.maskImage,
         storeInputImages: raw.storeInputImages ?? true,
+        saveFormat: raw.saveFormat,
         parentSystemPromptId: raw.parentSystemPromptId,
         personId: raw.personId,
         personPictureCount: raw.personPictureCount,

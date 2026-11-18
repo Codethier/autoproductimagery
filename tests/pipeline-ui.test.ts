@@ -24,6 +24,7 @@ import {
 } from "../app/utils/pipelineTemplates.ts";
 import {createGenerationCreditController, initialGenerationCreditState} from '../app/utils/generationCredit.ts';
 import {pipelineRerunUsesCredit, pipelineJobRerunBlockedReason} from '../app/utils/pipelineCredit.ts';
+import {i18nTestHelpersUrl} from './i18n-test-helpers.ts';
 
 const root = new URL("../", import.meta.url),
   key = "__pipelineUi";
@@ -34,6 +35,7 @@ const canvas = new URL("app/components/PipelineCanvas.vue", root).href;
 const results = new URL("app/components/PipelineRunResults.vue", root).href;
 const favourites = new URL("app/composables/useImageModelFavourites.ts", root)
   .href;
+const modelTextUrl = new URL("app/composables/useModelText.ts", root).href;
 const exposures: Record<string, string> = {
   [workspace]:
     "pipelines,pipeline,definition,name,description,editing,selectedId,selectedEdgeId,models,dirty,conflict,saveError,notice,useTemplate,addNode,updateNode,moveNode,removeNode,duplicateNode,copyNode,pasteNode,connect,disconnect,disconnectNode,undo,redo,canUndo,canRedo,loadPipelines,openPipeline,save,prepareRun,runTarget,batchInput,batchImages,runInputs,inputNodes,executionNodes,canStart,runIssues,creditBlockReason,startRun,runMode,activeRun,runError,runWakeNotice,starting,picker,pickerUrls,pickerTab,peopleOnlyPicker,pickerTabKey,openPicker,confirmPicker,refreshRun,resumeRun,cancelRun,retryRun,rerunJob,closeRun,loadRuns,runHistory,keyboard,metadataOpen,deleteOpen,discardOpen,openRuns",
@@ -51,6 +53,12 @@ registerHooks({
     return next(specifier, context);
   },
   load(url, context, next) {
+    if (url === modelTextUrl)
+      return {
+        format: "module",
+        shortCircuit: true,
+        source: `import {createModelText} from '${new URL("app/utils/modelText.ts", root).href}';import {useI18n} from '${i18nTestHelpersUrl}';export const useModelText=()=>createModelText(useI18n());`,
+      };
     if (url === favourites)
       return {
         format: "module",
@@ -79,7 +87,7 @@ registerHooks({
         format: "module",
         shortCircuit: true,
         source: stripTypeScriptTypes(
-          `import {computed,ref,watch,onMounted,onBeforeUnmount,onServerPrefetch,nextTick,toRaw} from 'vue';const useAccount=()=>globalThis.${key}.account;const useAccountBalance=()=>globalThis.${key}.balance;const useGenerationCredit=()=>globalThis.${key}.credit ??= globalThis.${key}.createCredit();const useRequestFetch=()=>(...args)=>globalThis.${key}.fetch(...args);const useRoute=()=>globalThis.${key}.route;const navigateTo=(...args)=>globalThis.${key}.navigate(...args);${compiled.content}`,
+          `import {computed,ref,watch,onMounted,onBeforeUnmount,onServerPrefetch,nextTick,toRaw} from 'vue';import {useI18n} from '${i18nTestHelpersUrl}';const useAccount=()=>globalThis.${key}.account;const useAccountBalance=()=>globalThis.${key}.balance;const useGenerationCredit=()=>globalThis.${key}.credit ??= globalThis.${key}.createCredit();const useRequestFetch=()=>(...args)=>globalThis.${key}.fetch(...args);const useRoute=()=>globalThis.${key}.route;const navigateTo=(...args)=>globalThis.${key}.navigate(...args);${compiled.content}`,
         ),
       };
     }
@@ -227,6 +235,7 @@ function components(app: any) {
     render: () => h("input", { type: "checkbox" }),
   });
   app.component("AssetBrowser", { render: () => h("div") });
+  app.component("SaveFormatSetting", { render: () => h("div") });
   app.component("PeopleBrowser", { render: () => h("div") });
   app.component("ModelGuidance", { props: ["modelId", "settings", "context"], setup: (props: any) => () => h("aside", {"data-model-guidance": props.modelId, "data-guidance-context": props.context}) });
   app.component("NuxtLink", {

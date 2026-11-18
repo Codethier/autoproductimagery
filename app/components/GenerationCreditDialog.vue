@@ -3,6 +3,7 @@ import {formatBalanceUsd} from '../utils/generationPrice'
 const credit = useGenerationCredit()
 const account = useAccount()
 const balance = useAccountBalance()
+const {t} = useI18n()
 const panel = ref<HTMLElement>()
 let previousFocus: HTMLElement | null = null
 function validOutsideFocus(target: EventTarget | null): target is HTMLElement {
@@ -46,12 +47,12 @@ onBeforeUnmount(() => { window.removeEventListener('focusin', rememberFocus); wi
 <template>
   <div v-if="credit.open.value" class="credit-dialog-backdrop" @click.self="credit.close()">
     <section ref="panel" class="credit-dialog" role="alertdialog" aria-modal="true" aria-labelledby="generation-credit-title" aria-describedby="generation-credit-description">
-      <header><span class="credit-dialog-symbol"><UIcon name="i-lucide-wallet" /></span><button type="button" class="credit-dialog-close" aria-label="Close balance notice" @click="credit.close()"><UIcon name="i-lucide-x" /></button></header>
-      <span class="credit-dialog-eyebrow">Generation credit</span>
-      <h2 id="generation-credit-title">More balance needed</h2>
-      <p id="generation-credit-description">Your available generation credit is used up. {{ account.isOwner.value ? 'Add credit from Team before starting another generation.' : 'Ask your organization owner to add credit before starting another generation.' }}</p>
-      <div v-if="balance.balance.value && !balance.balance.value.unlimited" class="credit-dialog-balance"><span>Available credit</span><strong>{{ formatBalanceUsd(balance.balance.value.actualBalanceUsd) }}</strong></div>
-      <footer><button type="button" class="credit-dialog-secondary" @click="credit.close()">Close</button><button type="button" class="credit-dialog-secondary" @click="viewBalance">View balance</button><button v-if="account.isOwner.value" type="button" class="credit-dialog-primary" @click="manageBalances">Manage balances</button></footer>
+      <header><span class="credit-dialog-symbol"><UIcon name="i-lucide-wallet" /></span><button type="button" class="credit-dialog-close" :aria-label="t('account.credit.close')" @click="credit.close()"><UIcon name="i-lucide-x" /></button></header>
+      <span class="credit-dialog-eyebrow">{{ t('account.credit.eyebrow') }}</span>
+      <h2 id="generation-credit-title">{{ t('account.credit.title') }}</h2>
+      <p id="generation-credit-description">{{ t('account.credit.usedUp') }} {{ account.isOwner.value ? t('account.credit.ownerHint') : t('account.credit.memberHint') }}</p>
+      <div v-if="balance.balance.value && !balance.balance.value.unlimited" class="credit-dialog-balance"><span>{{ t('account.credit.available') }}</span><strong>{{ formatBalanceUsd(balance.balance.value.actualBalanceUsd) }}</strong></div>
+      <footer><button type="button" class="credit-dialog-secondary" @click="credit.close()">{{ t('common.actions.close') }}</button><button type="button" class="credit-dialog-secondary" @click="viewBalance">{{ t('account.credit.viewBalance') }}</button><button v-if="account.isOwner.value" type="button" class="credit-dialog-primary" @click="manageBalances">{{ t('account.credit.manageBalances') }}</button></footer>
     </section>
   </div>
 </template>

@@ -7,6 +7,7 @@ import {createRenderer, createSSRApp, computed, h, nextTick, reactive, ref, watc
 import {transpileModule, ModuleKind, ScriptTarget} from 'typescript'
 import {createDefaultSettings} from '../schemas/image-generation.ts'
 import {createGenerationCreditController, initialGenerationCreditState} from '../app/utils/generationCredit.ts'
+import {useI18n} from './i18n-test-helpers.ts'
 
 // Render the actual history card with Nuxt composables and image/API components
 // stubbed. The image URL remains in expired records, so a DOM assertion catches
@@ -23,6 +24,7 @@ const vueUrl = new URL('../node_modules/vue/index.mjs', import.meta.url).href
 const schemaUrl = new URL('../schemas/image-generation.ts', import.meta.url).href
 const billingSchemaUrl = new URL('../schemas/generation-billing.ts', import.meta.url).href
 const priceFormatterUrl = new URL('../app/utils/generationPrice.ts', import.meta.url).href
+const saveFormatUrl = new URL('../app/utils/imageSaveFormat.ts', import.meta.url).href
 const combined = `${script.content.replace('export default', 'const component =')}
 ${template.code.replace('export function render', 'function render')}
 component.render = render;
@@ -31,6 +33,7 @@ export default component;`
   .replace(/(['"])~~\/schemas\/image-generation\1/g, JSON.stringify(schemaUrl))
   .replace(/(['"])~~\/schemas\/generation-billing\1/g, JSON.stringify(billingSchemaUrl))
   .replace(/(['"])\.\.\/utils\/generationPrice\1/g, JSON.stringify(priceFormatterUrl))
+  .replace(/(['"])\.\.\/utils\/imageSaveFormat\1/g, JSON.stringify(saveFormatUrl))
   .replace(/(['"])vue\1/g, JSON.stringify(vueUrl))
 const javascript = transpileModule(combined, {
   compilerOptions: {module: ModuleKind.ESNext, target: ScriptTarget.ES2022},
@@ -86,7 +89,7 @@ async function renderCard(data: Record<string, unknown>, history: Record<string,
   const refreshedKeys: string[] = []
   let bindings: any
   const injected: Record<string, unknown> = {
-    computed, ref, watch,
+    computed, ref, watch, useI18n,
     useAccount: () => account,
     useGenerationCredit: () => credit,
     useNuxtData: (key: string) => { historyKeys.push(key); return {data: ref({items: history})} },

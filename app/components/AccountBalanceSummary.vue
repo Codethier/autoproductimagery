@@ -1,24 +1,26 @@
 <script setup lang="ts">
 import type {AccountBalance} from '~~/schemas/account-billing'
 import {formatBalanceUsd, formatUsd} from '../utils/generationPrice'
-withDefaults(defineProps<{balance: AccountBalance | null; pending?: boolean; error?: string; title?: string}>(), {title: 'Your generation balance'})
+const props = defineProps<{balance: AccountBalance | null; pending?: boolean; error?: string; title?: string}>()
 defineEmits<{refresh: []}>()
+const {t} = useI18n()
+const heading = computed(() => props.title || t('account.balance.title'))
 </script>
 
 <template>
-  <section class="account-balance-summary" :aria-label="title">
-    <div class="account-balance-heading"><h2>{{ title }}</h2><button type="button" :disabled="pending" @click="$emit('refresh')"><UIcon :name="pending ? 'i-lucide-loader-circle' : 'i-lucide-refresh-cw'" />{{ pending ? 'Updating…' : 'Refresh' }}</button></div>
+  <section class="account-balance-summary" :aria-label="heading">
+    <div class="account-balance-heading"><h2>{{ heading }}</h2><button type="button" :disabled="pending" @click="$emit('refresh')"><UIcon :name="pending ? 'i-lucide-loader-circle' : 'i-lucide-refresh-cw'" />{{ pending ? t('account.balance.updating') : t('common.actions.refresh') }}</button></div>
     <div v-if="balance" class="account-balance-values">
-      <div><span>Actual balance</span><strong>{{ balance.unlimited ? 'Unlimited' : formatBalanceUsd(balance.actualBalanceUsd) }}</strong><small>Available credit · USD</small></div>
-      <div><span>Outstanding balance</span><strong>{{ formatUsd(balance.outstandingEstimateUsd) }}<span v-if="balance.outstandingUnknownCount"> + unpriced</span></strong><small>{{ balance.outstandingCount }} generation{{ balance.outstandingCount === 1 ? '' : 's' }} awaiting final cost<span v-if="balance.outstandingUnknownCount"> · {{ balance.outstandingUnknownCount }} without an estimate</span></small></div>
-      <div><span>Confirmed spend</span><strong>{{ formatUsd(balance.confirmedSpendUsd) }}</strong><small>Final Gateway charges · USD</small></div>
-      <div><span>Total paid</span><strong>{{ formatUsd(balance.totalPaidUsd) }}</strong><small>Payments recorded by organization owners · USD</small></div>
-      <div><span>Unpaid bills</span><strong>{{ formatUsd(balance.unpaidUsd) }}</strong><small>Confirmed spend minus received payments · USD</small></div>
-      <div v-if="balance.overpaidUsd && balance.overpaidUsd !== '0.000000000000'"><span>Paid ahead</span><strong>{{ formatUsd(balance.overpaidUsd) }}</strong><small>Payments above confirmed spend · USD</small></div>
+      <div><span>{{ t('account.balance.actual') }}</span><strong>{{ balance.unlimited ? t('common.layout.unlimited') : formatBalanceUsd(balance.actualBalanceUsd) }}</strong><small>{{ t('account.balance.availableCredit') }}</small></div>
+      <div><span>{{ t('account.balance.outstanding') }}</span><strong>{{ formatUsd(balance.outstandingEstimateUsd) }}<span v-if="balance.outstandingUnknownCount">{{ t('common.layout.unpricedSuffix') }}</span></strong><small>{{ t(balance.outstandingCount === 1 ? 'account.balance.awaitingOne' : 'account.balance.awaitingOther', {count: balance.outstandingCount}) }}<span v-if="balance.outstandingUnknownCount"> · {{ t('account.balance.withoutEstimate', {count: balance.outstandingUnknownCount}) }}</span></small></div>
+      <div><span>{{ t('account.balance.confirmedSpend') }}</span><strong>{{ formatUsd(balance.confirmedSpendUsd) }}</strong><small>{{ t('account.balance.confirmedSpendHelp') }}</small></div>
+      <div><span>{{ t('account.balance.totalPaid') }}</span><strong>{{ formatUsd(balance.totalPaidUsd) }}</strong><small>{{ t('account.balance.totalPaidHelp') }}</small></div>
+      <div><span>{{ t('account.balance.unpaid') }}</span><strong>{{ formatUsd(balance.unpaidUsd) }}</strong><small>{{ t('account.balance.unpaidHelp') }}</small></div>
+      <div v-if="balance.overpaidUsd && balance.overpaidUsd !== '0.000000000000'"><span>{{ t('account.balance.paidAhead') }}</span><strong>{{ formatUsd(balance.overpaidUsd) }}</strong><small>{{ t('account.balance.paidAheadHelp') }}</small></div>
     </div>
-    <p v-else role="status">{{ pending ? 'Loading your balance…' : 'Balance unavailable' }}</p>
+    <p v-else role="status">{{ pending ? t('account.balance.loading') : t('account.balance.unavailable') }}</p>
     <p v-if="error" role="alert" class="account-balance-error">{{ error }}</p>
-    <p class="account-balance-note">Outstanding amounts are estimates and are separate from unpaid bills. Payments settle confirmed bills without changing generation credit. Images are released once the final Gateway price is confirmed. New accounts have unlimited credit unless an organization owner sets a balance.</p>
+    <p class="account-balance-note">{{ t('account.balance.note') }}</p>
   </section>
 </template>
 

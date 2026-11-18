@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import {computed} from 'vue'
+import {useI18n} from 'vue-i18n'
 import type {ImageGenerationSettings} from '../../schemas/image-generation'
 import {getImageModelGuidance} from '../../schemas/image-model-guidance'
+import {createModelText} from '../utils/modelText'
 
 const props = withDefaults(defineProps<{
   modelId: string
@@ -9,26 +11,30 @@ const props = withDefaults(defineProps<{
   compact?: boolean
   context?: 'generation' | 'people' | 'pipeline'
 }>(), {compact: false, context: 'generation'})
+const i18n = useI18n()
+const {t} = i18n
+// Guidance prose is curated English in the shared schema; localize it here.
+const {modelText} = createModelText(i18n)
 const guidance = computed(() => getImageModelGuidance(props.modelId, props.settings))
 </script>
 
 <template>
-  <section v-if="guidance" class="model-guidance" :class="{'model-guidance--compact': compact}" :aria-label="`${guidance.modelName} guide`">
-    <p class="model-guidance-purpose">{{ guidance.purpose }}</p>
+  <section v-if="guidance" class="model-guidance" :class="{'model-guidance--compact': compact}" :aria-label="t('models.guidance.ariaLabel', {model: guidance.modelName})">
+    <p class="model-guidance-purpose">{{ modelText(guidance.purpose) }}</p>
     <div v-if="guidance.mask && context !== 'people'" class="model-guidance-mask">
-      <strong>{{ guidance.mask.title }}</strong>
-      <p>{{ guidance.mask.meaning }}</p>
+      <strong>{{ modelText(guidance.mask.title) }}</strong>
+      <p>{{ modelText(guidance.mask.meaning) }}</p>
     </div>
     <details :key="modelId" class="model-guidance-details">
-      <summary>How to use this model <span aria-hidden="true">+</span></summary>
+      <summary>{{ t('models.guidance.howToUse') }} <span aria-hidden="true">+</span></summary>
       <div class="model-guidance-body">
-        <div><strong>Sources and references</strong><p>{{ guidance.references }}</p></div>
-        <div v-if="guidance.mask && context !== 'people'"><strong>Preparing a mask</strong><p>{{ guidance.mask.preparation }}</p><p>{{ guidance.mask.example }}</p><p v-if="context === 'pipeline'">Connect the source to the image input and the prepared mask to Mask, or choose the mask in this step’s settings.</p></div>
-        <div v-else-if="guidance.mask && context === 'people'"><strong>Editing with a mask</strong><p>Masks guide a selected region of an existing picture. The People generator uses identity references without a separate mask. Use Edit or a pipeline when you need a masked edit.</p></div>
-        <div><strong>Transparent backgrounds</strong><p>{{ guidance.transparency }}</p></div>
-        <div v-if="guidance.settings"><strong>Choosing settings</strong><p>{{ guidance.settings }}</p></div>
-        <div><strong>Outputs and price</strong><p>{{ context === 'people' ? 'Variations creates separate jobs; the model’s image count adds outputs to each job. The People factory accepts at most 4 pictures per request. Final prices appear after they are confirmed.' : guidance.output }}</p></div>
-        <div v-if="context !== 'people'"><strong>Example prompt</strong><p class="model-guidance-example">{{ guidance.promptExample }}</p></div>
+        <div><strong>{{ t('models.guidance.references') }}</strong><p>{{ modelText(guidance.references) }}</p></div>
+        <div v-if="guidance.mask && context !== 'people'"><strong>{{ t('models.guidance.preparingMask') }}</strong><p>{{ modelText(guidance.mask.preparation) }}</p><p>{{ modelText(guidance.mask.example) }}</p><p v-if="context === 'pipeline'">{{ t('models.guidance.pipelineMask') }}</p></div>
+        <div v-else-if="guidance.mask && context === 'people'"><strong>{{ t('models.guidance.editingWithMask') }}</strong><p>{{ t('models.guidance.peopleMask') }}</p></div>
+        <div><strong>{{ t('models.guidance.transparency') }}</strong><p>{{ modelText(guidance.transparency) }}</p></div>
+        <div v-if="guidance.settings"><strong>{{ t('models.guidance.settings') }}</strong><p>{{ modelText(guidance.settings) }}</p></div>
+        <div><strong>{{ t('models.guidance.output') }}</strong><p>{{ context === 'people' ? t('models.guidance.peopleOutput') : modelText(guidance.output) }}</p></div>
+        <div v-if="context !== 'people'"><strong>{{ t('models.guidance.examplePrompt') }}</strong><p class="model-guidance-example">{{ modelText(guidance.promptExample) }}</p></div>
       </div>
     </details>
   </section>

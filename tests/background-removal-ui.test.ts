@@ -7,6 +7,7 @@ import {compileScript, parse} from '@vue/compiler-sfc'
 import {renderToString} from '@vue/server-renderer'
 import {createRenderer, createSSRApp, h, nextTick, ref} from 'vue'
 import type {BackgroundRemovalJob} from '../schemas/background-removal.ts'
+import {i18nTestHelpersUrl} from './i18n-test-helpers.ts'
 
 const root = new URL('../', import.meta.url)
 const panelUrl = new URL('app/components/BackgroundRemovalPanel.vue', root).href
@@ -19,6 +20,7 @@ registerHooks({
     const {descriptor} = parse(source, {filename})
     const compiled = compileScript(descriptor, {id: filename, inlineTemplate: true})
     return {format: 'module', shortCircuit: true, source: stripTypeScriptTypes(`import {computed, ref, watch, onMounted, onBeforeUnmount} from 'vue';
+      import {useI18n} from '${i18nTestHelpersUrl}';
       const useAccount = () => globalThis.${key}.account;
       const useRequestFetch = () => (...args) => globalThis.${key}.fetch(...args);
       ${compiled.content}`)}

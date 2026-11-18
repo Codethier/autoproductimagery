@@ -11,6 +11,11 @@ import { imageDownloadUrl, imagePreviewUrl } from "../utils/imageDelivery";
 import { formatUsd } from "../utils/generationPrice";
 import { pipelineNodeIcon } from "../utils/pipelineTemplates";
 import { pipelineJobRerunBlockedReason, pipelineRerunUsesCredit } from "../utils/pipelineCredit";
+import {
+  pipelineNodeTypeKey,
+  pipelineRerunReasonText,
+  pipelineStatusLabel,
+} from "../utils/pipelineEditor";
 const props = defineProps<{
   run: PipelineRunDTO;
   busy?: boolean;
@@ -26,6 +31,7 @@ const emit = defineEmits<{
   close: [];
   refresh: [];
 }>();
+const { t } = useI18n();
 const expandedItems = ref(new Set<string>());
 const retryIds = ref<string[]>([]);
 const retryOpen = ref(false);
@@ -79,17 +85,15 @@ const retryable = computed(() =>
       .map((step) => ({ ...step, itemIndex: item.index })),
   ),
 );
-const stateLabels: Record<string, string> = {
-  queued: "Queued",
-  running: "Running",
-  "awaiting-price": "Awaiting exact price",
-  succeeded: "Complete",
-  partial: "Partly complete",
-  failed: "Failed",
-  cancelled: "Cancelled",
-  interrupted: "Interrupted",
-  skipped: "Skipped",
-};
+const stateLabel = (value: string) => pipelineStatusLabel(t, value);
+const count = (key: string, value: number, params: Record<string, unknown> = {}) =>
+  t(`pipelineEditor.results.${key}${value === 1 ? "One" : "Other"}`, { count: value, ...params });
+function stepName(step: { nodeId: string; type: PipelineRunStepDTO["type"] }) {
+  return (
+    props.run.definition.nodes.find((node) => node.id === step.nodeId)?.label ||
+    t(`${pipelineNodeTypeKey(step.type)}.name`)
+  );
+}
 function visibleImage(image: PipelineImageValue) {
   return (
     ImagePathSchema.safeParse(image.url).success &&
@@ -98,9 +102,9 @@ function visibleImage(image: PipelineImageValue) {
 }
 function imagePrice(image: PipelineImageValue) {
   if (image.priceSource === "local-processing")
-    return "$0.00 · local processing";
+    return t("pipelineEditor.results.localPrice");
   return hasConfirmedGenerationPrice(image)
-    ? `${formatUsd(image.priceUsd)} · confirmed`
+    ? t("pipelineEditor.results.confirmedPrice", { price: formatUsd(image.priceUsd) })
     : "";
 }
 function stepFor(item: PipelineRunDTO["items"][number], id: string) {
@@ -113,7 +117,7 @@ function orderedItemSteps(item: PipelineRunDTO["items"][number]) {
   });
 }
 function rerunReason(item: PipelineRunDTO["items"][number]) {
-  return pipelineJobRerunBlockedReason(props.run, item.id);
+  return pipelineRerunReasonText(t, pipelineJobRerunBlockedReason(props.run, item.id));
 }
 function itemStepFingerprint(item: PipelineRunDTO["items"][number]) {
   return item.steps.map(step => step.id).join(",");
@@ -132,7 +136,7 @@ watch(() => props.busy, busy => {
   if (!busy) submittedItems.value = new Map();
 });
 function status(step?: PipelineRunStepDTO) {
-  return step ? (stateLabels[step.status] ?? step.status) : "Not in this run";
+  return pipelineStatusLabel(t, step?.status);
 }
 function toggleItem(id: string) {
   const next = new Set(expandedItems.value);
@@ -168,19 +172,19 @@ watch(
   <section class="pipeline-run-results" aria-labelledby="pipeline-run-title">
     <header>
       <div>
-        <span class="pipeline-eyebrow"
-          >Saved run · revision {{ run.revision }}</span
-        >
+        <span class="pipeline-eyebrow">{{
+          t("pipelineEditor.results.savedRun", { revision: run.revision })
+        }}</span>
         <h2 id="pipeline-run-title">{{ run.name }}</h2>
         <p>
-          {{ run.summary.succeeded }} / {{ run.summary.total }} inputs complete
-          <span>· {{ stateLabels[run.status] || run.status }}</span>
+          {{ t("pipelineEditor.results.inputsComplete", { succeeded: run.summary.succeeded, total: run.summary.total }) }}
+          <span>· {{ stateLabel(run.status) }}</span>
         </p>
       </div>
       <button
         type="button"
         class="pipeline-icon"
-        aria-label="Close run results"
+        :aria-label="t('pipelineEditor.results.close')"
         @click="emit('close')"
       >
         <UIcon name="i-lucide-x" />
@@ -188,28 +192,24 @@ watch(
     </header>
     <div class="pipeline-run-summary">
       <div>
-        <small>Confirmed cost</small
+        <small>{{ t("pipelineEditor.results.confirmedCost") }}</small
         ><strong>{{
           formatUsd(run.summary.confirmedCostUsd) || "$0.00"
         }}</strong>
       </div>
       <div>
-        <small>Outstanding</small
-        ><strong
-          >{{ run.summary.outstandingCount }} unpriced step{{
-            run.summary.outstandingCount === 1 ? "" : "s"
-          }}</strong
-        >
+        <small>{{ t("pipelineEditor.results.outstanding") }}</small
+        ><strong>{{ count("unpriced", run.summary.outstandingCount) }}</strong>
       </div>
       <div>
-        <small>Inputs</small><strong>{{ run.summary.total }} pictures</strong>
+        <small>{{ t("pipelineEditor.results.inputs") }}</small
+        ><strong>{{ count("pictures", run.summary.total) }}</strong>
       </div>
       <div>
-        <small>Progress</small
-        ><strong
-          >{{ run.summary.failed }} failed ·
-          {{ run.summary.pending }} pending</strong
-        >
+        <small>{{ t("pipelineEditor.results.progress") }}</small
+        ><strong>{{
+          t("pipelineEditor.results.progressValue", { failed: run.summary.failed, pending: run.summary.pending })
+        }}</strong>
       </div>
     </div>
     <div class="pipeline-run-actions">
@@ -217,9 +217,8 @@ watch(
         v-if="zipAvailable"
         class="pipeline-secondary"
         :href="`/api/pipeline-runs/${run.id}/download`"
-        ><UIcon name="i-lucide-folder-down" />Download all ·
-        {{ finalImages.length }} picture{{
-          finalImages.length === 1 ? "" : "s"
+        ><UIcon name="i-lucide-folder-down" />{{
+          count("downloadAll", finalImages.length)
         }}</a
       >
       <button
@@ -228,7 +227,7 @@ watch(
         class="pipeline-primary"
         @click="emit('resume')"
       >
-        <UIcon name="i-lucide-eye" />Watch progress</button
+        <UIcon name="i-lucide-eye" />{{ t("pipelineEditor.results.watchProgress") }}</button
       ><button
         v-if="active"
         type="button"
@@ -238,8 +237,8 @@ watch(
       >
         <UIcon name="i-lucide-square" />{{
           run.cancelRequested
-            ? "Cancellation requested"
-            : "Cancel remaining work"
+            ? t("pipelineEditor.results.cancellationRequested")
+            : t("pipelineEditor.results.cancelRemaining")
         }}</button
       ><button
         v-if="retryable.length"
@@ -248,44 +247,42 @@ watch(
         :disabled="busy"
         @click="openRetry"
       >
-        <UIcon name="i-lucide-rotate-ccw" />Retry failed steps</button
+        <UIcon name="i-lucide-rotate-ccw" />{{ t("pipelineEditor.results.retryFailed") }}</button
       ><button
         type="button"
         class="pipeline-secondary"
         :disabled="busy"
         @click="emit('refresh')"
       >
-        <UIcon name="i-lucide-refresh-cw" />Refresh progress</button
+        <UIcon name="i-lucide-refresh-cw" />{{ t("pipelineEditor.results.refreshProgress") }}</button
       ><span v-if="busy" class="pipeline-run-working" role="status"
-        ><UIcon name="i-lucide-loader-circle" />Updating this run…</span
+        ><UIcon name="i-lucide-loader-circle" />{{ t("pipelineEditor.results.updating") }}</span
       >
     </div>
     <p v-if="notice" class="pipeline-run-notice" role="status">{{ notice }}</p>
-    <p v-else-if="run.status === 'queued' && !run.cancelRequested" class="pipeline-run-notice" role="status">Your run is saved in the queue. Processing may take a little longer to start after being idle; you can close this page and check it later.</p>
+    <p v-else-if="run.status === 'queued' && !run.cancelRequested" class="pipeline-run-notice" role="status">{{ t("pipelineEditor.results.queuedNotice") }}</p>
     <p v-if="error" class="pipeline-run-error" role="alert">{{ error }}</p>
     <p v-if="paused && active" class="pipeline-run-notice" role="status">
-      Background work continues. Watch progress to resume updates here. You can
-      close this panel or leave the page.
+      {{ t("pipelineEditor.results.pausedNotice") }}
     </p>
     <p
       v-if="run.status === 'awaiting-price'"
       class="pipeline-run-notice"
       role="status"
     >
-      Generated pictures appear and continue through the pipeline once Gateway
-      confirms their exact prices.
+      {{ t("pipelineEditor.results.awaitingPriceNotice") }}
     </p>
     <div
       class="pipeline-run-table"
       role="region"
-      aria-label="Batch progress by input and step"
+      :aria-label="t('pipelineEditor.results.tableLabel')"
       tabindex="0"
     >
       <div
         class="pipeline-run-columns"
         :style="{ '--pipeline-columns': steps.length }"
       >
-        <div>Batch input</div>
+        <div>{{ t("pipelineEditor.results.batchInput") }}</div>
         <div v-for="node in steps" :key="node.id">
           <UIcon :name="pipelineNodeIcon(node.type)" /><span>{{
             node.label
@@ -314,14 +311,12 @@ watch(
                 ImagePathSchema.safeParse(item.inputUrl).success
               "
               :src="imagePreviewUrl(item.inputUrl, 160)"
-              alt="Batch input picture"
+              :alt="t('pipelineEditor.results.inputAlt')"
               loading="lazy"
               decoding="async"
             /><span
-              ><strong>Input {{ item.index + 1 }}</strong
-              ><small>{{
-                stateLabels[item.status] || item.status
-              }}</small></span
+              ><strong>{{ t("pipelineEditor.results.inputNumber", { number: item.index + 1 }) }}</strong
+              ><small>{{ stateLabel(item.status) }}</small></span
             ><UIcon
               :name="
                 expandedItems.has(item.id)
@@ -353,18 +348,18 @@ watch(
           <button
             type="button"
             class="pipeline-secondary"
-            :aria-label="`Rerun job for Input ${item.index + 1}`"
+            :aria-label="t('pipelineEditor.results.rerunAria', { number: item.index + 1 })"
             :disabled="busy || Boolean(rerunReason(item)) || rerunSubmitted(item)"
-            :title="rerunReason(item) || 'Repeat this input with the saved workflow and settings'"
+            :title="rerunReason(item) || t('pipelineEditor.results.rerunTitle')"
             @click="rerun(item)"
           >
-            <UIcon name="i-lucide-rotate-cw" />Rerun job
+            <UIcon name="i-lucide-rotate-cw" />{{ t("pipelineEditor.results.rerunJob") }}
           </button>
           <span v-if="rerunReason(item)">{{ rerunReason(item) }}</span>
           <span v-else>
-            Repeats this input with the saved workflow and settings.
-            {{ pipelineRerunUsesCredit(run, item.id) ? 'AI steps create new charges.' : 'Local steps have no provider charge.' }}
-            Previous pictures stay in Assets; displayed results are replaced.
+            {{ t("pipelineEditor.results.rerunRepeats") }}
+            {{ pipelineRerunUsesCredit(run, item.id) ? t("pipelineEditor.results.rerunAiCharges") : t("pipelineEditor.results.rerunLocalFree") }}
+            {{ t("pipelineEditor.results.rerunReplaced") }}
           </span>
         </div>
         <div
@@ -383,10 +378,7 @@ watch(
             class="pipeline-step-detail"
           >
             <h3>
-              <UIcon :name="pipelineNodeIcon(step.type)" />{{
-                run.definition.nodes.find((node) => node.id === step.nodeId)
-                  ?.label || step.type
-              }}
+              <UIcon :name="pipelineNodeIcon(step.type)" />{{ stepName(step) }}
             </h3>
             <p v-if="step.error" class="pipeline-step-error" role="status">
               {{ step.error.message }}
@@ -413,7 +405,7 @@ watch(
                   <strong>{{ image.name }}</strong
                   ><span v-if="imagePrice(image)">{{ imagePrice(image) }}</span
                   ><small v-if="image.width && image.height"
-                    >{{ image.width }} × {{ image.height }} px<span
+                    >{{ t("pipelineEditor.results.dimensions", { width: image.width, height: image.height }) }}<span
                       v-if="image.mimeType"
                     >
                       ·
@@ -422,10 +414,10 @@ watch(
                       }}</span
                     ></small
                   ><a :href="imageDownloadUrl(image.url)" :download="image.name"
-                    ><UIcon name="i-lucide-download" />Download original</a
+                    ><UIcon name="i-lucide-download" />{{ t("pipelineEditor.results.downloadOriginal") }}</a
                   ><NuxtLink
                     :to="{ path: '/edit', query: { source: image.url } }"
-                    >Use in Edit<UIcon name="i-lucide-arrow-up-right"
+                    >{{ t("pipelineEditor.results.useInEdit") }}<UIcon name="i-lucide-arrow-up-right"
                   /></NuxtLink>
                 </div>
               </article>
@@ -442,19 +434,16 @@ watch(
             "
             class="pipeline-run-notice"
           >
-            No confirmed results yet.
+            {{ t("pipelineEditor.results.noResults") }}
           </p>
         </div>
       </article>
     </div>
     <p class="pipeline-run-footnote">
-      Each input has its own steps and results. Runs continue after you close
-      the browser. Cancelling stops new work; accepted provider work may finish
-      and be charged. The saved run uses its original pipeline revision.
+      {{ t("pipelineEditor.results.footnote") }}
     </p>
     <p v-if="finalImages.length && !zipAvailable" class="pipeline-run-notice">
-      This collection exceeds the 200-picture or 256 MB archive limit. Use the
-      original downloads on individual cards.
+      {{ t("pipelineEditor.results.archiveLimit") }}
     </p>
     <div
       v-if="retryOpen"
@@ -469,35 +458,28 @@ watch(
         @keydown.esc.stop="retryOpen = false"
       >
         <header>
-          <h3 id="pipeline-retry-title">Retry failed steps</h3>
+          <h3 id="pipeline-retry-title">{{ t("pipelineEditor.results.retryTitle") }}</h3>
           <button
             type="button"
             class="pipeline-icon"
-            aria-label="Close retry dialog"
+            :aria-label="t('pipelineEditor.results.closeRetry')"
             @click="retryOpen = false"
           >
             <UIcon name="i-lucide-x" />
           </button>
         </header>
         <p>
-          Successful steps stay saved. Retrying a failed or interrupted AI step
-          can create another provider charge, including when an earlier call
-          completed without a saved response.
+          {{ t("pipelineEditor.results.retryWarning") }}
         </p>
         <label
           v-for="step in retryable"
           :key="step.id"
           class="pipeline-retry-option"
           ><input v-model="retryIds" type="checkbox" :value="step.id" /><span
-            >Input {{ step.itemIndex + 1 }} ·
-            {{
-              run.definition.nodes.find((node) => node.id === step.nodeId)
-                ?.label || step.type
-            }}<small>{{ step.error?.message }}</small></span
+            >{{ t("pipelineEditor.results.retryOption", { number: step.itemIndex + 1, step: stepName(step) }) }}<small>{{ step.error?.message }}</small></span
           ></label
         ><label class="pipeline-retry-confirm"
-          ><input v-model="chargeConfirmed" type="checkbox" />I understand that
-          retried AI work can incur another charge.</label
+          ><input v-model="chargeConfirmed" type="checkbox" />{{ t("pipelineEditor.results.retryConfirm") }}</label
         >
         <footer>
           <button
@@ -505,16 +487,14 @@ watch(
             class="pipeline-secondary"
             @click="retryOpen = false"
           >
-            Keep this run</button
+            {{ t("pipelineEditor.results.keepRun") }}</button
           ><button
             type="button"
             class="pipeline-primary"
             :disabled="!retryIds.length || !chargeConfirmed || busy"
             @click="retry"
           >
-            Retry {{ retryIds.length }} step{{
-              retryIds.length === 1 ? "" : "s"
-            }}
+            {{ count("retrySteps", retryIds.length) }}
           </button>
         </footer>
       </section>

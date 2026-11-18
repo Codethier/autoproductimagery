@@ -11,6 +11,7 @@ import {CATALOG_IMAGE_DEFINITIONS, CATALOG_IMAGE_MODEL_IDS} from '../schemas/cat
 import {BACKGROUND_REMOVAL_MODELS} from '../schemas/background-removal-models.ts'
 import {isNewImageModel, orderImageModels} from '../schemas/image-model-discovery.ts'
 import {createPipelineNode, type PipelineNode} from '../schemas/pipelines.ts'
+import {i18nTestHelpersUrl} from './i18n-test-helpers.ts'
 
 const transparentIds: readonly ImageModelId[] = ['openai/gpt-image-2.5-sunburst', 'openai/gpt-image-2.5-flare', 'openai/gpt-image-1.5', 'openai/gpt-image-1', 'openai/gpt-image-1-mini']
 const transparentSet = new Set(transparentIds)
@@ -56,6 +57,7 @@ const urls = {
   removal: new URL('app/components/BackgroundRemovalPanel.vue', root).href,
 }
 const favouriteUrl = new URL('app/composables/useImageModelFavourites.ts', root).href
+const modelTextUrl = new URL('app/composables/useModelText.ts', root).href
 const settingsDirectory = new URL('app/components/generation-settings/', root).href
 const exposures: Record<string, string> = {
   [urls.form]: 'data,modelOptions,selectedModelValue,selectedProfile',
@@ -72,6 +74,7 @@ registerHooks({
     return next(specifier, context)
   },
   load(url, context, next) {
+    if (url === modelTextUrl) return {format: 'module', shortCircuit: true, source: `import {createModelText} from '${new URL('app/utils/modelText.ts', root).href}';import {useI18n} from '${i18nTestHelpersUrl}';export const useModelText=()=>createModelText(useI18n());`}
     if (url === favouriteUrl) return {format: 'module', shortCircuit: true, source: `export const useImageModelFavourites=()=>globalThis.${key}.favourites;`}
     if ((exposures[url] || url.startsWith(settingsDirectory)) && url.endsWith('.vue')) {
       const filename = fileURLToPath(url)
@@ -81,6 +84,7 @@ registerHooks({
       const compiled = compileScript(descriptor, {id: filename, inlineTemplate: true, templateOptions: {compilerOptions: {hoistStatic: false}}})
       return {format: 'module', shortCircuit: true, source: stripTypeScriptTypes(`
         import {computed,ref,watch,toRef,toRaw,onMounted,onBeforeUnmount,onServerPrefetch,nextTick} from 'vue';
+        import {useI18n} from '${i18nTestHelpersUrl}';
         const useDataStore=()=>globalThis.${key}.store;
         const useAccount=()=>globalThis.${key}.account;
         const useAccountBalance=()=>globalThis.${key}.balance;
@@ -136,7 +140,7 @@ function primitives(app: ReturnType<typeof createSSRApp>) {
   app.component('UCheckbox', {props: ['label'], setup: (props: any) => () => h('label', [h('input', {type: 'checkbox'}), props.label])})
   app.component('USelect', {props: ['items'], setup: (props: any, {slots}: any) => () => h('div', {'data-model-options': true}, props.items.map((item: any) => h('div', {'data-model-id': item.value}, [item.label, slots['item-trailing']?.({item})])))})
   app.component('NuxtErrorBoundary', {setup: (_: unknown, {slots}: any) => () => slots.default?.()})
-  for (const name of ['UModal', 'AssetBrowser', 'PeopleBrowser', 'BackgroundRemovalPanel', 'system-promp']) app.component(name, {render: () => null})
+  for (const name of ['UModal', 'AssetBrowser', 'PeopleBrowser', 'BackgroundRemovalPanel', 'system-promp', 'SaveFormatSetting']) app.component(name, {render: () => null})
 }
 async function component(surface: Surface, env: ReturnType<typeof environment>) {
   ;(globalThis as any)[key] = env

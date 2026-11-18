@@ -276,6 +276,17 @@ export const ImagePathSchema = z.string()
   .refine(value => !/(^|[/\\])\.\.([/\\]|$)/.test(value), 'Parent path segments are not allowed.')
   .refine(value => !/[\0\r\n]/.test(value), 'Invalid image path.')
 
+/**
+ * How a returned image is stored. `webp` (the default) converts every decoded
+ * raster output to high-quality WebP, even when the provider returned PNG or
+ * JPEG; `png` converts to lossless PNG; `original` stores the exact provider
+ * bytes. Alpha is preserved by both conversions. This is a storage choice,
+ * kept separate from model-specific output-format settings.
+ */
+export const ImageSaveFormatSchema = z.enum(['webp', 'png', 'original'])
+export type ImageSaveFormat = z.infer<typeof ImageSaveFormatSchema>
+export const DEFAULT_IMAGE_SAVE_FORMAT: ImageSaveFormat = 'webp'
+
 export const StoredGenerationConfigSchema = z.object({
   schemaVersion: z.literal(1),
   profileVersion: z.number().int().positive(),
@@ -284,6 +295,8 @@ export const StoredGenerationConfigSchema = z.object({
   settings: ImageGenerationSettingsSchema,
   maskImage: ImagePathSchema.optional(),
   storeInputImages: z.boolean(),
+  // Absent on generations created before storage conversion; those kept the provider bytes.
+  saveFormat: ImageSaveFormatSchema.optional(),
 }).strict()
 export type StoredGenerationConfig = z.infer<typeof StoredGenerationConfigSchema>
 
@@ -292,6 +305,9 @@ export const OutputMetadataSchema = z.object({
   bytes: z.number().int().nonnegative(),
   width: z.number().int().positive().optional(),
   height: z.number().int().positive().optional(),
+  // The provider's decoded MIME type and size when storage converted the image.
+  providerMimeType: z.string().min(1).optional(),
+  providerBytes: z.number().int().nonnegative().optional(),
   responseText: z.string().optional(),
   reasoningText: z.string().optional(),
   warnings: z.array(z.string()).default([]),
@@ -323,6 +339,7 @@ export const ImageGenerationRequestSchema = z.object({
   modelImages: z.array(ImagePathSchema).max(16).default([]),
   maskImage: ImagePathSchema.optional(),
   storeInputImages: z.boolean().default(true),
+  saveFormat: ImageSaveFormatSchema.default(DEFAULT_IMAGE_SAVE_FORMAT),
   parentSystemPromptId: z.number().int().positive().optional(),
   personId: z.string().uuid().optional(),
   personPictureCount: z.number().int().min(1).max(4).optional(),

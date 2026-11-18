@@ -6,7 +6,8 @@ const initialPath = computed(() => typeof route.query.folder === 'string' && rou
 function onNavigate(path: string) {
   void router.replace({path: '/assets', query: path === '/' ? {} : {folder: path}})
 }
-useHead({title: 'Library · Product Imagery'})
+const {t} = useI18n()
+useHead({title: computed(() => t('library.pageTitle'))})
 </script>
 
 <template>

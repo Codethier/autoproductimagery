@@ -1,3 +1,5 @@
+import type { PipelineNode, PipelineNodeType } from "../../schemas/pipelines";
+import type { PipelineTranslate } from "./pipelineTemplates";
 /** Canvas geometry and history stay independent of the provider adapters. */
 export type CanvasPoint = { x: number; y: number };
 export type CanvasView = { x: number; y: number; zoom: number };
@@ -162,4 +164,142 @@ export function createPipelineHistory<T>(initial: T) {
       return values.length;
     },
   };
+}
+
+/**
+ * Localizable display copy. Plain utilities stay free of vue-i18n: they return
+ * `pipelineEditor.*` message keys and parameters, or user-entered text that is
+ * shown verbatim. Components translate with `pipelineMessageText`.
+ */
+export type PipelineMessage =
+  | { key: string; params?: Record<string, unknown> }
+  | { text: string };
+export function pipelineMessageText(
+  t: PipelineTranslate,
+  message: PipelineMessage,
+): string {
+  return "text" in message ? message.text : t(message.key, message.params ?? {});
+}
+/** `image-input` → `pipelineEditor.nodeTypes.imageInput`. */
+export function pipelineNodeTypeKey(type: PipelineNodeType): string {
+  return `pipelineEditor.nodeTypes.${type.replace(/-([a-z])/g, (_match, letter: string) => letter.toUpperCase())}`;
+}
+export type PipelinePaletteGroup =
+  | "inputs"
+  | "aiTools"
+  | "imageTools"
+  | "textTools"
+  | "finish";
+export const PIPELINE_NODE_GROUPS: Record<PipelineNodeType, PipelinePaletteGroup> = {
+  "image-input": "inputs",
+  "people-input": "inputs",
+  "text-input": "inputs",
+  "static-image": "inputs",
+  "static-text": "inputs",
+  "generate-image": "aiTools",
+  "describe-image": "aiTools",
+  "prompt-enhancer": "aiTools",
+  llm: "aiTools",
+  "remove-background": "imageTools",
+  upscale: "imageTools",
+  expand: "imageTools",
+  crop: "imageTools",
+  resize: "imageTools",
+  translate: "imageTools",
+  "prompt-concatenator": "textTools",
+  output: "finish",
+  "sticky-note": "finish",
+};
+const PORT_LABEL_KEYS: Record<string, string> = {
+  Image: "image",
+  Prompt: "prompt",
+  Text: "text",
+  References: "references",
+  Mask: "mask",
+  Output: "output",
+};
+/** Schema port labels are fixed English identifiers shared with the server. */
+export function pipelinePortLabel(
+  t: PipelineTranslate,
+  port: { label: string },
+): string {
+  const key = PORT_LABEL_KEYS[port.label];
+  return key ? t(`pipelineEditor.ports.${key}`) : port.label;
+}
+const STATUS_KEYS: Record<string, string> = {
+  queued: "queued",
+  running: "running",
+  "awaiting-price": "awaitingPrice",
+  succeeded: "succeeded",
+  partial: "partial",
+  failed: "failed",
+  cancelled: "cancelled",
+  interrupted: "interrupted",
+  skipped: "skipped",
+};
+export function pipelineStatusLabel(
+  t: PipelineTranslate,
+  status: string | undefined,
+): string {
+  if (!status) return t("pipelineEditor.status.notInRun");
+  const key = STATUS_KEYS[status];
+  return key ? t(`pipelineEditor.status.${key}`) : status;
+}
+/** Canvas card summary: user-entered text stays verbatim; fallbacks are keys. */
+export function pipelineNodeSummary(node: PipelineNode): PipelineMessage {
+  const summary = (key: string, params?: Record<string, unknown>) => ({
+    key: `pipelineEditor.nodeSummary.${key}`,
+    params,
+  });
+  if (node.type === "generate-image")
+    return node.config.prompt ? { text: node.config.prompt } : summary("generatePrompt");
+  if (node.type === "static-text")
+    return node.config.text ? { text: node.config.text } : summary("staticText");
+  if (node.type === "text-input")
+    return node.config.defaultValue ? { text: node.config.defaultValue } : summary("textInput");
+  if (node.type === "sticky-note")
+    return node.config.text ? { text: node.config.text } : summary("stickyNote");
+  if (node.type === "static-image") {
+    const count = node.config.images.length;
+    return summary(count === 1 ? "staticImagesOne" : "staticImagesOther", { count });
+  }
+  if (node.type === "people-input") {
+    const count = node.config.images.length;
+    return count
+      ? summary(count === 1 ? "peopleOne" : "peopleOther", { count })
+      : summary("peopleEmpty");
+  }
+  if (node.type === "image-input") return summary("imageInput");
+  if (node.type === "remove-background")
+    return summary("removeBackground", {
+      model: node.config.model === "birefnet-lite" ? "BiRefNet Lite" : "BiRefNet Full",
+    });
+  if (node.type === "crop" || node.type === "resize")
+    return summary("dimensions", { width: node.config.width, height: node.config.height });
+  if (node.type === "upscale")
+    return summary(node.config.mode === "ai" ? "upscaleAi" : "upscaleStandard", {
+      scale: node.config.scale,
+    });
+  if (node.type === "translate")
+    return summary("translate", { language: node.config.language });
+  if (node.type === "output")
+    return node.config.format === "original"
+      ? summary("outputOriginal")
+      : summary("outputFormat", { format: node.config.format.toUpperCase() });
+  return { key: `${pipelineNodeTypeKey(node.type)}.description` };
+}
+/** Exact English reasons from `pipelineJobRerunBlockedReason` map to keys. */
+const RERUN_REASON_KEYS: Array<[RegExp, string]> = [
+  [/^Only completed jobs can be rerun/, "notCompleted"],
+  [/^Wait for the remaining cancelled work/, "cancelling"],
+  [/^Wait for this job.s exact prices/, "pricePending"],
+  [/five-attempt limit/, "attemptLimit"],
+];
+export function pipelineRerunReasonText(
+  t: PipelineTranslate,
+  reason: string,
+): string {
+  if (!reason) return "";
+  const match = RERUN_REASON_KEYS.find(([pattern]) => pattern.test(reason));
+  return match ? t(`pipelineEditor.results.rerunBlocked.${match[1]}`) : reason;
 }

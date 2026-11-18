@@ -9,6 +9,7 @@ import { createRenderer, createSSRApp, h, nextTick, reactive, ref } from 'vue'
 import { IMAGE_MODEL_PROFILES, createDefaultSettings } from '../schemas/image-generation.ts'
 import type { PendingGeneration } from '../app/utils/generationComposer.ts'
 import {createGenerationCreditController, initialGenerationCreditState} from '../app/utils/generationCredit.ts'
+import {i18nTestHelpersUrl} from './i18n-test-helpers.ts'
 
 const root = new URL('../', import.meta.url)
 const formUrl = new URL('app/components/GeminiForm.vue', root).href
@@ -40,7 +41,7 @@ registerHooks({
         const refreshNuxtData = async () => {};
       ` : ''
       return { format: 'module', shortCircuit: true,
-        source: stripTypeScriptTypes(`import { computed, ref, watch, toRef, toRaw, onMounted, onBeforeUnmount } from 'vue';\n${nuxtServices}\n${compiled.content}`) }
+        source: stripTypeScriptTypes(`import { computed, ref, watch, toRef, toRaw, onMounted, onBeforeUnmount } from 'vue';\nimport { useI18n } from '${i18nTestHelpersUrl}';\n${nuxtServices}\n${compiled.content}`) }
     }
     return nextLoad(url, context)
   },
@@ -107,6 +108,7 @@ function registerUiPrimitives(app: ReturnType<typeof createSSRApp>) {
   app.component('AssetBrowser', { render: () => null })
   app.component('PeopleBrowser', { render: () => null })
   app.component('BackgroundRemovalPanel', { render: () => null })
+  app.component('SaveFormatSetting', { render: () => null })
   app.component('ModelGuidance', { props: ['modelId', 'settings', 'context'], setup: (props: any) => () => h('aside', {'data-model-guidance': props.modelId, 'data-guidance-kind': props.settings?.kind}) })
   // The parent must not mount result components until their exact prices exist.
   // A marked stub makes that boundary observable independently of the child's
@@ -526,7 +528,7 @@ test('navigation unmounts and remounts the editor without losing an in-flight re
     assert.equal(remounted.exposed.activeGenerationCount.value, 1)
     assert.equal(remounted.exposed.canSubmit.value, false)
     const text = (node: MemoryNode): string => node.text + node.children.map(text).join(' ')
-    assert.match(text(remounted.rootNode), /1 input jobs running/)
+    assert.match(text(remounted.rootNode), /1 input job running/)
     await remounted.exposed.submit()
     assert.equal(workspace.requests.length, 1, 'returning to either workspace must not start another paid call')
 

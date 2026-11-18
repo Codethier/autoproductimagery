@@ -354,3 +354,26 @@ test('a failed durable provider fence releases pending charges without starting 
   assert.equal(env.closeCount, 1)
   assert.ok(env.failures.every((value: any) => value.data.releaseCharge === true))
 })
+
+test('generated JPEG outputs are stored as WebP by default, PNG or JPEG only on request', async () => {
+  const sharp = (await import('sharp')).default
+  const jpeg = await sharp({create: {width: 20, height: 10, channels: 3, background: {r: 10, g: 120, b: 200}}}).jpeg().toBuffer()
+  for (const saveFormat of [undefined, 'webp', 'png', 'original'] as const) {
+    const env = setup()
+    if (saveFormat) env.body.saveFormat = saveFormat
+    env.outputs = [{buffer: Buffer.from(jpeg), mimeType: 'image/jpeg', billing: billed()}]
+    const response = await handler(event())
+    assert.equal(response.obj[0]!.status, 'succeeded')
+    const expected = saveFormat ?? 'webp'
+    assert.equal(env.saves[0].mimeType, {webp: 'image/webp', png: 'image/png', original: 'image/jpeg'}[expected])
+    assert.equal(env.pendingData[0].generationConfig.saveFormat, expected)
+    const metadata = env.completions[0].data.outputMetadata
+    if (expected !== 'original') {
+      assert.equal(metadata.providerMimeType, 'image/jpeg')
+      assert.equal(metadata.providerBytes, jpeg.byteLength)
+    } else {
+      assert.equal(metadata.providerMimeType, undefined)
+      assert.equal(env.saves[0].bytes, jpeg.byteLength)
+    }
+  }
+})

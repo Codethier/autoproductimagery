@@ -11,7 +11,6 @@ import { ImagePathSchema } from "../../schemas/image-generation";
 import { hasConfirmedGenerationPrice } from "../../schemas/generation-billing";
 import {
   PIPELINE_PALETTE,
-  pipelineNodeDescription,
   pipelineNodeIcon,
 } from "../utils/pipelineTemplates";
 import {
@@ -24,8 +23,15 @@ import {
   PIPELINE_PORT_SPACING,
   PIPELINE_PORT_TOP,
   zoomCanvas,
+  PIPELINE_NODE_GROUPS,
+  pipelineMessageText,
+  pipelineNodeSummary,
+  pipelineNodeTypeKey,
+  pipelinePortLabel,
+  pipelineStatusLabel,
   type CanvasView,
   type CanvasPoint,
+  type PipelineMessage,
 } from "../utils/pipelineEditor";
 import { imagePreviewUrl } from "../utils/imageDelivery";
 const props = defineProps<{
@@ -52,22 +58,39 @@ const emit = defineEmits<{
   "remove-edge": [id: string];
   run: [id: string];
 }>();
+const { t } = useI18n();
 const canvas = ref<HTMLElement>();
 const view = ref<CanvasView>({ x: 65, y: 65, zoom: 1 });
 const paletteOpen = ref(false);
 const paletteSearch = ref("");
 const pendingSource = ref<{ id: string; port: "image" | "text" } | null>(null);
 const draftPosition = ref<{ id: string; position: CanvasPoint } | null>(null);
-const announcement = ref("");
-const palette = computed(() =>
-  PIPELINE_PALETTE.filter((item) =>
-    `${item.group} ${item.description} ${item.type}`
-      .toLowerCase()
-      .includes(paletteSearch.value.toLowerCase()),
-  ),
+// Store the message key, not translated text, so a language switch re-renders it.
+const announcementMessage = ref<PipelineMessage | null>(null);
+const announcement = computed(() =>
+  announcementMessage.value ? pipelineMessageText(t, announcementMessage.value) : "",
 );
+function announce(key: string, params?: Record<string, unknown>) {
+  announcementMessage.value = { key: `pipelineEditor.canvas.announce.${key}`, params };
+}
+const typeName = (type: PipelineNodeType) => t(`${pipelineNodeTypeKey(type)}.name`);
+const typeDescription = (type: PipelineNodeType) =>
+  t(`${pipelineNodeTypeKey(type)}.description`);
+const groupName = (type: PipelineNodeType) =>
+  t(`pipelineEditor.paletteGroups.${PIPELINE_NODE_GROUPS[type]}`);
+const nodeSummary = (node: PipelineNode) =>
+  pipelineMessageText(t, pipelineNodeSummary(node));
+const portName = (port: { label: string }) => pipelinePortLabel(t, port);
+const palette = computed(() => {
+  const search = paletteSearch.value.toLowerCase();
+  return PIPELINE_PALETTE.filter((item) =>
+    `${groupName(item.type)} ${typeName(item.type)} ${typeDescription(item.type)} ${item.type}`
+      .toLowerCase()
+      .includes(search),
+  );
+});
 const groups = computed(() => [
-  ...new Set(palette.value.map((item) => item.group)),
+  ...new Set(palette.value.map((item) => PIPELINE_NODE_GROUPS[item.type])),
 ]);
 const mapBounds = computed(() =>
   minimapBounds(props.definition.nodes.map((node) => position(node))),
@@ -78,7 +101,7 @@ const selectedNode = computed(() =>
 const pendingSourceLabel = computed(
   () =>
     props.definition.nodes.find((node) => node.id === pendingSource.value?.id)
-      ?.label ?? "step",
+      ?.label ?? t("pipelineEditor.canvas.stepFallback"),
 );
 let drag: {
   id: string;
@@ -137,7 +160,7 @@ function add(type: PipelineNodeType) {
   emit("add", type, clampCanvasPoint(point));
   paletteOpen.value = false;
   paletteSearch.value = "";
-  announcement.value = `Added ${PIPELINE_PALETTE.find((value) => value.type === type)?.type.replaceAll("-", " ")}`;
+  announce("added", { name: typeName(type) });
 }
 function startMove(node: PipelineNode, event: PointerEvent) {
   if (props.disabled || event.button !== 0) return;
@@ -209,14 +232,14 @@ function moveKey(node: PipelineNode, event: KeyboardEvent) {
         y: node.position.y + direction.y,
       }),
     );
-    announcement.value = `Moved ${node.label}`;
+    announce("moved", { label: node.label });
   } else if (event.key === "Enter" || event.key === " ") {
     event.preventDefault();
     select(node.id);
   } else if (event.key === "Delete") {
     event.preventDefault();
     emit("disconnect-node", node.id);
-    announcement.value = `Disconnected ${node.label}`;
+    announce("disconnected", { label: node.label });
   }
 }
 function outputPort(node: PipelineNode, port: "image" | "text") {
@@ -225,16 +248,14 @@ function outputPort(node: PipelineNode, port: "image" | "text") {
     pendingSource.value?.id === node.id && pendingSource.value.port === port
       ? null
       : { id: node.id, port };
-  announcement.value = pendingSource.value
-    ? `Choose a compatible input for ${node.label}`
-    : "Connection cancelled";
+  if (pendingSource.value) announce("chooseInput", { label: node.label });
+  else announce("connectionCancelled");
 }
 function inputPort(node: PipelineNode, port: string) {
   if (props.disabled) return;
   if (!pendingSource.value) {
     select(node.id);
-    announcement.value =
-      "Choose a source in Connections or click an output first.";
+    announce("chooseSource");
     return;
   }
   emit(
@@ -333,7 +354,7 @@ defineExpose({ fit, view, paletteOpen, pendingSource, add });
       ref="canvas"
       class="pipeline-canvas"
       role="region"
-      aria-label="Pipeline node canvas"
+      :aria-label="t('pipelineEditor.canvas.regionLabel')"
       tabindex="0"
       :style="{
         '--pipeline-grid-size': `${28 * view.zoom}px`,
@@ -391,14 +412,14 @@ defineExpose({ fit, view, paletteOpen, pendingSource, add });
             left: `${position(node).x}px`,
             top: `${position(node).y}px`,
           }"
-          :aria-label="`${node.label}, ${node.type.replaceAll('-', ' ')}`"
+          :aria-label="t('pipelineEditor.canvas.nodeLabel', { label: node.label, type: typeName(node.type) })"
           @click.stop="select(node.id)"
         >
           <header
             class="pipeline-node-header"
             role="button"
             tabindex="0"
-            :aria-label="`Select or move ${node.label}. Arrow keys move; Shift moves farther. Delete disconnects.`"
+            :aria-label="t('pipelineEditor.canvas.moveNode', { label: node.label })"
             @pointerdown="startMove(node, $event)"
             @pointermove="move"
             @pointerup="endMove"
@@ -411,7 +432,7 @@ defineExpose({ fit, view, paletteOpen, pendingSource, add });
             ><UIcon name="i-lucide-grip" class="pipeline-node-grip" />
           </header>
           <p class="pipeline-node-description">
-            {{ pipelineNodeDescription(node) }}
+            {{ nodeSummary(node) }}
           </p>
           <div class="pipeline-node-ports">
             <div>
@@ -422,10 +443,10 @@ defineExpose({ fit, view, paletteOpen, pendingSource, add });
                 type="button"
                 :class="`pipeline-port-${port.type}`"
                 :disabled="disabled"
-                :aria-label="`Connect ${node.label} ${port.label} input`"
+                :aria-label="t('pipelineEditor.canvas.connectInput', { label: node.label, port: portName(port) })"
                 @click.stop="inputPort(node, port.id)"
               >
-                <i /><span>{{ port.label }}</span
+                <i /><span>{{ portName(port) }}</span
                 ><small v-if="port.required">*</small>
               </button>
             </div>
@@ -448,10 +469,10 @@ defineExpose({ fit, view, paletteOpen, pendingSource, add });
                   pendingSource?.id === node.id &&
                   pendingSource?.port === port.id
                 "
-                :aria-label="`Connect from ${node.label} ${port.label} output`"
+                :aria-label="t('pipelineEditor.canvas.connectOutput', { label: node.label, port: portName(port) })"
                 @click.stop="outputPort(node, port.id as 'image' | 'text')"
               >
-                <span>{{ port.label }}</span
+                <span>{{ portName(port) }}</span
                 ><i />
               </button>
             </div>
@@ -459,7 +480,7 @@ defineExpose({ fit, view, paletteOpen, pendingSource, add });
           <div v-if="image(node)" class="pipeline-node-preview">
             <img
               :src="imagePreviewUrl(image(node)!, 160)"
-              :alt="`${node.label} preview`"
+              :alt="t('pipelineEditor.canvas.previewAlt', { label: node.label })"
               loading="lazy"
               decoding="async"
             />
@@ -468,18 +489,18 @@ defineExpose({ fit, view, paletteOpen, pendingSource, add });
             <button
               type="button"
               :disabled="disabled"
-              :aria-label="`Run to ${node.label}`"
+              :aria-label="t('pipelineEditor.canvas.runTo', { label: node.label })"
               @click.stop="emit('run', node.id)"
             >
-              <UIcon name="i-lucide-play" />Run step</button
+              <UIcon name="i-lucide-play" />{{ t("pipelineEditor.canvas.runStep") }}</button
             ><span v-if="stepState(node)" class="pipeline-node-state">{{
-              stepState(node)?.replaceAll("-", " ")
+              pipelineStatusLabel(t, stepState(node))
             }}</span
             ><button
               class="pipeline-node-delete"
               type="button"
               :disabled="disabled"
-              :aria-label="`Delete ${node.label}`"
+              :aria-label="t('pipelineEditor.canvas.deleteNode', { label: node.label })"
               @click.stop="emit('remove', node.id)"
             >
               <UIcon name="i-lucide-trash-2" />
@@ -497,23 +518,21 @@ defineExpose({ fit, view, paletteOpen, pendingSource, add });
         aria-controls="pipeline-node-palette"
         @click="paletteOpen = !paletteOpen"
       >
-        <UIcon name="i-lucide-plus" />Add step</button
-      ><span class="pipeline-canvas-hint"
-        >Connect an output dot to an input · drag the background to pan</span
-      >
+        <UIcon name="i-lucide-plus" />{{ t("pipelineEditor.canvas.addStep") }}</button
+      ><span class="pipeline-canvas-hint">{{ t("pipelineEditor.canvas.hint") }}</span>
     </div>
     <aside
       v-if="paletteOpen"
       id="pipeline-node-palette"
       class="pipeline-node-palette"
-      aria-label="Add a pipeline step"
+      :aria-label="t('pipelineEditor.canvas.paletteLabel')"
     >
       <header>
-        <strong>Choose a step</strong
+        <strong>{{ t("pipelineEditor.canvas.chooseStep") }}</strong
         ><button
           type="button"
           class="pipeline-icon"
-          aria-label="Close step palette"
+          :aria-label="t('pipelineEditor.canvas.closePalette')"
           @click="paletteOpen = false"
         >
           <UIcon name="i-lucide-x" />
@@ -522,62 +541,55 @@ defineExpose({ fit, view, paletteOpen, pendingSource, add });
       <input
         v-model="paletteSearch"
         class="pipeline-palette-search"
-        placeholder="Search tools…"
-        aria-label="Search pipeline steps"
+        :placeholder="t('pipelineEditor.canvas.searchPlaceholder')"
+        :aria-label="t('pipelineEditor.canvas.searchLabel')"
       />
       <section v-for="group in groups" :key="group">
-        <h3>{{ group }}</h3>
+        <h3>{{ t(`pipelineEditor.paletteGroups.${group}`) }}</h3>
         <button
-          v-for="item in palette.filter((value) => value.group === group)"
+          v-for="item in palette.filter((value) => PIPELINE_NODE_GROUPS[value.type] === group)"
           :key="item.type"
           type="button"
           @click="add(item.type)"
         >
           <UIcon :name="item.icon" /><span
-            ><strong>{{
-              item.type === "llm"
-                ? "LLM"
-                : item.type
-                    .split("-")
-                    .map((word) => word[0]!.toUpperCase() + word.slice(1))
-                    .join(" ")
-            }}</strong
-            ><small>{{ item.description }}</small></span
+            ><strong>{{ typeName(item.type) }}</strong
+            ><small>{{ typeDescription(item.type) }}</small></span
           >
         </button>
       </section>
-      <p v-if="!palette.length">No matching tools.</p>
+      <p v-if="!palette.length">{{ t("pipelineEditor.canvas.noMatches") }}</p>
     </aside>
     <div v-if="pendingSource" class="pipeline-connection-notice" role="status">
-      Connecting {{ pendingSourceLabel }}. Choose an input dot.<button
+      {{ t("pipelineEditor.canvas.connecting", { label: pendingSourceLabel }) }}<button
         type="button"
         @click="pendingSource = null"
       >
-        Cancel
+        {{ t("common.actions.cancel") }}
       </button>
     </div>
     <div v-if="selectedEdgeId" class="pipeline-edge-tools">
-      <span>Connection selected</span
+      <span>{{ t("pipelineEditor.canvas.connectionSelected") }}</span
       ><button
         type="button"
         :disabled="disabled"
         @click="emit('remove-edge', selectedEdgeId!)"
       >
-        <UIcon name="i-lucide-unplug" />Remove
+        <UIcon name="i-lucide-unplug" />{{ t("common.actions.remove") }}
       </button>
     </div>
     <div class="pipeline-canvas-bottom">
       <div class="pipeline-canvas-controls">
-        <button type="button" aria-label="Zoom out" @click="zoom(-0.1)">
+        <button type="button" :aria-label="t('pipelineEditor.canvas.zoomOut')" @click="zoom(-0.1)">
           <UIcon name="i-lucide-minus" /></button
         ><span>{{ Math.round(view.zoom * 100) }}%</span
-        ><button type="button" aria-label="Zoom in" @click="zoom(0.1)">
+        ><button type="button" :aria-label="t('pipelineEditor.canvas.zoomIn')" @click="zoom(0.1)">
           <UIcon name="i-lucide-plus" /></button
-        ><button type="button" aria-label="Fit pipeline to canvas" @click="fit">
+        ><button type="button" :aria-label="t('pipelineEditor.canvas.fit')" @click="fit">
           <UIcon name="i-lucide-expand" /></button
         ><button
           type="button"
-          aria-label="Reset canvas zoom"
+          :aria-label="t('pipelineEditor.canvas.resetZoom')"
           @click="view = { x: 65, y: 65, zoom: 1 }"
         >
           <UIcon name="i-lucide-locate-fixed" />
@@ -588,7 +600,7 @@ defineExpose({ fit, view, paletteOpen, pendingSource, add });
         class="pipeline-minimap"
         :viewBox="`${mapBounds.left} ${mapBounds.top} ${mapBounds.width} ${mapBounds.height}`"
         role="img"
-        aria-label="Pipeline overview"
+        :aria-label="t('pipelineEditor.canvas.overview')"
       >
         <rect
           v-for="node in definition.nodes"
@@ -611,15 +623,15 @@ defineExpose({ fit, view, paletteOpen, pendingSource, add });
     <p class="pipeline-sr-only" aria-live="polite">{{ announcement }}</p>
     <div v-if="!definition.nodes.length" class="pipeline-empty-canvas">
       <UIcon name="i-lucide-workflow" />
-      <h2>A blank canvas, a repeatable process</h2>
-      <p>Add an input and connect it to your first tool.</p>
+      <h2>{{ t("pipelineEditor.canvas.emptyTitle") }}</h2>
+      <p>{{ t("pipelineEditor.canvas.emptyText") }}</p>
       <button
         type="button"
         class="pipeline-add-step"
         :disabled="disabled"
         @click="paletteOpen = true"
       >
-        Add your first step
+        {{ t("pipelineEditor.canvas.addFirstStep") }}
       </button>
     </div>
   </div>

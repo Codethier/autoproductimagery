@@ -19,12 +19,18 @@ import {
   pipelineNodeDescription,
   pipelineNodeIcon,
 } from "../app/utils/pipelineTemplates.ts";
+import {i18nTestHelpersUrl} from "./i18n-test-helpers.ts";
 
 const root = new URL("../", import.meta.url);
 const properties = new URL("app/components/PipelineNodeProperties.vue", root).href;
 const favourites = new URL("app/composables/useImageModelFavourites.ts", root).href;
+const modelTextUrl = new URL("app/composables/useModelText.ts", root).href;
 registerHooks({
   load(url, context, next) {
+    if (url === modelTextUrl) return {
+      format: "module", shortCircuit: true,
+      source: `import {createModelText} from '${new URL("app/utils/modelText.ts", root).href}';import {useI18n} from '${i18nTestHelpersUrl}';export const useModelText=()=>createModelText(useI18n());`,
+    };
     if (url === favourites) return {
       format: "module", shortCircuit: true,
       source: `import {computed,ref} from 'vue';export const useImageModelFavourites=()=>({favouriteModelIds:ref([]),favouriteSet:computed(()=>new Set()),ready:ref(true),toggleFavourite(){}});`,
@@ -35,7 +41,7 @@ registerHooks({
       const filename = fileURLToPath(url);
       const {descriptor} = parse(readFileSync(filename, "utf8"), {filename});
       const compiled = compileScript(descriptor, {id: filename, inlineTemplate: true});
-      return {format: "module", shortCircuit: true, source: stripTypeScriptTypes(`import {computed,ref,watch} from 'vue';${compiled.content}`)};
+      return {format: "module", shortCircuit: true, source: stripTypeScriptTypes(`import {computed,ref,watch} from 'vue';import {useI18n} from '${i18nTestHelpersUrl}';${compiled.content}`)};
     }
     return next(url, context);
   },
@@ -55,6 +61,7 @@ function registerComponents(app: any) {
   app.component("UIcon", {props: ["name"], setup: (props: any) => () => h("span", {"data-icon": props.name})});
   app.component("NuxtErrorBoundary", {setup: (_props: unknown, {slots}: any) => () => slots.default?.()});
   app.component("ModelGuidance", {props: ["modelId", "settings", "context"], setup: (props: any) => () => h("aside", {"data-model-guidance": props.modelId})});
+  app.component("SaveFormatSetting", {setup: () => () => null});
 }
 type MemoryNode = {tag: string; text: string; children: MemoryNode[]; parent: MemoryNode | null; props: Record<string, any>};
 function memoryNode(tag: string, text = ""): MemoryNode { return {tag, text, children: [], parent: null, props: {}}; }

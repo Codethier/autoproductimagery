@@ -169,7 +169,8 @@ export function createPipelineExecutor(actor: PipelineActor, repository = create
         }
         references = [...new Set(references)]
         const candidate = ImageGenerationRequestSchema.safeParse({model: node.config.model, settings: node.config.settings, prompt,
-            inputImages: sources.map(image => image.url), modelImages: references, maskImage, storeInputImages: true})
+            inputImages: sources.map(image => image.url), modelImages: references, maskImage, storeInputImages: true,
+            saveFormat: node.config.saveFormat})
         if (!candidate.success) invalid('The connected images, prompt, mask, or settings exceed the selected model limits')
         signal.throwIfAborted()
         await (options.generate ?? runAccountImageGeneration)(actor as AuthContext, candidate.data!, {pipelineStepId: claim.step.id, runtimeConfig: runtimeConfig(), signal,

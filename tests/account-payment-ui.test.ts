@@ -9,6 +9,7 @@ import {createRenderer, createSSRApp, effectScope, h, nextTick, ref} from 'vue'
 import type {AccountBalance} from '../schemas/account-billing.ts'
 import type {AccountPaymentEvent, AccountPaymentList} from '../schemas/account-payments.ts'
 import {mergeAccountPaymentEvents} from '../app/utils/accountPaymentEvents.ts'
+import {i18nTestHelpersUrl} from './i18n-test-helpers.ts'
 
 const root = new URL('../', import.meta.url)
 const key = '__accountPaymentUi'
@@ -24,7 +25,7 @@ registerHooks({
   load(url, context, next) {
     if (url === hookUrl) {
       const source = readFileSync(fileURLToPath(url), 'utf8')
-      return {format: 'module', shortCircuit: true, source: stripTypeScriptTypes(`import {computed,ref,watch} from 'vue';const useAccount=()=>globalThis.${key}.session;const useRequestFetch=()=>{const env=globalThis.${key};return (...args)=>env.fetch(...args)};${source}`)}
+      return {format: 'module', shortCircuit: true, source: stripTypeScriptTypes(`import {computed,ref,watch} from 'vue';import {useI18n} from '${i18nTestHelpersUrl}';const useAccount=()=>globalThis.${key}.session;const useRequestFetch=()=>{const env=globalThis.${key};return (...args)=>env.fetch(...args)};${source}`)}
     }
     if (url !== historyUrl && url !== balanceUrl && url !== teamUrl) return next(url, context)
     const filename = fileURLToPath(url)
@@ -34,7 +35,7 @@ registerHooks({
     const {descriptor} = parse(source, {filename})
     const compiled = compileScript(descriptor, {id: filename, inlineTemplate: true})
     const services = `const useAccount=()=>globalThis.${key}.session;const useAccountBalance=()=>({refresh:async()=>{}});const useFetch=()=>({data:ref({users:[],total:0}),status:ref('success'),error:ref(null),refresh:async()=>{}});const useToast=()=>({add:()=>{}});const definePageMeta=()=>{};const useHead=()=>{};const $fetch=(...args)=>globalThis.${key}.fetch(...args);`
-    return {format: 'module', shortCircuit: true, source: stripTypeScriptTypes(`import {ref,reactive,watch,toRef,nextTick,onMounted,onBeforeUnmount,onServerPrefetch} from 'vue';import {useAccountPayments} from '${hookUrl}';${services}${compiled.content}`)}
+    return {format: 'module', shortCircuit: true, source: stripTypeScriptTypes(`import {ref,reactive,computed,watch,toRef,nextTick,onMounted,onBeforeUnmount,onServerPrefetch} from 'vue';import {useI18n} from '${i18nTestHelpersUrl}';import {useAccountPayments} from '${hookUrl}';${services}${compiled.content}`)}
   },
 })
 

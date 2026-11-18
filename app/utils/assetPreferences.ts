@@ -78,16 +78,43 @@ export function assetSelectionLimit(mode?: 'single' | 'multiple', requested?: nu
     return Number.isInteger(requested) && requested >= 0 ? Math.min(maximum, requested) : 0
 }
 
-export function validateAssetUploads(files: readonly Pick<File, 'name' | 'size' | 'type'>[]): string | undefined {
-    if (!files.length) return 'Choose at least one image.'
-    if (files.length > MAX_UPLOAD_FILES) return `Upload up to ${MAX_UPLOAD_FILES} images at a time.`
-    if (files.reduce((total, file) => total + file.size, 0) > MAX_UPLOAD_AGGREGATE_BYTES) return 'The selected images exceed the 100 MB upload limit.'
+export type AssetUploadIssue = {key: `library.upload.validation.${keyof typeof ASSET_UPLOAD_MESSAGES_EN}`; params: Record<string, string | number>}
+export type MessageTranslator = (key: string, params?: Record<string, unknown>) => string
+
+// English copy of the `library.upload.validation` messages, used when a caller
+// has no i18n translator (node tests, plain utilities). Kept in sync with
+// i18n/locales/en/library.json by tests/asset-workflow.test.ts.
+export const ASSET_UPLOAD_MESSAGES_EN = {
+    none: 'Choose at least one image.',
+    tooMany: 'Upload up to {max} images at a time.',
+    aggregate: 'The selected images exceed the 100 MB upload limit.',
+    fileTooLarge: '“{name}” exceeds the 25 MB image limit.',
+    empty: '“{name}” is empty.',
+    unsupported: '“{name}” is not a supported raster image. Use JPG, PNG, WebP, GIF, BMP, TIFF, or HEIC.',
+} as const
+
+function englishUploadMessage(key: string, params: Record<string, unknown> = {}): string {
+    const template = ASSET_UPLOAD_MESSAGES_EN[key.split('.').at(-1) as keyof typeof ASSET_UPLOAD_MESSAGES_EN] ?? key
+    return template.replace(/\{(\w+)\}/g, (_match, name: string) => String(params[name] ?? ''))
+}
+
+/** Returns the first upload problem as a message key and parameters, or undefined when the files are acceptable. */
+export function assetUploadIssue(files: readonly Pick<File, 'name' | 'size' | 'type'>[]): AssetUploadIssue | undefined {
+    if (!files.length) return {key: 'library.upload.validation.none', params: {}}
+    if (files.length > MAX_UPLOAD_FILES) return {key: 'library.upload.validation.tooMany', params: {max: MAX_UPLOAD_FILES}}
+    if (files.reduce((total, file) => total + file.size, 0) > MAX_UPLOAD_AGGREGATE_BYTES) return {key: 'library.upload.validation.aggregate', params: {}}
     for (const file of files) {
-        if (file.size > MAX_UPLOAD_FILE_BYTES) return `“${file.name}” exceeds the 25 MB image limit.`
-        if (!file.size) return `“${file.name}” is empty.`
+        if (file.size > MAX_UPLOAD_FILE_BYTES) return {key: 'library.upload.validation.fileTooLarge', params: {name: file.name}}
+        if (!file.size) return {key: 'library.upload.validation.empty', params: {name: file.name}}
         const extension = file.name.split('.').at(-1)?.toLowerCase() ?? ''
         if (!SUPPORTED_EXTENSIONS.has(extension) || (file.type && !['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/bmp', 'image/x-ms-bmp', 'image/tiff', 'image/heic', 'image/heif'].includes(file.type))) {
-            return `“${file.name}” is not a supported raster image. Use JPG, PNG, WebP, GIF, BMP, TIFF, or HEIC.`
+            return {key: 'library.upload.validation.unsupported', params: {name: file.name}}
         }
     }
+}
+
+/** Validates uploads and returns a readable message. Pass the component's `t` to localize it; English otherwise. */
+export function validateAssetUploads(files: readonly Pick<File, 'name' | 'size' | 'type'>[], t: MessageTranslator = englishUploadMessage): string | undefined {
+    const issue = assetUploadIssue(files)
+    return issue ? t(issue.key, issue.params) : undefined
 }

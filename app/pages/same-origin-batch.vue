@@ -1,6 +1,7 @@
 <script setup lang="ts">
 definePageMeta({ layout: 'workspace', colorMode: 'dark' })
-useHead({ title: 'Same-origin batch · Product imagery' })
+const { t } = useI18n()
+useHead({ title: computed(() => `${t('common.layout.nav.sameOriginBatch')} · ${t('common.appName')}`) })
 </script>
 
 <template>

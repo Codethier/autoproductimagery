@@ -22,6 +22,7 @@ import {createS3ImageStorage, type ImageStorageCommand} from '../server/utils/us
 import {createBackgroundRemovalRepository} from '../server/utils/backgroundRemovalJobs.ts'
 import {getBackgroundRemovalModel} from '../schemas/background-removal-models.ts'
 import {createDefaultSettings} from '../schemas/image-generation.ts'
+import {i18nTestHelpersUrl} from './i18n-test-helpers.ts'
 
 const integration = {skip: !process.env.TEST_DATABASE_URL, timeout: 60_000}
 const status = (code: number) => (error: unknown) => Boolean(error && typeof error === 'object' && 'statusCode' in error && error.statusCode === code)
@@ -206,7 +207,7 @@ registerHooks({load(url, context, nextLoad) {
         const useAccount = () => globalThis.${sharedEnvironmentKey}.account;
         const navigateTo = async path => {globalThis.${sharedEnvironmentKey}.navigation.push(path)};`
     return {format: 'module', shortCircuit: true,
-        source: stripTypeScriptTypes(`import {computed, ref, watch, nextTick} from 'vue';\n${services}\n${compiled.content}`)}
+        source: stripTypeScriptTypes(`import {computed, ref, watch, nextTick} from 'vue';\nimport {useI18n} from '${i18nTestHelpersUrl}';\n${services}\n${compiled.content}`)}
 }})
 async function renderSharedPage(peopleView = false) {
     const store = reactive({models: ['/images/existing.png'], selectedModel: 'google/gemini-3.1-flash-image',

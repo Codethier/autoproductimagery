@@ -10,6 +10,7 @@ import {CREDIT_EXHAUSTED_CODE, CREDIT_EXHAUSTED_MESSAGE, type AccountBalance} fr
 import {createGenerationCreditController, generationCreditStatus, initialGenerationCreditState, isCreditExhaustionError,
     CREDIT_OUTSTANDING_MESSAGE, CREDIT_UNAVAILABLE_MESSAGE} from '../app/utils/generationCredit.ts'
 import {serverlessFetchOptions, SERVERLESS_READ_ATTEMPT_MS} from '../app/utils/serverlessRequests.ts'
+import {i18nTestHelpersUrl, translate, useI18n} from './i18n-test-helpers.ts'
 
 const root = new URL('../', import.meta.url)
 const dialogUrl = new URL('app/components/GenerationCreditDialog.vue', root).href
@@ -23,6 +24,7 @@ registerHooks({
         const compiled = compileScript(descriptor, {id: filename, inlineTemplate: true})
         return {format: 'module', shortCircuit: true, source: stripTypeScriptTypes(`
             import {ref, watch, nextTick, onMounted, onBeforeUnmount} from 'vue';
+            import {useI18n} from '${i18nTestHelpersUrl}';
             const useGenerationCredit = () => globalThis.${environmentKey}.credit;
             const useAccount = () => globalThis.${environmentKey}.account;
             const useAccountBalance = () => globalThis.${environmentKey}.balance;
@@ -146,7 +148,7 @@ test('an authoritative HTTP credit refusal opens immediately even when the subse
     } finally {fixture.scope.stop()}
 })
 
-function balanceFixture() {
+function balanceFixture(locale = 'en') {
     const source = stripTypeScriptTypes(readFileSync(new URL('app/composables/useAccountBalance.ts', root), 'utf8'))
         .replace(/import \{serverlessFetchOptions\} from '[^']+'/, '')
         .replace('export function useAccountBalance', 'return function useAccountBalance')
@@ -155,9 +157,9 @@ function balanceFixture() {
     const transport: Array<{url: string; options: unknown}> = []
     const state = ref<any>()
     const scope = effectScope()
-    const factory = new Function('computed', 'watch', 'useAccount', 'useState', 'useRequestFetch', 'serverlessFetchOptions', source)
+    const factory = new Function('computed', 'watch', 'useAccount', 'useState', 'useRequestFetch', 'serverlessFetchOptions', 'useI18n', source)
     const balance = scope.run(() => factory(computed, watch, () => account, (_key: string, initial: () => unknown) => {state.value ??= initial(); return state},
-        () => (url: string, options: any) => {options.onRequest?.({options}); transport.push({url, options}); const request = deferred<AccountBalance>(); requests.push(request); return request.promise}, serverlessFetchOptions)())
+        () => (url: string, options: any) => {options.onRequest?.({options}); transport.push({url, options}); const request = deferred<AccountBalance>(); requests.push(request); return request.promise}, serverlessFetchOptions, () => useI18n(locale))())
     return {account, balance, requests, transport, scope}
 }
 
@@ -369,4 +371,33 @@ test('the mounted popup remembers Generate before a pending check drops focus to
         ;(globalThis as any).window = windowBefore
         ;(globalThis as any).HTMLElement = elementBefore
     }
+})
+
+test('credit refusals and balance failures keep message codes and follow the active language', async () => {
+    const locale = ref('en')
+    const account = {identity: ref('org.alice'), epoch: ref(1)}
+    const balance = {balance: ref<AccountBalance | null>(money('2')), refresh: async () => money('2', {generationBlockedByOutstanding: true, outstandingCount: 1})}
+    const state = ref(initialGenerationCreditState())
+    const scope = effectScope()
+    const credit = scope.run(() => createGenerationCreditController(account, balance, state, (key, params) => translate(key, params, locale.value)))!
+    try {
+        assert.equal(await credit.ensureCredit(), false)
+        assert.equal(state.value.reason, 'outstanding', 'shared state stores a code, never translated text')
+        assert.equal(credit.blockedReason.value, CREDIT_OUTSTANDING_MESSAGE)
+        locale.value = 'hu'
+        assert.equal(credit.blockedReason.value, translate('account.credit.outstanding', {}, 'hu'))
+        assert.notEqual(credit.blockedReason.value, CREDIT_OUTSTANDING_MESSAGE)
+        credit.showExhausted()
+        assert.equal(credit.blockedReason.value, translate('account.credit.exhausted', {}, 'hu'))
+        locale.value = 'en'
+        assert.equal(credit.blockedReason.value, CREDIT_EXHAUSTED_MESSAGE, 'the English locale matches the server refusal text')
+    } finally {scope.stop()}
+    const hungarian = balanceFixture('hu')
+    try {
+        const failed = hungarian.balance.refresh()
+        hungarian.requests[0]!.reject(new Error('offline'))
+        assert.equal(await failed, null)
+        assert.equal(hungarian.balance.error.value, translate('account.balance.loadFailed', {}, 'hu'))
+        assert.notEqual(hungarian.balance.error.value, 'Could not load your balance. Try again.')
+    } finally {hungarian.scope.stop()}
 })

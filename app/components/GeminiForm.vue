@@ -2,11 +2,13 @@
 import {imageDownloadUrl, imagePreviewUrl, type ImagePreviewSize} from '../utils/imageDelivery'
 import type { Component } from 'vue'
 import type { SelectableFile } from '../../schemas/main.dto'
-import { buildComposerRequest, composerSources, imageName, type GenerationComposerMode, type PendingGeneration } from '../utils/generationComposer'
+import { buildComposerRequest, ComposerValidationError, composerSources, imageName, type GenerationComposerMode, type PendingGeneration } from '../utils/generationComposer'
 import { isNewImageModel, orderImageModels } from '../../schemas/image-model-discovery'
 import { useImageModelFavourites } from '../composables/useImageModelFavourites'
+import { useImageSaveFormat } from '../composables/useImageSaveFormat'
 import { watchImageModelSelection } from '../utils/watchImageModelSelection'
-import {validateAssetUploads} from '../utils/assetPreferences'
+import { createModelText } from '../utils/modelText'
+import {assetUploadIssue} from '../utils/assetPreferences'
 import {hasConfirmedGenerationPrice} from '~~/schemas/generation-billing'
 import {formatBalanceUsd, formatUsd, generationPriceLabel, type GenerationPrice} from '../utils/generationPrice'
 import {parseUsdUnits} from '~~/schemas/account-billing'
@@ -29,6 +31,10 @@ import OpenAiGptImageLegacySettings from './generation-settings/OpenAiGptImageLe
 import CatalogImageSettings from './generation-settings/CatalogImageSettings.vue'
 
 const props = withDefaults(defineProps<{ mode?: GenerationComposerMode }>(), { mode: 'batch' })
+const i18n = useI18n()
+const { t, locale } = i18n
+// Curated catalog prose from shared schemas stays English there; localize it for display.
+const { modelText } = createModelText(i18n)
 const data = useDataStore()
 const account = useAccount()
 const accountBalance = useAccountBalance()
@@ -41,9 +47,22 @@ const sourceImages = computed(() => composerSources(props.mode, data.editSource,
 const isEdit = computed(() => props.mode === 'edit')
 const hasSources = computed(() => sourceImages.value.length > 0)
 const { favouriteModelIds, favouriteSet, persistent: favouritesPersistent, ready: favouritesReady, toggleFavourite } = useImageModelFavourites()
+const { saveFormat, setSaveFormat } = useImageSaveFormat()
 const selectedIsFavourite = computed(() => favouriteSet.value.has(data.selectedModel))
 const prompt = toRef(data, 'composerPrompt')
-const errorMsg = ref<string | null>(null)
+// Client-authored errors keep their message key so a language switch
+// re-translates them; server/provider text is stored verbatim.
+type UiMessage = { key: string; params?: Record<string, unknown> } | { text: string }
+const errorState = ref<UiMessage | null>(null)
+const errorMsg = computed<string | null>({
+  get: () => {
+    const value = errorState.value
+    if (!value) return null
+    return 'key' in value ? t(value.key, value.params ?? {}) : value.text
+  },
+  set: (value) => { errorState.value = value ? { text: value } : null },
+})
+function showError(key: string, params?: Record<string, unknown>) { errorState.value = { key, params } }
 const keepSubmitInputs = ref(true)
 
 // Fetch all image-capable models from the gateway (across providers).
@@ -133,12 +152,12 @@ const modelOptions = computed<ModelOption[]>(() => orderImageModels(SUPPORTED_IM
   const profile = item?.profile ?? IMAGE_MODEL_PROFILES[id]
   const usable = !!item && item.catalogStatus !== 'unavailable'
   const statusLabel = item?.catalogStatus === 'unknown'
-      ? ' — unverified'
+      ? ` — ${t('generation.composer.statusUnverified')}`
       : usable
           ? ''
-          : ' — unavailable'
+          : ` — ${t('generation.composer.statusUnavailable')}`
   return {
-    label: `${profile.shortName}${profile.lifecycle === 'recommended' ? ' (Recommended)' : ''}${statusLabel}`,
+    label: `${profile.shortName}${profile.lifecycle === 'recommended' ? ` (${t('generation.composer.recommended')})` : ''}${statusLabel}`,
     value: id,
     icon: profile.provider === 'openai' ? 'i-lucide-image' : 'i-lucide-sparkles',
     disabled: !usable,
@@ -178,17 +197,19 @@ const settingsComponents: Record<ImageModelProfile['settingsComponent'], Compone
 }
 const selectedSettingsComponent = computed(() => settingsComponents[selectedProfile.value.settingsComponent])
 const settingsPanelRevision = ref(0)
-const settingsResetMessage = ref('')
+const settingsResetModel = ref('')
+const settingsResetMessage = computed(() => settingsResetModel.value
+  ? t('generation.composer.settingsRestored', { model: settingsResetModel.value }) : '')
 
 function resetModelSettings() {
   data.generationSettings = createDefaultSettings(data.selectedModel)
   // Recreate the controls as well as their values, including after a render error.
   settingsPanelRevision.value += 1
-  settingsResetMessage.value = `${selectedProfile.value.shortName} settings restored to defaults.`
+  settingsResetModel.value = selectedProfile.value.shortName
 }
 
 watch(() => [data.selectedModel, data.generationSettings], () => {
-  settingsResetMessage.value = ''
+  settingsResetModel.value = ''
 }, {deep: true, flush: 'sync'})
 
 watchImageModelSelection(data)
@@ -202,11 +223,11 @@ const selectedPricingText = computed(() => {
   const out = fmtPerMillion(p.output)
   const cached = fmtPerMillion(p.cachedInputTokens)
   const parts: string[] = []
-  if (inp) parts.push(`${inp} input`)
-  if (out) parts.push(`${out} output`)
-  if (cached) parts.push(`${cached} cached input`)
+  if (inp) parts.push(t('generation.details.priceInput', { price: inp }))
+  if (out) parts.push(t('generation.details.priceOutput', { price: out }))
+  if (cached) parts.push(t('generation.details.priceCachedInput', { price: cached }))
   if (!parts.length) return null
-  return `${parts.join(' - ')} per 1M tokens`
+  return t('generation.details.pricePerMillion', { parts: parts.join(' - ') })
 })
 
 const selectedPricingMethod = computed(() => selectedModelInfo.value?.pricingDetails?.method || 'unknown')
@@ -232,13 +253,15 @@ const selectedCostEstimate = computed(() => {
   const fixed = components.find(c => c.kind === 'fixed-image' && c.amountUsd != null)
   if (fixed?.amountUsd != null) {
     const total = fixed.amountUsd * estimatedOutputCount.value
-    return `Estimate: $${total.toFixed(total < 0.01 ? 4 : 2)} for ${estimatedOutputCount.value} image${estimatedOutputCount.value > 1 ? 's' : ''}`
+    const count = estimatedOutputCount.value
+    return t(count > 1 ? 'generation.details.estimateFixedOther' : 'generation.details.estimateFixedOne',
+      { amount: `$${total.toFixed(total < 0.01 ? 4 : 2)}`, count })
   }
   const mp = components.find(c => c.kind === 'megapixel')
-  if (mp) return `Estimate needs final dimensions (${mp.label})`
+  if (mp) return t('generation.details.estimateMegapixel', { label: mp.label })
   const token = components.find(c => c.kind === 'token')
-  if (token) return 'Estimate needs final token usage; exact Gateway cost is stored after generation when available.'
-  return 'Exact cost will be queried from the Gateway generation record after generation when available.'
+  if (token) return t('generation.details.estimateToken')
+  return t('generation.details.estimateUnknown')
 })
 const inputCapabilityWarning = computed(() => {
   const hasImageInputs = sourceImages.value.length > 0 || data.models.length > 0
@@ -246,7 +269,7 @@ const inputCapabilityWarning = computed(() => {
   if (!hasImageInputs || !caps) return ''
   return caps.input.includes('image')
       ? ''
-      : 'Selected images may be rejected because this model is text-to-image only.'
+      : t('generation.details.textOnlyWarning')
 })
 
 const referenceCount = computed(() => (sourceImages.value.length > 0 ? 1 : 0) + data.models.length)
@@ -258,12 +281,10 @@ const maskFileNotPng = computed(() => !!data.maskImage && !/\.png(?:$|[?#])/i.te
 const maskSources = computed(() => sourceImages.value.length > 0
     ? sourceImages.value
     : data.models.slice(0, 1))
-const maskSourceNotPng = computed(() => !luminanceMask.value && !!data.maskImage
-    && maskSources.value.some(source => !/\.png(?:$|[?#])/i.test(source)))
-const referenceSummary = computed(() => {
-  const inputPart = sourceImages.value.length > 0 ? '1 per input job' : 'no per-job input'
-  return `${referenceCount.value}/${selectedProfile.value.maxReferenceImages} references per generation (${inputPart} + ${data.models.length} shared)`
-})
+const referenceSummary = computed(() => t(sourceImages.value.length > 0
+    ? 'generation.composer.referenceSummaryWithInput'
+    : 'generation.composer.referenceSummaryNoInput',
+  { used: referenceCount.value, max: selectedProfile.value.maxReferenceImages, shared: data.models.length }))
 
 const pastPrompts = useFetch('/api/systemprompts', {
   deep: true, query: { take: 20 }, key: computed(() => `systemPrompts:${account.identity.value}:${account.epoch.value}`),
@@ -304,18 +325,26 @@ watch(activeGenerationCount, (count) => {
 }, { immediate: true })
 
 function formatLogTime(value?: string) {
-  return value ? new Date(value).toLocaleString() : ''
+  return value ? new Date(value).toLocaleString(locale.value) : ''
 }
 
 function formatLogPrice(value?: string | null, source?: string | null) {
   const amount = formatUsd(value)
-  if (!amount) return source === 'unknown' ? 'Unknown' : ''
+  if (!amount) return source === 'unknown' ? t('common.states.unknown') : ''
   return source ? `${amount} (${source})` : amount
 }
 
 function formatLogImages(items?: string[] | null) {
   const count = Array.isArray(items) ? items.length : 0
-  return `${count} image${count === 1 ? '' : 's'}`
+  return t(count === 1 ? 'generation.diagnostics.imagesOne' : 'generation.diagnostics.imagesOther', { count })
+}
+
+function formatLogSummary(log: AiGatewayLog) {
+  return t('generation.diagnostics.summary', {
+    inputs: formatLogImages(log.inputImages),
+    references: formatLogImages(log.modelImages),
+    tokens: log.totalTokens?.toLocaleString(locale.value) || t('common.states.unknown'),
+  })
 }
 
 function formatJson(value: unknown) {
@@ -368,11 +397,12 @@ const confirmPeople = computed(() => {
     if (!snapshot || snapshot !== peoplePickerAccount.value || !peoplePickerOpen.value || !isCurrentAccount(snapshot)) return
     const selections = Array.from(new Set(urls))
     if (selections.some(url => !ImagePathSchema.safeParse(url).success)) {
-      errorMsg.value = 'Choose valid images from People.'
+      showError('generation.errors.invalidPeopleImages')
       return
     }
     if (selections.length > sharedReferenceAllowance.value) {
-      errorMsg.value = `This model supports ${sharedReferenceAllowance.value} shared reference image${sharedReferenceAllowance.value === 1 ? '' : 's'}. Remove a selection to continue.`
+      const count = sharedReferenceAllowance.value
+      showError(count === 1 ? 'generation.errors.peopleLimitOne' : 'generation.errors.peopleLimitOther', { count })
       return
     }
     data.models = selections
@@ -479,13 +509,13 @@ watch(() => route.query.source, (source) => {
   if (!isEdit.value || typeof source !== 'string') return
   const parsed = ImagePathSchema.safeParse(source)
   if (parsed.success) data.editSource = parsed.data
-  else errorMsg.value = 'This image link is invalid. Choose an image from Assets.'
+  else showError('generation.errors.invalidImageLink')
 }, { immediate: true })
 
 function chooseSource(source: string) {
   if (isEdit.value) data.editSource = source
   else if (!data.inputImages.includes(source)) {
-    if (data.inputImages.length >= 50) { errorMsg.value = 'A batch supports at most 50 input images.'; return }
+    if (data.inputImages.length >= 50) { showError('generation.errors.batchLimit'); return }
     data.inputImages.push(source)
   }
   errorMsg.value = null
@@ -508,7 +538,7 @@ function confirmPicker(files: SelectableFile[]) {
   if (pickerKind.value === 'source') {
     if (isEdit.value) data.editSource = urls[0] || null
     else if (urls.length <= 50) data.inputImages = urls
-    else { errorMsg.value = 'A batch supports at most 50 input images.'; return }
+    else { showError('generation.errors.batchLimit'); return }
   } else if (pickerKind.value === 'references') {
     data.models = urls
   } else data.maskImage = urls[0] || null
@@ -520,15 +550,15 @@ function sourceUrl(source: string, size: ImagePreviewSize = 160) { return imageP
 async function uploadFiles(files: File[]) {
   if (!files.length || uploading.value) return
   if (isEdit.value && files.length !== 1) {
-    errorMsg.value = 'Choose one image for Edit. Use Same-origin batch for multiple images.'
+    showError('generation.errors.editOneImage')
     return
   }
   if (files.length + (isEdit.value ? 0 : data.inputImages.length) > 50) {
-    errorMsg.value = 'A batch supports at most 50 input images.'
+    showError('generation.errors.batchLimit')
     return
   }
-  const invalid = validateAssetUploads(files)
-  if (invalid) { errorMsg.value = invalid; return }
+  const invalid = assetUploadIssue(files)
+  if (invalid) { showError(invalid.key, invalid.params); return }
   uploading.value = true
   errorMsg.value = null
   const snapshot = accountSnapshot()
@@ -542,7 +572,11 @@ async function uploadFiles(files: File[]) {
     if (result.failed.length) errorMsg.value = result.failed.map(file => `${file.filename}: ${file.reason}`).join(' ')
     await refreshNuxtData('asset-files')
   } catch (error: any) {
-    if (isCurrentAccount(snapshot)) errorMsg.value = error?.data?.statusMessage || error?.statusMessage || 'Could not upload the images. Please try again.'
+    if (isCurrentAccount(snapshot)) {
+      const serverMessage = error?.data?.statusMessage || error?.statusMessage
+      if (serverMessage) errorMsg.value = serverMessage
+      else showError('generation.errors.uploadFailed')
+    }
   } finally {
     if (isCurrentAccount(snapshot)) {
       uploading.value = false
@@ -566,7 +600,7 @@ function onPreviewLoad(event: Event) {
 }
 function onPreviewError() {
   if (!previewOutput.value) sourceUnavailable.value = true
-  errorMsg.value = 'This image is unavailable or has expired. Choose another image from Assets.'
+  showError('generation.errors.imageUnavailable')
 }
 function adjustZoom(amount: number) { zoom.value = Math.max(0.25, Math.min(2, Math.round((zoom.value + amount) * 100) / 100)) }
 
@@ -580,20 +614,20 @@ async function loadMoreHistory() {
     if (!isCurrentAccount(snapshot) || displayedHistory.value.length !== skip) return
     const known = new Set(displayedHistory.value.map(item => item.id))
     additionalHistory.value.push(...page.items.filter(item => !known.has(item.id)))
-  } catch { if (isCurrentAccount(snapshot)) errorMsg.value = 'Could not load more generation history.' }
+  } catch { if (isCurrentAccount(snapshot)) showError('generation.errors.historyLoadMore') }
   finally { if (isCurrentAccount(snapshot)) loadingHistory.value = false }
 }
 
 const creditBlockReason = computed(() => {
   const balance = accountBalance.balance.value
   if (!balance || balance.unlimited) return ''
-  if (!balance.actualBalanceUsd || balance.actualBalanceUsd.startsWith('-') || parseUsdUnits(balance.actualBalanceUsd) === 0n) return 'Your credit is used up. Ask an organization owner to add credit before generating another image.'
-  if (balance.generationBlockedByOutstanding ?? (balance.outstandingCount > 0)) return 'Your previous generation prices are still being confirmed. They must settle before another generation can use your credit.'
+  if (!balance.actualBalanceUsd || balance.actualBalanceUsd.startsWith('-') || parseUsdUnits(balance.actualBalanceUsd) === 0n) return t('generation.errors.creditUsedUp')
+  if (balance.generationBlockedByOutstanding ?? (balance.outstandingCount > 0)) return t('generation.errors.creditPending')
   return ''
 })
 const canSubmit = computed(() => hasSources.value && !!prompt.value.trim()
   && !referenceOverflow.value && !missingRequiredMask.value && !maskWithoutReference.value
-  && !maskFileNotPng.value && !maskSourceNotPng.value && selectedModelAvailable.value
+  && !maskFileNotPng.value && selectedModelAvailable.value
   && estimatedOutputCount.value <= 50 && !sourceUnavailable.value
   && !activeGenerationCount.value && !uploading.value && !generationCredit.checking.value && !generationCredit.outstandingBlocked.value)
 
@@ -621,7 +655,9 @@ onBeforeUnmount(() => {
 async function submit() {
   if (activeGenerationCount.value || generationCredit.checking.value) return
   if (!selectedModelAvailable.value) {
-    errorMsg.value = selectedModelInfo.value?.availabilityNote || 'This model is not currently available through AI Gateway.'
+    const note = selectedModelInfo.value?.availabilityNote
+    if (note) errorMsg.value = note
+    else showError('generation.errors.modelNotAvailable')
     return
   }
   let requestBody: ReturnType<typeof buildComposerRequest>
@@ -635,9 +671,13 @@ async function submit() {
       settings: structuredClone(toRaw(data.generationSettings)),
       sharedReferences: data.models,
       maskImage: data.maskImage,
+      saveFormat: saveFormat.value,
     })
   } catch (error: any) {
-    errorMsg.value = error?.issues?.map((issue: { message: string }) => issue.message).join(' ') || error?.message || 'Check your generation settings.'
+    if (error instanceof ComposerValidationError) { showError(error.messageKey); return }
+    const detail = error?.issues?.map((issue: { message: string }) => issue.message).join(' ') || error?.message
+    if (detail) errorMsg.value = detail
+    else showError('generation.errors.checkSettings')
     return
   }
 
@@ -673,7 +713,8 @@ async function submit() {
     if (!isCurrentAccount(snapshot)) return
     serverCreatedRows = true
     const failures = response.obj?.filter(row => !!row.errors) || []
-    if (failures.length) errorMsg.value = `${failures.length} output${failures.length === 1 ? '' : 's'} failed. ${failures[0]?.errors || ''}`
+    if (failures.length) showError(failures.length === 1 ? 'generation.errors.outputsFailedOne' : 'generation.errors.outputsFailedOther',
+      { count: failures.length, detail: failures[0]?.errors || '' })
     const firstResult = response.obj?.find(row => !row.errors && (row.status === 'succeeded' || !!row.outputImage))
     // A changed source must not be replaced by an older in-flight request.
     if (isEdit.value && firstResult && data.editSource === requestBody.inputImages[0]) {
@@ -688,12 +729,14 @@ async function submit() {
       return
     }
     if (!isCurrentAccount(snapshot)) return
-    const message = error?.data?.statusMessage || error?.statusMessage || 'Generation failed. Please try again.'
+    // Server text is kept verbatim; the localized fallback is resolved at render time.
+    const message: string | undefined = error?.data?.statusMessage || error?.statusMessage || undefined
     for (const job of jobs) {
       const retainedJob = pendingGenerations.value.find(item => item.id === job.id)
       if (retainedJob) { retainedJob.status = 'failed'; retainedJob.error = message }
     }
-    errorMsg.value = message
+    if (message) errorMsg.value = message
+    else showError('generation.errors.generationFailed')
   } finally {
     if (isCurrentAccount(snapshot)) {
       if (serverCreatedRows) for (const job of jobs) removePendingJob(job.id)
@@ -709,11 +752,11 @@ async function submit() {
 
 <template>
   <div class="generation-studio" :class="{ 'generation-studio--empty': !hasSources }">
-    <header class="studio-route-header"><h1><UIcon :name="isEdit ? 'i-lucide-sliders-horizontal' : 'i-lucide-layers'" class="size-4" />{{ isEdit ? 'Edit' : 'Same-origin batch' }}</h1><span v-if="hasSources">{{ isEdit ? 'Single image editor' : `${sourceImages.length} input images` }}</span></header>
+    <header class="studio-route-header"><h1><UIcon :name="isEdit ? 'i-lucide-sliders-horizontal' : 'i-lucide-layers'" class="size-4" />{{ isEdit ? t('common.layout.nav.edit') : t('common.layout.nav.sameOriginBatch') }}</h1><span v-if="hasSources">{{ isEdit ? t('generation.header.singleImageEditor') : t(sourceImages.length === 1 ? 'generation.header.inputImagesOne' : 'generation.header.inputImagesOther', { count: sourceImages.length }) }}</span></header>
     <input ref="uploadInput" class="sr-only" type="file" :multiple="!isEdit"
            accept="image/jpeg,image/png,image/webp,image/gif,image/bmp,image/tiff,image/heic,.heic"
-           aria-label="Upload source images" @change="onUploadChange">
-    <UModal v-model:open="pickerOpen" :title="pickerKind === 'source' ? (isEdit ? 'Choose an image to edit' : 'Choose batch input images') : pickerKind === 'mask' ? 'Choose a PNG mask' : 'Choose shared reference images'"
+           :aria-label="t('generation.upload.inputLabel')" @change="onUploadChange">
+    <UModal v-model:open="pickerOpen" :title="pickerKind === 'source' ? (isEdit ? t('generation.picker.chooseEditImage') : t('generation.picker.chooseBatchInputs')) : pickerKind === 'mask' ? t('generation.picker.chooseMask') : t('generation.picker.chooseReferences')"
             :ui="{ content: 'max-w-6xl max-h-[90vh]' }">
       <template #body>
         <AssetBrowser v-model:selected-urls="pickerSelection"
@@ -724,7 +767,7 @@ async function submit() {
                       @confirm="confirmPicker" />
       </template>
     </UModal>
-    <UModal v-model:open="peoplePickerOpen" title="Choose people references" description="Select portraits to attach as shared reference images."
+    <UModal v-model:open="peoplePickerOpen" :title="t('generation.picker.peopleTitle')" :description="t('generation.picker.peopleDescription')"
             :ui="{ content: 'max-w-6xl max-h-[90vh]' }">
       <template #body>
         <PeopleBrowser v-if="peoplePickerOpen" :key="`${account.identity.value}:${account.epoch.value}`"
@@ -736,25 +779,25 @@ async function submit() {
       <BackgroundRemovalPanel :source-urls="backgroundRemovalSources" @close="backgroundRemovalSources = []" @use-output="useCutout" />
     </div>
     <div class="studio-workspace" :class="{ 'studio-workspace--editing': hasSources }">
-      <section class="studio-canvas-area" aria-label="Image canvas" @dragover.prevent="dragging = true" @dragleave.prevent="dragging = false" @drop.prevent="onDrop">
+      <section class="studio-canvas-area" :aria-label="t('generation.editor.canvasLabel')" @dragover.prevent="dragging = true" @dragleave.prevent="dragging = false" @drop.prevent="onDrop">
         <div v-if="!hasSources" class="studio-start">
-          <div class="studio-start-story"><span class="workspace-eyebrow">{{ isEdit ? 'The editing room' : 'A collection, one direction' }}</span><h2>{{ isEdit ? 'Make room for a new perspective.' : 'Give every image the same creative direction.' }}</h2><p>{{ isEdit ? 'Bring a product photo into the studio. Shape the scene with a prompt and reference images, then explore the result.' : 'Each selected image gets its own generation, with one shared prompt and the same references.' }}</p><span class="studio-start-line" /></div>
+          <div class="studio-start-story"><span class="workspace-eyebrow">{{ isEdit ? t('generation.start.editEyebrow') : t('generation.start.batchEyebrow') }}</span><h2>{{ isEdit ? t('generation.start.editHeadline') : t('generation.start.batchHeadline') }}</h2><p>{{ isEdit ? t('generation.start.editStory') : t('generation.start.batchStory') }}</p><span class="studio-start-line" /></div>
           <div class="studio-drop-zone" :class="{ 'studio-drop-zone--dragging': dragging }">
             <span class="studio-upload-symbol"><UIcon :name="isEdit ? 'i-lucide-layers' : 'i-lucide-images'" class="size-10" /></span>
-            <h2>{{ isEdit ? 'Start with a product photo' : 'One prompt. Every product image.' }}</h2>
-            <p>{{ isEdit ? 'Upload an image or choose one from your assets to get started.' : 'Upload multiple images. Run the same prompt once for each input, with shared references.' }}</p>
+            <h2>{{ isEdit ? t('generation.start.editDropTitle') : t('generation.start.batchDropTitle') }}</h2>
+            <p>{{ isEdit ? t('generation.start.editDropBody') : t('generation.start.batchDropBody') }}</p>
             <div class="studio-upload-actions">
-              <UButton icon="i-lucide-upload" :loading="uploading" :disabled="uploading" @click="uploadInput?.click()">Upload {{ isEdit ? 'image' : 'images' }}</UButton>
-              <UButton color="neutral" variant="soft" icon="i-lucide-folder" @click="openPicker('source')">Assets</UButton>
+              <UButton icon="i-lucide-upload" :loading="uploading" :disabled="uploading" @click="uploadInput?.click()">{{ isEdit ? t('generation.upload.uploadImage') : t('generation.upload.uploadImages') }}</UButton>
+              <UButton color="neutral" variant="soft" icon="i-lucide-folder" @click="openPicker('source')">{{ t('generation.upload.assets') }}</UButton>
             </div>
             <div class="studio-file-types"><span>JPG</span><span>PNG</span><span>WebP</span><span>HEIC</span></div>
-            <p class="studio-upload-limits">Images only · up to 25 MB per image{{ isEdit ? '' : ' · up to 50 inputs · 100 MB total' }}</p>
+            <p class="studio-upload-limits">{{ isEdit ? t('generation.upload.limitsEdit') : t('generation.upload.limitsBatch') }}</p>
           </div>
           <div v-if="recentImages.length" class="studio-recent">
-            <span>Continue editing</span>
+            <span>{{ t('generation.start.continueEditing') }}</span>
             <div class="studio-recent-grid">
-              <button v-for="item in recentImages" :key="item.id" type="button" :aria-label="`Edit result: ${item.TextPrompt}`" :title="item.TextPrompt" @click="chooseSource(item.outputImage!)">
-                <img :src="sourceUrl(item.outputImage!)" alt="Recent generated image" loading="lazy" decoding="async">
+              <button v-for="item in recentImages" :key="item.id" type="button" :aria-label="t('generation.start.editResult', { prompt: item.TextPrompt })" :title="item.TextPrompt" @click="chooseSource(item.outputImage!)">
+                <img :src="sourceUrl(item.outputImage!)" :alt="t('generation.start.recentAlt')" loading="lazy" decoding="async">
                 <span class="studio-recent-price">{{ generationPriceLabel(item) }}</span>
               </button>
             </div>
@@ -762,136 +805,137 @@ async function submit() {
         </div>
         <template v-else-if="isEdit">
           <div class="studio-canvas-toolbar">
-            <div class="studio-source-title"><UIcon name="i-lucide-image" class="size-4" /><span>{{ imageName(data.editSource!) }}</span><span v-if="previewOutput" class="studio-result-label">Result · {{ previewPrice }}</span></div>
+            <div class="studio-source-title"><UIcon name="i-lucide-image" class="size-4" /><span>{{ imageName(data.editSource!) }}</span><span v-if="previewOutput" class="studio-result-label">{{ t('generation.editor.resultLabel', { price: previewPrice }) }}</span></div>
             <div class="studio-toolbar-actions">
-              <UButton v-if="previewOutput" color="neutral" variant="ghost" size="sm" @click="data.editSource = previewOutput">Use as input</UButton>
-              <UButton color="neutral" variant="ghost" size="sm" icon="i-lucide-folder" @click="openPicker('source')">Replace</UButton>
-              <UButton v-if="previewImage && !sourceUnavailable" color="neutral" variant="soft" size="sm" icon="i-lucide-scissors" @click="openBackgroundRemoval([previewImage])">Remove background</UButton>
-              <UButton v-if="previewImage" :href="imageDownloadUrl(previewImage)" :download="imageName(previewImage)" external color="neutral" variant="soft" size="sm" icon="i-lucide-download">Download</UButton>
+              <UButton v-if="previewOutput" color="neutral" variant="ghost" size="sm" @click="data.editSource = previewOutput">{{ t('generation.editor.useAsInput') }}</UButton>
+              <UButton color="neutral" variant="ghost" size="sm" icon="i-lucide-folder" @click="openPicker('source')">{{ t('generation.editor.replace') }}</UButton>
+              <UButton v-if="previewImage && !sourceUnavailable" color="neutral" variant="soft" size="sm" icon="i-lucide-scissors" @click="openBackgroundRemoval([previewImage])">{{ t('generation.editor.removeBackground') }}</UButton>
+              <UButton v-if="previewImage" :href="imageDownloadUrl(previewImage)" :download="imageName(previewImage)" external color="neutral" variant="soft" size="sm" icon="i-lucide-download">{{ t('common.actions.download') }}</UButton>
             </div>
           </div>
           <div class="studio-image-stage" :class="{ 'studio-image-stage--dragging': dragging }">
             <div class="studio-image-sheet" :style="{ transform: `scale(${zoom})` }">
-              <img v-if="previewImage" :key="previewImage" :src="sourceUrl(previewImage, 1600)" decoding="async" :alt="previewOutput ? 'Generated result' : 'Image being edited'" @load="onPreviewLoad" @error="onPreviewError">
+              <img v-if="previewImage" :key="previewImage" :src="sourceUrl(previewImage, 1600)" decoding="async" :alt="previewOutput ? t('generation.editor.generatedResult') : t('generation.editor.imageBeingEdited')" @load="onPreviewLoad" @error="onPreviewError">
             </div>
-            <div v-if="activeGenerationCount" class="studio-generating-overlay" role="status"><UIcon name="i-lucide-loader-circle" class="size-5 animate-spin" /><span>Creating your image…</span></div>
+            <div v-if="activeGenerationCount" class="studio-generating-overlay" role="status"><UIcon name="i-lucide-loader-circle" class="size-5 animate-spin" /><span>{{ t('generation.editor.creating') }}</span></div>
           </div>
           <div class="studio-canvas-footer">
             <span>{{ imageDimensions }}</span>
             <div class="studio-zoom-controls">
-              <button type="button" aria-label="Zoom out" :disabled="zoom <= 0.25" @click="adjustZoom(-0.25)"><UIcon name="i-lucide-minus" class="size-4" /></button>
+              <button type="button" :aria-label="t('generation.editor.zoomOut')" :disabled="zoom <= 0.25" @click="adjustZoom(-0.25)"><UIcon name="i-lucide-minus" class="size-4" /></button>
               <span>{{ Math.round(zoom * 100) }}%</span>
-              <button type="button" aria-label="Zoom in" :disabled="zoom >= 2" @click="adjustZoom(0.25)"><UIcon name="i-lucide-plus" class="size-4" /></button>
-              <button type="button" @click="zoom = 1">Fit</button>
+              <button type="button" :aria-label="t('generation.editor.zoomIn')" :disabled="zoom >= 2" @click="adjustZoom(0.25)"><UIcon name="i-lucide-plus" class="size-4" /></button>
+              <button type="button" @click="zoom = 1">{{ t('generation.editor.fit') }}</button>
             </div>
-            <button v-if="previewOutput" type="button" class="studio-text-button" @click="previewResult = null">View original</button>
-            <button v-else type="button" class="studio-text-button" @click="clearInputImages">Close image</button>
+            <button v-if="previewOutput" type="button" class="studio-text-button" @click="previewResult = null">{{ t('generation.editor.viewOriginal') }}</button>
+            <button v-else type="button" class="studio-text-button" @click="clearInputImages">{{ t('generation.editor.closeImage') }}</button>
           </div>
         </template>
         <template v-else>
           <div class="studio-canvas-toolbar">
-            <div><strong>{{ sourceImages.length }} input{{ sourceImages.length === 1 ? '' : 's' }}</strong><p class="studio-toolbar-description">Each input creates an independent generation job.</p></div>
+            <div><strong>{{ t(sourceImages.length === 1 ? 'generation.batch.inputsOne' : 'generation.batch.inputsOther', { count: sourceImages.length }) }}</strong><p class="studio-toolbar-description">{{ t('generation.batch.jobDescription') }}</p></div>
             <div class="studio-toolbar-actions">
-              <UButton color="neutral" variant="ghost" size="sm" @click="clearInputImages">Clear</UButton>
-              <UButton color="neutral" variant="soft" size="sm" icon="i-lucide-folder" @click="openPicker('source')">Assets</UButton>
-              <UButton color="neutral" variant="soft" size="sm" icon="i-lucide-scissors" @click="openBackgroundRemoval(sourceImages)">Remove backgrounds</UButton>
-              <UButton size="sm" icon="i-lucide-plus" :loading="uploading" @click="uploadInput?.click()">Add images</UButton>
+              <UButton color="neutral" variant="ghost" size="sm" @click="clearInputImages">{{ t('generation.batch.clear') }}</UButton>
+              <UButton color="neutral" variant="soft" size="sm" icon="i-lucide-folder" @click="openPicker('source')">{{ t('generation.upload.assets') }}</UButton>
+              <UButton color="neutral" variant="soft" size="sm" icon="i-lucide-scissors" @click="openBackgroundRemoval(sourceImages)">{{ t('generation.batch.removeBackgrounds') }}</UButton>
+              <UButton size="sm" icon="i-lucide-plus" :loading="uploading" @click="uploadInput?.click()">{{ t('generation.batch.addImages') }}</UButton>
             </div>
           </div>
           <div class="studio-batch-grid" :class="{ 'studio-batch-grid--dragging': dragging }">
             <div v-for="(image, index) in sourceImages" :key="image" class="studio-input-card">
-              <div class="studio-input-preview"><img :src="sourceUrl(image, 480)" :alt="`Input ${index + 1}: ${imageName(image)}`" loading="lazy" decoding="async"><span class="studio-input-number">{{ index + 1 }}</span><button type="button" :aria-label="`Remove ${imageName(image)} from batch`" @click="removeSource(image)"><UIcon name="i-lucide-x" class="size-4" /></button></div>
-              <div class="studio-input-caption"><span :title="imageName(image)">{{ imageName(image) }}</span><small>{{ outputsPerJob }} output{{ outputsPerJob === 1 ? '' : 's' }}</small></div>
+              <div class="studio-input-preview"><img :src="sourceUrl(image, 480)" :alt="t('generation.batch.inputAlt', { index: index + 1, name: imageName(image) })" loading="lazy" decoding="async"><span class="studio-input-number">{{ index + 1 }}</span><button type="button" :aria-label="t('generation.batch.removeInput', { name: imageName(image) })" @click="removeSource(image)"><UIcon name="i-lucide-x" class="size-4" /></button></div>
+              <div class="studio-input-caption"><span :title="imageName(image)">{{ imageName(image) }}</span><small>{{ t(outputsPerJob === 1 ? 'generation.batch.outputsOne' : 'generation.batch.outputsOther', { count: outputsPerJob }) }}</small></div>
             </div>
-            <button v-if="sourceImages.length < 50" type="button" class="studio-add-card" @click="uploadInput?.click()"><UIcon name="i-lucide-plus" class="size-7" /><span>Add images</span><small>or drop them here</small></button>
+            <button v-if="sourceImages.length < 50" type="button" class="studio-add-card" @click="uploadInput?.click()"><UIcon name="i-lucide-plus" class="size-7" /><span>{{ t('generation.batch.addImages') }}</span><small>{{ t('generation.batch.dropHint') }}</small></button>
           </div>
         </template>
       </section>
-      <aside v-if="hasSources" class="studio-composer" aria-label="Generation settings">
+      <aside v-if="hasSources" class="studio-composer" :aria-label="t('generation.composer.label')">
         <div class="studio-composer-scroll">
-          <div class="studio-panel-heading"><h2>{{ isEdit ? 'Edit image' : 'Same-origin batch' }}</h2><span>AI image editor</span></div>
+          <div class="studio-panel-heading"><h2>{{ isEdit ? t('generation.composer.headingEdit') : t('common.layout.nav.sameOriginBatch') }}</h2><span>{{ t('generation.composer.subheading') }}</span></div>
           <div class="studio-control-group">
-            <label for="image-model-select">Model</label>
+            <label for="image-model-select">{{ t('generation.composer.model') }}</label>
             <div class="studio-model-row">
-              <USelect id="image-model-select" v-model="selectedModelValue" :items="modelOptions" placeholder="Select model" class="min-w-0 flex-1" :content="{ align: 'end', sideOffset: 6 }" :ui="{ content: 'min-w-[min(560px,calc(100vw-2rem))]' }">
+              <USelect id="image-model-select" v-model="selectedModelValue" :items="modelOptions" :placeholder="t('generation.composer.selectModel')" class="min-w-0 flex-1" :content="{ align: 'end', sideOffset: 6 }" :ui="{ content: 'min-w-[min(560px,calc(100vw-2rem))]' }">
                 <template #item-leading="{ item }"><UIcon :name="item.isFavourite ? 'i-lucide-heart' : item.icon" class="size-4 shrink-0" :class="{ 'text-rose-400': item.isFavourite }" /></template>
-                <template #item-trailing="{ item }"><span v-if="item.isFavourite" class="sr-only">Favourite</span><span class="studio-model-tags"><UBadge v-if="item.supportsTransparentBackground" class="model-transparent-badge" size="xs" color="neutral" variant="subtle" title="Supports transparent image output; enable it in model settings." aria-label="Supports transparent image output">Transparent</UBadge><UBadge v-if="item.isNew" size="xs" color="primary" variant="subtle">New</UBadge></span></template>
+                <template #item-trailing="{ item }"><span v-if="item.isFavourite" class="sr-only">{{ t('generation.composer.favourite') }}</span><span class="studio-model-tags"><UBadge v-if="item.supportsTransparentBackground" class="model-transparent-badge" size="xs" color="neutral" variant="subtle" :title="t('generation.composer.transparentTitle')" :aria-label="t('generation.composer.transparentAria')">{{ t('generation.composer.transparent') }}</UBadge><UBadge v-if="item.isNew" size="xs" color="primary" variant="subtle">{{ t('generation.composer.new') }}</UBadge></span></template>
               </USelect>
-              <UButton type="button" variant="ghost" :color="selectedIsFavourite ? 'error' : 'neutral'" :disabled="!favouritesReady" :aria-pressed="selectedIsFavourite" :aria-label="`${selectedIsFavourite ? 'Remove' : 'Add'} ${selectedProfile.shortName} ${selectedIsFavourite ? 'from' : 'to'} favourites`" @click="toggleFavourite(data.selectedModel)">
+              <UButton type="button" variant="ghost" :color="selectedIsFavourite ? 'error' : 'neutral'" :disabled="!favouritesReady" :aria-pressed="selectedIsFavourite" :aria-label="t(selectedIsFavourite ? 'generation.composer.removeFavourite' : 'generation.composer.addFavourite', { model: selectedProfile.shortName })" @click="toggleFavourite(data.selectedModel)">
                 <svg aria-hidden="true" viewBox="0 0 24 24" class="size-4" :fill="selectedIsFavourite ? 'currentColor' : 'none'" stroke="currentColor" stroke-width="2"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78L12 21.23l8.84-8.84a5.5 5.5 0 0 0 0-7.78Z" /></svg>
               </UButton>
             </div>
-            <div class="studio-model-meta"><UBadge v-if="selectedProfile.supportsTransparentBackground" class="model-transparent-badge" size="xs" color="neutral" variant="subtle" title="Supports transparent image output; enable it in model settings." aria-label="Supports transparent image output">Transparent</UBadge><UBadge v-if="isNewImageModel(data.selectedModel)" size="xs" color="primary" variant="subtle">New</UBadge><span v-if="selectedProfile.lifecycle === 'recommended'">Recommended</span><span v-if="selectedIsFavourite">Favourite</span></div>
-            <p v-if="selectedProfile.supportsTransparentBackground" class="studio-help">For a transparent image, choose Background → Transparent in Model settings and use PNG or WebP.</p>
-            <p v-if="!favouritesPersistent" role="status" class="studio-notice">Browser storage is unavailable. Favourites last for this visit.</p>
+            <div class="studio-model-meta"><UBadge v-if="selectedProfile.supportsTransparentBackground" class="model-transparent-badge" size="xs" color="neutral" variant="subtle" :title="t('generation.composer.transparentTitle')" :aria-label="t('generation.composer.transparentAria')">{{ t('generation.composer.transparent') }}</UBadge><UBadge v-if="isNewImageModel(data.selectedModel)" size="xs" color="primary" variant="subtle">{{ t('generation.composer.new') }}</UBadge><span v-if="selectedProfile.lifecycle === 'recommended'">{{ t('generation.composer.recommended') }}</span><span v-if="selectedIsFavourite">{{ t('generation.composer.favourite') }}</span></div>
+            <p v-if="selectedProfile.supportsTransparentBackground" class="studio-help">{{ t('generation.composer.transparentHelp') }}</p>
+            <p v-if="!favouritesPersistent" role="status" class="studio-notice">{{ t('generation.composer.favouritesSession') }}</p>
             <ModelGuidance :model-id="data.selectedModel" :settings="data.generationSettings" compact />
           </div>
           <details class="studio-settings">
-            <summary><span>Model settings</span><UIcon name="i-lucide-sliders-horizontal" class="size-4" /></summary>
+            <summary><span>{{ t('generation.composer.modelSettings') }}</span><UIcon name="i-lucide-sliders-horizontal" class="size-4" /></summary>
             <div class="studio-settings-body">
-              <div class="studio-settings-reset"><span>{{ selectedProfile.shortName }}</span><button type="button" @click="resetModelSettings">Reset</button></div>
+              <div class="studio-settings-reset"><span>{{ selectedProfile.shortName }}</span><button type="button" @click="resetModelSettings">{{ t('common.actions.reset') }}</button></div>
               <p v-if="settingsResetMessage" role="status" class="studio-notice">{{ settingsResetMessage }}</p>
               <component :is="selectedSettingsComponent" :key="`${data.selectedModel}:${settingsPanelRevision}`" v-model="data.generationSettings" />
             </div>
           </details>
+          <div class="studio-control-group studio-save-format"><SaveFormatSetting :model-value="saveFormat" @update:model-value="setSaveFormat" /></div>
           <div class="studio-control-group studio-references">
-            <div class="studio-group-title"><label>Reference images <span class="studio-optional">Optional</span></label><button v-if="data.models.length" type="button" @click="clearModels">Clear</button></div>
+            <div class="studio-group-title"><label>{{ t('generation.composer.references') }} <span class="studio-optional">{{ t('common.states.optional') }}</span></label><button v-if="data.models.length" type="button" @click="clearModels">{{ t('generation.composer.clear') }}</button></div>
             <div class="studio-reference-thumbnails">
-              <div v-for="image in data.models" :key="image" class="studio-reference-thumb"><img :src="sourceUrl(image)" :alt="`Shared reference: ${imageName(image)}`" loading="lazy" decoding="async"><button type="button" :aria-label="`Remove shared reference ${imageName(image)}`" @click="data.models = data.models.filter(source => source !== image)"><UIcon name="i-lucide-x" class="size-3" /></button></div>
-              <button type="button" class="studio-reference-add" aria-label="Choose shared reference images" @click="openPicker('references')"><UIcon name="i-lucide-plus" class="size-5" /></button>
+              <div v-for="image in data.models" :key="image" class="studio-reference-thumb"><img :src="sourceUrl(image)" :alt="t('generation.composer.sharedReferenceAlt', { name: imageName(image) })" loading="lazy" decoding="async"><button type="button" :aria-label="t('generation.composer.removeSharedReference', { name: imageName(image) })" @click="data.models = data.models.filter(source => source !== image)"><UIcon name="i-lucide-x" class="size-3" /></button></div>
+              <button type="button" class="studio-reference-add" :aria-label="t('generation.picker.chooseReferences')" @click="openPicker('references')"><UIcon name="i-lucide-plus" class="size-5" /></button>
             </div>
-            <div class="studio-reference-actions"><button type="button" class="studio-people-picker" :disabled="!sharedReferenceAllowance" @click="openPeoplePicker"><UIcon name="i-lucide-contact-round" class="size-4" />People</button></div>
+            <div class="studio-reference-actions"><button type="button" class="studio-people-picker" :disabled="!sharedReferenceAllowance" @click="openPeoplePicker"><UIcon name="i-lucide-contact-round" class="size-4" />{{ t('common.layout.nav.people') }}</button></div>
             <p class="studio-help">{{ referenceSummary }}</p>
-            <p v-if="!isEdit" class="studio-help">The same references are attached to every input job.</p>
+            <p v-if="!isEdit" class="studio-help">{{ t('generation.composer.sameReferences') }}</p>
           </div>
           <div v-if="selectedProfile.supportsMask" class="studio-control-group">
-            <div class="studio-group-title"><label>{{ luminanceMask ? 'Fill mask' : 'Edit mask' }} <span class="studio-optional">{{ selectedProfile.requiresMask ? 'Required' : 'Optional' }}</span></label><button v-if="data.maskImage" type="button" @click="clearMaskImage">Clear</button></div>
-            <button type="button" class="studio-mask-picker" @click="openPicker('mask')"><img v-if="data.maskImage" :src="sourceUrl(data.maskImage)" alt="Selected edit mask" decoding="async"><UIcon v-else name="i-lucide-scan" class="size-5" /><span>{{ data.maskImage ? imageName(data.maskImage) : 'Choose a PNG mask' }}</span><UIcon name="i-lucide-chevron-right" class="size-4" /></button>
-            <p class="studio-help">{{ luminanceMask ? 'White areas are replaced, black areas are preserved. Match the source dimensions.' : 'Transparent areas guide the edit. The PNG mask and every source must have identical dimensions.' }}</p>
+            <div class="studio-group-title"><label>{{ luminanceMask ? t('generation.composer.fillMask') : t('generation.composer.editMask') }} <span class="studio-optional">{{ selectedProfile.requiresMask ? t('generation.composer.required') : t('common.states.optional') }}</span></label><button v-if="data.maskImage" type="button" @click="clearMaskImage">{{ t('generation.composer.clear') }}</button></div>
+            <button type="button" class="studio-mask-picker" @click="openPicker('mask')"><img v-if="data.maskImage" :src="sourceUrl(data.maskImage)" :alt="t('generation.composer.selectedMaskAlt')" decoding="async"><UIcon v-else name="i-lucide-scan" class="size-5" /><span>{{ data.maskImage ? imageName(data.maskImage) : t('generation.picker.chooseMask') }}</span><UIcon name="i-lucide-chevron-right" class="size-4" /></button>
+            <p class="studio-help">{{ luminanceMask ? t('generation.composer.luminanceMaskHelp') : t('generation.composer.alphaMaskHelp') }}</p>
           </div>
-          <p v-if="referenceOverflow" class="studio-validation" role="alert">Remove {{ referenceOverflow }} shared reference{{ referenceOverflow === 1 ? '' : 's' }} to meet this model’s limit.</p>
-          <p v-if="estimatedOutputCount > 50" class="studio-validation" role="alert">A request supports at most 50 outputs. Reduce the inputs or this model’s output count.</p>
-          <p v-if="missingRequiredMask" class="studio-validation" role="alert">This model requires a PNG mask.</p>
-          <p v-if="maskWithoutReference || maskFileNotPng || maskSourceNotPng" class="studio-validation" role="alert">{{ maskWithoutReference ? 'A mask needs a source image.' : maskFileNotPng ? 'The mask must be PNG.' : 'Every source must be PNG when using this edit mask.' }}</p>
-          <p v-if="!selectedModelAvailable" class="studio-validation" role="alert">{{ selectedModelInfo?.availabilityNote || 'This model is unavailable through AI Gateway.' }}</p>
-          <p v-else-if="selectedModelInfo?.catalogStatus === 'unknown'" class="studio-notice">Live availability is unverified. Requests use this exact curated model.</p>
+          <p v-if="referenceOverflow" class="studio-validation" role="alert">{{ t(referenceOverflow === 1 ? 'generation.validation.referenceOverflowOne' : 'generation.validation.referenceOverflowOther', { count: referenceOverflow }) }}</p>
+          <p v-if="estimatedOutputCount > 50" class="studio-validation" role="alert">{{ t('generation.validation.tooManyOutputs') }}</p>
+          <p v-if="missingRequiredMask" class="studio-validation" role="alert">{{ t('generation.validation.maskRequired') }}</p>
+          <p v-if="maskWithoutReference || maskFileNotPng" class="studio-validation" role="alert">{{ maskWithoutReference ? t('generation.validation.maskNeedsSource') : t('generation.validation.maskNotPng') }}</p>
+          <p v-if="!selectedModelAvailable" class="studio-validation" role="alert">{{ selectedModelInfo?.availabilityNote || t('generation.validation.modelUnavailable') }}</p>
+          <p v-else-if="selectedModelInfo?.catalogStatus === 'unknown'" class="studio-notice">{{ t('generation.validation.availabilityUnverified') }}</p>
           <details class="studio-model-details">
-            <summary>Model details &amp; pricing <UIcon name="i-lucide-info" class="size-4" /></summary>
-            <div class="studio-details-body"><strong>{{ selectedProfile.name }}</strong><p>{{ selectedProfile.description }}</p><code>{{ data.selectedModel }}</code><p v-if="selectedPricingText">{{ selectedPricingText }}</p><p>{{ selectedCostEstimate }}</p><p v-if="selectedProfile.lifecycleNote">{{ selectedProfile.lifecycleNote }}</p><p v-for="warning in selectedWarnings" :key="warning">{{ warning }}</p><p v-if="inputCapabilityWarning">{{ inputCapabilityWarning }}</p></div>
+            <summary>{{ t('generation.details.summary') }} <UIcon name="i-lucide-info" class="size-4" /></summary>
+            <div class="studio-details-body"><strong>{{ selectedProfile.name }}</strong><p>{{ modelText(selectedProfile.description) }}</p><code>{{ data.selectedModel }}</code><p v-if="selectedPricingText">{{ selectedPricingText }}</p><p>{{ selectedCostEstimate }}</p><p v-if="selectedProfile.lifecycleNote">{{ modelText(selectedProfile.lifecycleNote) }}</p><p v-for="warning in selectedWarnings" :key="warning">{{ modelText(warning) }}</p><p v-if="inputCapabilityWarning">{{ inputCapabilityWarning }}</p></div>
           </details>
         </div>
         <div class="studio-prompt-composer">
-          <label for="edit-prompt">Prompt</label>
-          <UTextarea id="edit-prompt" v-model="prompt" class="w-full" :rows="4" placeholder="Describe the changes you want to make…" autoresize />
-          <p v-if="!isEdit" class="studio-help">One prompt for all {{ sourceImages.length }} input images · {{ estimatedOutputCount }} expected output{{ estimatedOutputCount === 1 ? '' : 's' }}.</p>
-          <UButton class="studio-generate-button" icon="i-lucide-sparkles" :loading="!!activeGenerationCount" :disabled="!canSubmit" @click="submit">{{ activeGenerationCount ? 'Generating…' : isEdit ? 'Generate' : 'Run batch' }}</UButton>
+          <label for="edit-prompt">{{ t('generation.prompt.label') }}</label>
+          <UTextarea id="edit-prompt" v-model="prompt" class="w-full" :rows="4" :placeholder="t('generation.prompt.placeholder')" autoresize />
+          <p v-if="!isEdit" class="studio-help">{{ t(estimatedOutputCount === 1 ? 'generation.prompt.batchSummaryOne' : 'generation.prompt.batchSummaryOther', { inputs: sourceImages.length, count: estimatedOutputCount }) }}</p>
+          <UButton class="studio-generate-button" icon="i-lucide-sparkles" :loading="!!activeGenerationCount" :disabled="!canSubmit" @click="submit">{{ activeGenerationCount ? t('generation.prompt.generating') : isEdit ? t('generation.prompt.generate') : t('generation.prompt.runBatch') }}</UButton>
           <p class="studio-generation-price">{{ selectedCostEstimate }}</p>
-          <p v-if="accountBalance.balance.value" class="studio-generation-credit">Available credit: {{ accountBalance.balance.value.unlimited ? 'Unlimited' : formatBalanceUsd(accountBalance.balance.value.actualBalanceUsd) }}</p>
+          <p v-if="accountBalance.balance.value" class="studio-generation-credit">{{ t('generation.prompt.availableCredit', { amount: accountBalance.balance.value.unlimited ? t('common.layout.unlimited') : formatBalanceUsd(accountBalance.balance.value.actualBalanceUsd) }) }}</p>
           <p v-if="creditBlockReason" class="studio-validation" role="status">{{ creditBlockReason }}</p>
-          <div class="studio-submit-preferences"><UCheckbox v-model="keepSubmitInputs" label="Keep prompt and images" /></div>
+          <div class="studio-submit-preferences"><UCheckbox v-model="keepSubmitInputs" :label="t('generation.prompt.keepInputs')" /></div>
         </div>
       </aside>
     </div>
-    <div v-if="errorMsg" role="alert" class="studio-error"><UIcon name="i-lucide-triangle-alert" class="size-4 shrink-0" /><span>{{ errorMsg }}</span><button type="button" aria-label="Dismiss error" @click="errorMsg = null"><UIcon name="i-lucide-x" class="size-4" /></button></div>
+    <div v-if="errorMsg" role="alert" class="studio-error"><UIcon name="i-lucide-triangle-alert" class="size-4 shrink-0" /><span>{{ errorMsg }}</span><button type="button" :aria-label="t('generation.errors.dismiss')" @click="errorMsg = null"><UIcon name="i-lucide-x" class="size-4" /></button></div>
     <section v-if="pendingGenerations.length" class="studio-pending" aria-live="polite">
-      <div class="studio-section-heading"><h2>{{ activeGenerationCount ? `${activeGenerationCount} input jobs running` : 'Unfinished requests' }}</h2><UButton v-if="failedGenerationCount" size="xs" color="neutral" variant="ghost" @click="clearFailedJobs">Clear failed</UButton></div>
-      <div class="studio-pending-grid"><div v-for="job in pendingGenerations" :key="job.id" class="studio-pending-card"><img :src="sourceUrl(job.inputImages[0]!)" alt="Generation source" loading="lazy" decoding="async"><div><UIcon :name="job.status === 'failed' ? 'i-lucide-triangle-alert' : 'i-lucide-loader-circle'" :class="{ 'animate-spin': job.status === 'pending' }" class="size-4" /><strong>{{ job.status === 'failed' ? 'Failed' : 'Generating' }}</strong><span>{{ elapsedLabel(job.startedAt) }}</span><p v-if="job.error">{{ job.error }}</p></div></div></div>
+      <div class="studio-section-heading"><h2>{{ activeGenerationCount ? t(activeGenerationCount === 1 ? 'generation.pending.runningOne' : 'generation.pending.runningOther', { count: activeGenerationCount }) : t('generation.pending.unfinished') }}</h2><UButton v-if="failedGenerationCount" size="xs" color="neutral" variant="ghost" @click="clearFailedJobs">{{ t('generation.pending.clearFailed') }}</UButton></div>
+      <div class="studio-pending-grid"><div v-for="job in pendingGenerations" :key="job.id" class="studio-pending-card"><img :src="sourceUrl(job.inputImages[0]!)" :alt="t('generation.pending.sourceAlt')" loading="lazy" decoding="async"><div><UIcon :name="job.status === 'failed' ? 'i-lucide-triangle-alert' : 'i-lucide-loader-circle'" :class="{ 'animate-spin': job.status === 'pending' }" class="size-4" /><strong>{{ job.status === 'failed' ? t('generation.pending.failed') : t('generation.pending.generating') }}</strong><span>{{ elapsedLabel(job.startedAt) }}</span><p v-if="job.status === 'failed' || job.error">{{ job.error || t('generation.errors.generationFailed') }}</p></div></div></div>
     </section>
     <details class="studio-history" :open="historyOpen" @toggle="historyOpen = ($event.target as HTMLDetailsElement).open">
-      <summary><span>Generation history <span v-if="confirmedHistory.length" class="studio-history-count">{{ confirmedHistory.length }}</span></span><UIcon name="i-lucide-chevron-down" class="size-4" /></summary>
+      <summary><span>{{ t('generation.history.title') }} <span v-if="confirmedHistory.length" class="studio-history-count">{{ confirmedHistory.length }}</span></span><UIcon name="i-lucide-chevron-down" class="size-4" /></summary>
       <div v-if="historyOpen" class="studio-history-content">
-        <p v-if="pastPrompts.status.value === 'pending'" class="studio-help" role="status">Loading history…</p>
-        <p v-else-if="pastPrompts.error.value" class="studio-validation">Could not load generation history. <button type="button" @click="pastPrompts.refresh()">Try again</button></p>
+        <p v-if="pastPrompts.status.value === 'pending'" class="studio-help" role="status">{{ t('generation.history.loading') }}</p>
+        <p v-else-if="pastPrompts.error.value" class="studio-validation">{{ t('generation.history.loadError') }} <button type="button" @click="pastPrompts.refresh()">{{ t('common.actions.retry') }}</button></p>
         <div v-else-if="confirmedHistory.length" class="studio-history-grid"><system-promp v-for="item in confirmedHistory" :key="item.id" :data="item" /></div>
-        <p v-else class="studio-help">Your generated images will appear here with their final prices.</p>
-        <UButton v-if="showMoreHistory" color="neutral" variant="soft" :loading="loadingHistory" @click="loadMoreHistory">Load more history</UButton>
+        <p v-else class="studio-help">{{ t('generation.history.empty') }}</p>
+        <UButton v-if="showMoreHistory" color="neutral" variant="soft" :loading="loadingHistory" @click="loadMoreHistory">{{ t('generation.history.loadMore') }}</UButton>
       </div>
     </details>
-    <div class="studio-debug-toggle"><button type="button" @click="toggleDebugLogs"><UIcon name="i-lucide-bug" class="size-3.5" />{{ debugLogsOpen ? 'Hide' : 'Show' }} Gateway diagnostics</button></div>
+    <div class="studio-debug-toggle"><button type="button" @click="toggleDebugLogs"><UIcon name="i-lucide-bug" class="size-3.5" />{{ debugLogsOpen ? t('generation.diagnostics.hide') : t('generation.diagnostics.show') }}</button></div>
     <section v-if="debugLogsOpen" class="studio-diagnostics">
-      <div class="studio-section-heading"><div><h2>Gateway diagnostics</h2><p class="studio-help">Redacted request records, billing, and provider errors.</p></div><UButton size="xs" color="neutral" variant="ghost" :loading="gatewayLogsPending" @click="gatewayLogs.refresh()">Refresh</UButton></div>
-      <div v-for="log in gatewayLogItems" :key="log.id" class="studio-log"><button type="button" class="studio-log-summary" @click="toggleLogDetails(log.id)"><span>{{ log.status }}</span><span>{{ log.model }}</span><span>{{ formatLogPrice(log.priceUsd, log.priceSource) || 'Cost pending' }}</span><span>{{ formatLogTime(log.createdAt) }}</span><UIcon :name="isLogExpanded(log.id) ? 'i-lucide-chevron-up' : 'i-lucide-chevron-down'" class="size-4" /></button><div v-if="isLogExpanded(log.id)" class="studio-log-body"><p>{{ log.prompt }}</p><p v-if="log.error" class="studio-validation">{{ log.error }}</p><p>{{ formatLogImages(log.inputImages) }} inputs · {{ formatLogImages(log.modelImages) }} references · {{ log.totalTokens?.toLocaleString() || 'Unknown' }} tokens</p><div class="studio-log-json"><div><h3>Request</h3><pre>{{ formatJson(log.requestJson) }}</pre></div><div><h3>Response</h3><pre>{{ formatJson(log.responseJson) }}</pre></div></div></div></div>
-      <p v-if="!gatewayLogItems.length" class="studio-help">No Gateway diagnostics yet.</p>
+      <div class="studio-section-heading"><div><h2>{{ t('generation.diagnostics.title') }}</h2><p class="studio-help">{{ t('generation.diagnostics.description') }}</p></div><UButton size="xs" color="neutral" variant="ghost" :loading="gatewayLogsPending" @click="gatewayLogs.refresh()">{{ t('common.actions.refresh') }}</UButton></div>
+      <div v-for="log in gatewayLogItems" :key="log.id" class="studio-log"><button type="button" class="studio-log-summary" @click="toggleLogDetails(log.id)"><span>{{ log.status }}</span><span>{{ log.model }}</span><span>{{ formatLogPrice(log.priceUsd, log.priceSource) || t('generation.diagnostics.costPending') }}</span><span>{{ formatLogTime(log.createdAt) }}</span><UIcon :name="isLogExpanded(log.id) ? 'i-lucide-chevron-up' : 'i-lucide-chevron-down'" class="size-4" /></button><div v-if="isLogExpanded(log.id)" class="studio-log-body"><p>{{ log.prompt }}</p><p v-if="log.error" class="studio-validation">{{ log.error }}</p><p>{{ formatLogSummary(log) }}</p><div class="studio-log-json"><div><h3>{{ t('generation.diagnostics.request') }}</h3><pre>{{ formatJson(log.requestJson) }}</pre></div><div><h3>{{ t('generation.diagnostics.response') }}</h3><pre>{{ formatJson(log.responseJson) }}</pre></div></div></div></div>
+      <p v-if="!gatewayLogItems.length" class="studio-help">{{ t('generation.diagnostics.empty') }}</p>
     </section>
   </div>
 </template>

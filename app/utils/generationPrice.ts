@@ -1,5 +1,6 @@
 import {hasConfirmedGenerationPrice} from '../../schemas/generation-billing'
 import {formatUsdUnits, parseUsdUnits} from '../../schemas/account-billing'
+import {fallbackTranslator, type Translate} from './uiMessage'
 
 export type GenerationPrice = {priceUsd?: string | null; priceSource?: string | null; billingState?: string | null}
 
@@ -21,8 +22,16 @@ export function formatBalanceUsd(value?: string | null): string {
   return formatUsd(value)
 }
 
-export function generationPriceLabel(row: GenerationPrice): string {
+const englishPriceLabels = fallbackTranslator({
+  'account.price.confirmed': '{amount} · confirmed',
+  'account.price.estimate': '{amount} · estimate, final price pending',
+  'account.price.pending': 'Price pending confirmation',
+})
+
+// Components pass their `t` from useI18n() so the label follows the active
+// language; the English fallback keeps plain node callers working.
+export function generationPriceLabel(row: GenerationPrice, t: Translate = englishPriceLabels): string {
   const amount = formatUsd(row.priceUsd)
-  if (hasConfirmedGenerationPrice(row)) return `${amount} · confirmed`
-  return row.priceSource === 'estimate' && amount ? `${amount} · estimate, final price pending` : 'Price pending confirmation'
+  if (hasConfirmedGenerationPrice(row)) return t('account.price.confirmed', {amount})
+  return row.priceSource === 'estimate' && amount ? t('account.price.estimate', {amount}) : t('account.price.pending')
 }

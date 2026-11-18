@@ -13,6 +13,7 @@ import {
     type StoredGenerationError,
 } from '../../schemas/image-generation'
 import { catalogImageOptions } from './catalogImageOptions'
+import { convertSourceToPng } from './generatedImageFormat'
 import {settleWithinMs} from './gatewayTimeout'
 import {
     getGatewayMetadataLookupPool,
@@ -701,28 +702,38 @@ export async function useGateway(imageStorage?: GenerationImageStorage) {
             : isOpenAiImageSettings(opts.settings)
                 ? new Set(['image/png', 'image/jpeg', 'image/webp'])
                 : new Set(['image/png', 'image/jpeg'])
+        // GPT Image (alpha-mask) edits need every image in the mask's PNG format.
+        const pngForMask = !!opts.maskImage && IMAGE_MODEL_PROFILES[opts.model]?.maskMode !== 'luminance'
         let totalBytes = 0
         for (const imagePath of paths) {
             requestAbortSignal?.throwIfAborted()
             const image = await fs.getImageFile(imagePath)
             requestAbortSignal?.throwIfAborted()
-            if (!allowedMediaTypes.has(image.mimeType)) {
-                throw createError({
-                    statusCode: 415,
-                    statusMessage: `${opts.model} does not accept ${image.mimeType} reference images. Use ${[...allowedMediaTypes].join(', ')}.`,
-                })
+            let buffer = image.buffer
+            let mediaType = image.mimeType
+            // Stored images (WebP by default) are converted to PNG in memory
+            // when the model cannot take their format or a GPT mask needs PNG.
+            // The stored object and its replay path are unchanged.
+            if (mediaType !== 'image/png' && (pngForMask || !allowedMediaTypes.has(mediaType))) {
+                const png = await convertSourceToPng(buffer, mediaType, {preserveGeometry: pngForMask})
+                requestAbortSignal?.throwIfAborted()
+                if (!png) {
+                    throw createError({
+                        statusCode: 415,
+                        statusMessage: `${opts.model} does not accept ${image.mimeType} reference images. Use ${[...allowedMediaTypes].join(', ')}.`,
+                    })
+                }
+                buffer = png
+                mediaType = 'image/png'
             }
-            totalBytes += image.buffer.length
+            totalBytes += buffer.length
             if (totalBytes > 100 * 1024 * 1024) {
                 throw createError({
                     statusCode: 413,
                     statusMessage: 'Reference images may total at most 100 MB per provider request.',
                 })
             }
-            files.push({
-                buffer: image.buffer,
-                mediaType: image.mimeType,
-            })
+            files.push({buffer, mediaType})
         }
         return files
     }

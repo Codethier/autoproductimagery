@@ -31,6 +31,8 @@ import {
 import { useImageModelFavourites } from "../composables/useImageModelFavourites";
 import { imagePreviewUrl } from "../utils/imageDelivery";
 import { pipelineNodeIcon } from "../utils/pipelineTemplates";
+import { pipelinePortLabel } from "../utils/pipelineEditor";
+import { useModelText } from "../composables/useModelText";
 import Gemini31FlashImageSettings from "./generation-settings/Gemini31FlashImageSettings.vue";
 import Gemini3ProImageSettings from "./generation-settings/Gemini3ProImageSettings.vue";
 import Gemini31FlashLiteImageSettings from "./generation-settings/Gemini31FlashLiteImageSettings.vue";
@@ -66,9 +68,21 @@ const {
   ready: favouritesReady,
   toggleFavourite,
 } = useImageModelFavourites();
+const { t } = useI18n();
+const { modelText } = useModelText();
 const label = ref(props.node.label);
 const draftNode = ref<PipelineNode>(props.node);
-const errorMessage = ref("");
+// Shared-schema (Zod) issue text is shown as returned; the generic fallback is a
+// message key so it follows a runtime language switch.
+const errorState = ref<{ text: string } | null>(null);
+const errorMessage = computed(() =>
+  errorState.value
+    ? errorState.value.text || t("pipelineEditor.properties.checkSetting")
+    : "",
+);
+const portName = (port: { label: string }) => pipelinePortLabel(t, port);
+const reasoningLabel = (level: string) =>
+  t(`pipelineEditor.properties.reasoning.${level}`);
 const config = computed(() => props.node.config as Record<string, unknown>);
 const ai = computed(() =>
   "settings" in props.node.config && "model" in props.node.config
@@ -133,13 +147,13 @@ const inputOptions = (portId: string) => {
         )
         .map((output) => ({
           value: `${value.id}:${output.id}`,
-          label: `${value.label} · ${output.label}`,
+          label: `${value.label} · ${portName(output)}`,
         })),
     );
 };
 const edgeName = (edge: PipelineEdge) =>
   props.definition.nodes.find((value) => value.id === edge.source)?.label ??
-  "Removed node";
+  t("pipelineEditor.properties.removedNode");
 function updateNode(
   changes: Record<string, unknown>,
   nextLabel = draftNode.value.label,
@@ -151,11 +165,10 @@ function updateNode(
     config: { ...draftNode.value.config, ...changes },
   });
   if (!parsed.success) {
-    errorMessage.value =
-      parsed.error.issues[0]?.message ?? "Check this setting.";
+    errorState.value = { text: parsed.error.issues[0]?.message ?? "" };
     return;
   }
-  errorMessage.value = "";
+  errorState.value = null;
   draftNode.value = parsed.data;
   emit("update", parsed.data);
 }
@@ -190,7 +203,7 @@ function changeEnhancerModel(event: Event) {
     ...createPromptEnhancerConfig(model), prompt: current.prompt, systemPrompt: current.systemPrompt,
   }});
   if (!parsed.success) return;
-  errorMessage.value = "";
+  errorState.value = null;
   draftNode.value = parsed.data;
   emit("update", parsed.data);
 }
@@ -208,7 +221,7 @@ function changeEnhancerReasoning(event: Event) {
       GEMINI_ENHANCER_THINKING_BUDGETS[reasoningEffort as keyof typeof GEMINI_ENHANCER_THINKING_BUDGETS] + 64);
   const parsed = PipelineNodeSchema.safeParse({...draftNode.value, config: next});
   if (!parsed.success) return;
-  errorMessage.value = "";
+  errorState.value = null;
   draftNode.value = parsed.data;
   emit("update", parsed.data);
 }
@@ -271,32 +284,32 @@ watch(
   () => [props.node.id, props.node.label],
   () => {
     label.value = props.node.label;
-    errorMessage.value = "";
+    errorState.value = null;
   },
 );
 </script>
 
 <template>
-  <aside class="pipeline-inspector" aria-label="Node properties">
+  <aside class="pipeline-inspector" :aria-label="t('pipelineEditor.properties.ariaLabel')">
     <header>
       <span class="pipeline-inspector-icon"
         ><UIcon :name="pipelineNodeIcon(node.type)"
       /></span>
       <div>
-        <small>Selected step</small>
+        <small>{{ t("pipelineEditor.properties.selectedStep") }}</small>
         <h2>{{ node.label }}</h2>
       </div>
       <button
         type="button"
         class="pipeline-icon"
-        aria-label="Close node properties"
+        :aria-label="t('pipelineEditor.properties.close')"
         @click="emit('close')"
       >
         <UIcon name="i-lucide-x" />
       </button>
     </header>
     <div class="pipeline-inspector-body">
-      <label class="pipeline-label" for="pipeline-node-name">Step name</label
+      <label class="pipeline-label" for="pipeline-node-name">{{ t("pipelineEditor.properties.stepName") }}</label
       ><input
         id="pipeline-node-name"
         :value="label"
@@ -306,15 +319,15 @@ watch(
         @input="rename"
       />
       <section v-if="ports.inputs.length" class="pipeline-section">
-        <h3>Connections</h3>
+        <h3>{{ t("pipelineEditor.properties.connections") }}</h3>
         <div
           v-for="port in ports.inputs"
           :key="port.id"
           class="pipeline-port-setting"
         >
           <label class="pipeline-label" :for="`pipeline-connect-${port.id}`"
-            >{{ port.label }} <span v-if="port.required">required</span
-            ><span v-else>optional</span></label
+            >{{ portName(port) }} <span v-if="port.required">{{ t("pipelineEditor.properties.required") }}</span
+            ><span v-else>{{ t("pipelineEditor.properties.optional") }}</span></label
           >
           <div
             v-for="edge in connections.filter(
@@ -331,7 +344,7 @@ watch(
               type="button"
               class="pipeline-icon"
               :disabled="disabled"
-              :aria-label="`Disconnect ${edgeName(edge)} from ${port.label}`"
+              :aria-label="t('pipelineEditor.properties.disconnect', { source: edgeName(edge), port: portName(port) })"
               @click="emit('disconnect', edge.id)"
             >
               <UIcon name="i-lucide-unplug" />
@@ -344,7 +357,7 @@ watch(
             @change="connect(port.id, $event)"
           >
             <option value="">
-              {{ port.multiple ? "Add a connection…" : "Connect from…" }}
+              {{ port.multiple ? t("pipelineEditor.properties.addConnection") : t("pipelineEditor.properties.connectFrom") }}
             </option>
             <option
               v-for="option in inputOptions(port.id)"
@@ -357,11 +370,10 @@ watch(
         </div>
       </section>
       <section class="pipeline-section">
-        <h3>Settings</h3>
+        <h3>{{ t("pipelineEditor.properties.settings") }}</h3>
         <template v-if="node.type === 'image-input'"
           ><p class="pipeline-help">
-            Choose this input when running a batch. Each selected picture runs
-            through the pipeline independently.
+            {{ t("pipelineEditor.properties.imageInputHelp") }}
           </p>
           <label class="pipeline-checkbox"
             ><input
@@ -369,7 +381,7 @@ watch(
               :checked="node.config.required"
               :disabled="disabled"
               @change="boolean('required', $event)"
-            />Required input</label
+            />{{ t("pipelineEditor.properties.requiredInput") }}</label
           ><button
             type="button"
             class="pipeline-secondary"
@@ -378,20 +390,20 @@ watch(
           >
             <UIcon name="i-lucide-image-plus" />{{
               node.config.defaultImage
-                ? "Change default picture"
-                : "Choose default picture"
+                ? t("pipelineEditor.properties.changeDefaultPicture")
+                : t("pipelineEditor.properties.chooseDefaultPicture")
             }}
           </button>
           <div v-if="node.config.defaultImage" class="pipeline-reference-list">
             <img
               :src="imagePreviewUrl(node.config.defaultImage, 160)"
-              alt="Default input"
+              :alt="t('pipelineEditor.properties.defaultInputAlt')"
               loading="lazy"
             /><button
               type="button"
               class="pipeline-icon"
               :disabled="disabled"
-              aria-label="Remove default picture"
+              :aria-label="t('pipelineEditor.properties.removeDefaultPicture')"
               @click="removeImage('defaultImage', node.config.defaultImage)"
             >
               <UIcon name="i-lucide-x" />
@@ -399,7 +411,7 @@ watch(
         ></template>
         <template v-if="node.type === 'text-input'"
           ><label class="pipeline-label" for="pipeline-default-text"
-            >Default value</label
+            >{{ t("pipelineEditor.properties.defaultValue") }}</label
           ><textarea
             id="pipeline-default-text"
             class="pipeline-input"
@@ -414,11 +426,11 @@ watch(
               :checked="node.config.required"
               :disabled="disabled"
               @change="boolean('required', $event)"
-            />Required input</label
+            />{{ t("pipelineEditor.properties.requiredInput") }}</label
           ></template
         >
         <template v-if="node.type === 'static-text'"
-          ><label class="pipeline-label" for="pipeline-static-text">Text</label
+          ><label class="pipeline-label" for="pipeline-static-text">{{ t("pipelineEditor.properties.text") }}</label
           ><textarea
             id="pipeline-static-text"
             class="pipeline-input"
@@ -431,8 +443,7 @@ watch(
         </template>
         <template v-if="node.type === 'people-input'">
           <p class="pipeline-help">
-            Choose pictures from your People or profiles shared with you.
-            These references stay the same for every product in a batch.
+            {{ t("pipelineEditor.properties.peopleHelp") }}
           </p>
           <button
             type="button"
@@ -440,20 +451,20 @@ watch(
             :disabled="disabled"
             @click="selectImage('images')"
           >
-            <UIcon name="i-lucide-contact-round" />Choose person pictures
+            <UIcon name="i-lucide-contact-round" />{{ t("pipelineEditor.properties.choosePeople") }}
           </button>
           <div class="pipeline-reference-list">
             <div v-for="url in node.config.images" :key="url">
               <img
                 :src="imagePreviewUrl(url, 160)"
-                alt="Person reference"
+                :alt="t('pipelineEditor.properties.personAlt')"
                 loading="lazy"
               />
               <button
                 type="button"
                 class="pipeline-icon"
                 :disabled="disabled"
-                aria-label="Remove person reference"
+                :aria-label="t('pipelineEditor.properties.removePerson')"
                 @click="removeImage('images', url)"
               >
                 <UIcon name="i-lucide-x" />
@@ -461,7 +472,7 @@ watch(
             </div>
           </div>
           <p class="pipeline-help">
-            {{ node.config.images.length }} / 16 person pictures selected
+            {{ t("pipelineEditor.properties.peopleCount", { count: node.config.images.length, max: 16 }) }}
           </p>
           <button
             v-if="node.config.images.length"
@@ -470,17 +481,15 @@ watch(
             :disabled="disabled"
             @click="updateNode({ images: [] })"
           >
-            <UIcon name="i-lucide-x" />Clear selection
+            <UIcon name="i-lucide-x" />{{ t("pipelineEditor.properties.clearSelection") }}
           </button>
           <p class="pipeline-help">
-            Connect this node to Generate Image → References to reuse the
-            selected people in your generated pictures. The selected model’s
-            reference-picture limit still applies.
+            {{ t("pipelineEditor.properties.peopleConnectHelp") }}
           </p>
         </template>
         <template v-if="node.type === 'static-image'"
           ><p class="pipeline-help">
-            Reuse pictures from your Library, shared files or People.
+            {{ t("pipelineEditor.properties.staticImageHelp") }}
           </p>
           <button
             type="button"
@@ -488,19 +497,19 @@ watch(
             :disabled="disabled"
             @click="selectImage('images')"
           >
-            <UIcon name="i-lucide-images" />Choose pictures
+            <UIcon name="i-lucide-images" />{{ t("pipelineEditor.properties.choosePictures") }}
           </button>
           <div class="pipeline-reference-list">
             <div v-for="url in node.config.images" :key="url">
               <img
                 :src="imagePreviewUrl(url, 160)"
-                alt="Static reference"
+                :alt="t('pipelineEditor.properties.staticAlt')"
                 loading="lazy"
               /><button
                 type="button"
                 class="pipeline-icon"
                 :disabled="disabled"
-                aria-label="Remove static reference"
+                :aria-label="t('pipelineEditor.properties.removeStatic')"
                 @click="removeImage('images', url)"
               >
                 <UIcon name="i-lucide-x" />
@@ -508,7 +517,7 @@ watch(
             </div>
           </div>
           <p class="pipeline-help">
-            {{ node.config.images.length }} / 16 pictures
+            {{ t("pipelineEditor.properties.picturesCount", { count: node.config.images.length, max: 16 }) }}
           </p></template
         >
         <template
@@ -520,7 +529,7 @@ watch(
           "
         >
           <label class="pipeline-label" for="pipeline-image-model"
-            >Image model</label
+            >{{ t("pipelineEditor.properties.imageModel") }}</label
           >
           <div class="pipeline-model-select">
             <select
@@ -538,16 +547,16 @@ watch(
               >
                 {{ favouriteSet.has(item.id) ? "♥ " : ""
                 }}{{ item.profile.shortName
-                }}{{ isNewImageModel(item.id) ? " · New" : ""
-                }}{{ item.profile.supportsTransparentBackground ? " · Transparent" : ""
-                }}{{ !item.available ? " · unavailable" : "" }}
+                }}{{ isNewImageModel(item.id) ? ` · ${t("pipelineEditor.tags.new")}` : ""
+                }}{{ item.profile.supportsTransparentBackground ? ` · ${t("pipelineEditor.tags.transparent")}` : ""
+                }}{{ !item.available ? ` · ${t("pipelineEditor.tags.unavailable")}` : "" }}
               </option></select
             ><button
               type="button"
               class="pipeline-icon"
               :disabled="disabled || !favouritesReady"
               :aria-pressed="favouriteSet.has(ai.model)"
-              :aria-label="`${favouriteSet.has(ai.model) ? 'Remove' : 'Add'} ${imageProfile.shortName} ${favouriteSet.has(ai.model) ? 'from' : 'to'} favourites`"
+              :aria-label="t(favouriteSet.has(ai.model) ? 'pipelineEditor.properties.favouriteRemove' : 'pipelineEditor.properties.favouriteAdd', { model: imageProfile.shortName })"
               @click="toggleFavourite(ai.model)"
             >
               <UIcon
@@ -557,16 +566,16 @@ watch(
             </button>
           </div>
           <p v-if="imageProfile.requiresMask" class="pipeline-help">
-            This model requires a connected mask or a selected mask picture.
+            {{ t("pipelineEditor.properties.requiresMask") }}
           </p>
           <ModelGuidance :model-id="ai.model" :settings="ai.settings" context="pipeline" compact />
           <details class="pipeline-model-settings">
             <summary>
-              Model settings
-              <small v-if="imageProfile.supportsTransparentBackground" class="pipeline-transparency-badge model-transparent-badge" title="Supports transparent image output; enable it in model settings." aria-label="Supports transparent image output">Transparent</small>
-              <small v-if="isNewImageModel(ai.model)">New</small>
+              {{ t("pipelineEditor.properties.modelSettings") }}
+              <small v-if="imageProfile.supportsTransparentBackground" class="pipeline-transparency-badge model-transparent-badge" :title="t('pipelineEditor.properties.transparentTitle')" :aria-label="t('pipelineEditor.properties.transparentAria')">{{ t("pipelineEditor.tags.transparent") }}</small>
+              <small v-if="isNewImageModel(ai.model)">{{ t("pipelineEditor.tags.new") }}</small>
             </summary>
-            <p v-if="imageProfile.supportsTransparentBackground" class="pipeline-help pipeline-transparency-help">For a transparent image, choose Background → Transparent and use PNG or WebP.</p>
+            <p v-if="imageProfile.supportsTransparentBackground" class="pipeline-help pipeline-transparency-help">{{ t("pipelineEditor.properties.transparentHelp") }}</p>
             <NuxtErrorBoundary :key="ai.model"
               ><component
                 :is="settingsComponent"
@@ -574,23 +583,30 @@ watch(
                 @update:model-value="settings"
               /><template #error
                 ><p class="pipeline-error">
-                  Settings could not load.
+                  {{ t("pipelineEditor.properties.settingsLoadFailed") }}
                   <button
                     type="button"
                     @click="
                       updateNode({ settings: createDefaultSettings(ai!.model) })
                     "
                   >
-                    Restore defaults
+                    {{ t("pipelineEditor.properties.restoreDefaults") }}
                   </button>
                 </p></template
               ></NuxtErrorBoundary
             >
           </details>
+          <SaveFormatSetting
+            class="pipeline-save-format"
+            compact
+            :disabled="disabled"
+            :model-value="config.saveFormat === 'original' || config.saveFormat === 'png' ? config.saveFormat : 'webp'"
+            @update:model-value="value => updateNode({ saveFormat: value })"
+          />
         </template>
         <template v-if="node.type === 'generate-image'"
           ><label class="pipeline-label" for="pipeline-generation-prompt"
-            >Prompt</label
+            >{{ t("pipelineEditor.properties.prompt") }}</label
           ><textarea
             id="pipeline-generation-prompt"
             class="pipeline-input"
@@ -598,11 +614,10 @@ watch(
             rows="6"
             maxlength="20000"
             :disabled="disabled"
-            placeholder="Describe the picture, or connect a text step."
+            :placeholder="t('pipelineEditor.properties.promptPlaceholder')"
             @input="text('prompt', $event)" />
           <p class="pipeline-help">
-            A connected prompt is combined with these instructions. The input
-            picture and references use the selected model’s limits.
+            {{ t("pipelineEditor.properties.promptHelp") }}
           </p>
           <button
             type="button"
@@ -610,20 +625,19 @@ watch(
             :disabled="disabled"
             @click="selectImage('referenceImages')"
           >
-            <UIcon name="i-lucide-contact-round" />Choose identity & style
-            references
+            <UIcon name="i-lucide-contact-round" />{{ t("pipelineEditor.properties.chooseReferences") }}
           </button>
           <div class="pipeline-reference-list">
             <div v-for="url in node.config.referenceImages" :key="url">
               <img
                 :src="imagePreviewUrl(url, 160)"
-                alt="Generation reference"
+                :alt="t('pipelineEditor.properties.generationReferenceAlt')"
                 loading="lazy"
               /><button
                 type="button"
                 class="pipeline-icon"
                 :disabled="disabled"
-                aria-label="Remove generation reference"
+                :aria-label="t('pipelineEditor.properties.removeGenerationReference')"
                 @click="removeImage('referenceImages', url)"
               >
                 <UIcon name="i-lucide-x" />
@@ -638,19 +652,19 @@ watch(
               @click="selectImage('maskImage')"
             >
               {{
-                node.config.maskImage ? "Change mask" : "Choose mask picture"
+                node.config.maskImage ? t("pipelineEditor.properties.changeMask") : t("pipelineEditor.properties.chooseMask")
               }}
             </button>
             <div v-if="node.config.maskImage" class="pipeline-reference-list">
               <img
                 :src="imagePreviewUrl(node.config.maskImage, 160)"
-                alt="Mask"
+                :alt="t('pipelineEditor.properties.maskAlt')"
                 loading="lazy"
               /><button
                 type="button"
                 class="pipeline-icon"
                 :disabled="disabled"
-                aria-label="Remove mask"
+                :aria-label="t('pipelineEditor.properties.removeMask')"
                 @click="removeImage('maskImage', node.config.maskImage)"
               >
                 <UIcon name="i-lucide-x" />
@@ -658,7 +672,7 @@ watch(
         ></template>
         <template v-if="node.type === 'remove-background'"
           ><label class="pipeline-label" for="pipeline-cutout-model"
-            >CPU model</label
+            >{{ t("pipelineEditor.properties.cpuModel") }}</label
           ><select
             id="pipeline-cutout-model"
             class="pipeline-input"
@@ -671,19 +685,18 @@ watch(
               :key="profile.id"
               :value="profile.id"
             >
-              {{ profile.label }}{{ profile.supportsTransparentBackground ? " · Transparent" : "" }}
+              {{ modelText(profile.label) }}{{ profile.supportsTransparentBackground ? ` · ${t("pipelineEditor.tags.transparent")}` : "" }}
             </option>
           </select>
           <p class="pipeline-help">
-            $0 provider charge. One inference runs at a time. Full BiRefNet
-            takes longer and needs more memory.
+            {{ t("pipelineEditor.properties.removalHelp") }}
           </p></template
         >
         <template v-if="node.type === 'crop' || node.type === 'resize'"
           ><div class="pipeline-field-grid">
             <div>
               <label class="pipeline-label" for="pipeline-width"
-                >Width (px)</label
+                >{{ t("pipelineEditor.properties.width") }}</label
               ><input
                 id="pipeline-width"
                 class="pipeline-input"
@@ -697,7 +710,7 @@ watch(
             </div>
             <div>
               <label class="pipeline-label" for="pipeline-height"
-                >Height (px)</label
+                >{{ t("pipelineEditor.properties.height") }}</label
               ><input
                 id="pipeline-height"
                 class="pipeline-input"
@@ -712,7 +725,7 @@ watch(
           </div>
           <template v-if="node.type === 'crop'"
             ><label class="pipeline-label" for="pipeline-crop-position"
-              >Focus position</label
+              >{{ t("pipelineEditor.properties.focusPosition") }}</label
             ><select
               id="pipeline-crop-position"
               class="pipeline-input"
@@ -725,11 +738,11 @@ watch(
                 :key="value"
                 :value="value"
               >
-                {{ value }}
+                {{ t(`pipelineEditor.properties.positions.${value}`) }}
               </option>
             </select></template
           ><template v-else
-            ><label class="pipeline-label" for="pipeline-fit">Fit</label
+            ><label class="pipeline-label" for="pipeline-fit">{{ t("pipelineEditor.properties.fit") }}</label
             ><select
               id="pipeline-fit"
               class="pipeline-input"
@@ -748,26 +761,25 @@ watch(
                 :key="value"
                 :value="value"
               >
-                {{ value }}
+                {{ t(`pipelineEditor.properties.fits.${value}`) }}
               </option></select
             ><label class="pipeline-label" for="pipeline-background-color"
-              >Background</label
+              >{{ t("pipelineEditor.properties.background") }}</label
             ><input
               id="pipeline-background-color"
               class="pipeline-input"
               :value="node.config.background"
               :disabled="disabled"
-              placeholder="transparent or #ffffff"
+              :placeholder="t('pipelineEditor.properties.backgroundPlaceholder')"
               @input="text('background', $event)"
           /></template>
           <p class="pipeline-help">
-            Local image processing has $0 provider charge. Outputs are limited
-            to 40 megapixels.
+            {{ t("pipelineEditor.properties.localHelp") }}
           </p></template
         >
         <template v-if="node.type === 'upscale'"
           ><label class="pipeline-label" for="pipeline-upscale-mode"
-            >Method</label
+            >{{ t("pipelineEditor.properties.method") }}</label
           ><select
             id="pipeline-upscale-mode"
             class="pipeline-input"
@@ -775,10 +787,10 @@ watch(
             :disabled="disabled"
             @change="choice('mode', $event)"
           >
-            <option value="standard">Standard · $0 provider charge</option>
-            <option value="ai">AI detail · image model</option></select
+            <option value="standard">{{ t("pipelineEditor.properties.upscaleStandard") }}</option>
+            <option value="ai">{{ t("pipelineEditor.properties.upscaleAi") }}</option></select
           ><label class="pipeline-label" for="pipeline-upscale-factor"
-            >Scale</label
+            >{{ t("pipelineEditor.properties.scale") }}</label
           ><select
             id="pipeline-upscale-factor"
             class="pipeline-input"
@@ -792,7 +804,7 @@ watch(
         >
         <template v-if="node.type === 'expand'"
           ><label class="pipeline-label" for="pipeline-expand-mode"
-            >Expand by</label
+            >{{ t("pipelineEditor.properties.expandBy") }}</label
           ><select
             id="pipeline-expand-mode"
             class="pipeline-input"
@@ -800,13 +812,13 @@ watch(
             :disabled="disabled"
             @change="choice('mode', $event)"
           >
-            <option value="pixels">Pixels</option>
-            <option value="aspect-ratio">Aspect ratio</option>
+            <option value="pixels">{{ t("pipelineEditor.properties.pixels") }}</option>
+            <option value="aspect-ratio">{{ t("pipelineEditor.properties.aspectRatio") }}</option>
           </select>
           <div v-if="node.config.mode === 'pixels'" class="pipeline-field-grid">
             <div v-for="side in ['top', 'bottom', 'left', 'right']" :key="side">
               <label class="pipeline-label" :for="`pipeline-expand-${side}`"
-                >{{ side }} (px)</label
+                >{{ t(`pipelineEditor.properties.sides.${side}`) }}</label
               ><input
                 :id="`pipeline-expand-${side}`"
                 class="pipeline-input"
@@ -821,7 +833,7 @@ watch(
           </div>
           <template v-else
             ><label class="pipeline-label" for="pipeline-expand-ratio"
-              >Target aspect ratio</label
+              >{{ t("pipelineEditor.properties.targetAspectRatio") }}</label
             ><select
               id="pipeline-expand-ratio"
               class="pipeline-input"
@@ -848,7 +860,7 @@ watch(
               </option>
             </select></template
           ><label class="pipeline-label" for="pipeline-creativity"
-            >Creativity · {{ node.config.creativity }}</label
+            >{{ t("pipelineEditor.properties.creativity", { value: node.config.creativity }) }}</label
           ><input
             id="pipeline-creativity"
             class="pipeline-range"
@@ -860,7 +872,7 @@ watch(
             :disabled="disabled"
             @input="numeric('creativity', $event)"
           /><label class="pipeline-label" for="pipeline-expand-prompt"
-            >Scene instructions</label
+            >{{ t("pipelineEditor.properties.sceneInstructions") }}</label
           ><textarea
             id="pipeline-expand-prompt"
             class="pipeline-input"
@@ -871,13 +883,12 @@ watch(
             @input="text('prompt', $event)"
           />
           <p class="pipeline-help">
-            AI expansion uses the selected image model and its final confirmed
-            price.
+            {{ t("pipelineEditor.properties.expandHelp") }}
           </p></template
         >
         <template v-if="node.type === 'translate'"
           ><label class="pipeline-label" for="pipeline-language"
-            >Translate to</label
+            >{{ t("pipelineEditor.properties.translateTo") }}</label
           ><input
             id="pipeline-language"
             class="pipeline-input"
@@ -886,7 +897,7 @@ watch(
             :disabled="disabled"
             @input="text('language', $event)"
           /><label class="pipeline-label" for="pipeline-translation-prompt"
-            >Design instructions</label
+            >{{ t("pipelineEditor.properties.designInstructions") }}</label
           ><textarea
             id="pipeline-translation-prompt"
             class="pipeline-input"
@@ -905,22 +916,22 @@ watch(
           "
           >
           <template v-if="node.type === 'prompt-enhancer'">
-            <label class="pipeline-label" for="pipeline-enhancer-model">Prompt enhancement model</label>
+            <label class="pipeline-label" for="pipeline-enhancer-model">{{ t("pipelineEditor.properties.enhancerModel") }}</label>
             <select id="pipeline-enhancer-model" class="pipeline-input" :value="node.config.model" :disabled="disabled" @change="changeEnhancerModel">
               <option v-for="id in PIPELINE_TEXT_MODEL_IDS" :key="id" :value="id">{{ PIPELINE_TEXT_MODEL_PROFILES[id].name }}</option>
             </select>
-            <p class="pipeline-help">{{ textProfile?.description }} These steps improve text; connect their output to an image generator’s Prompt input.</p>
-            <label class="pipeline-label" for="pipeline-enhancer-reasoning">Reasoning effort (attention level)</label>
+            <p class="pipeline-help">{{ modelText(textProfile?.description) }} {{ t("pipelineEditor.properties.enhancerHelp") }}</p>
+            <label class="pipeline-label" for="pipeline-enhancer-reasoning">{{ t("pipelineEditor.properties.reasoningEffort") }}</label>
             <select id="pipeline-enhancer-reasoning" class="pipeline-input" :value="node.config.reasoningEffort ?? 'none'" :disabled="disabled" @change="changeEnhancerReasoning">
-              <option v-for="level in textProfile?.reasoningLevels" :key="level" :value="level">{{ level === 'xhigh' ? 'Extra high' : level.charAt(0).toUpperCase() + level.slice(1) }}</option>
+              <option v-for="level in textProfile?.reasoningLevels" :key="level" :value="level">{{ reasoningLabel(level) }}</option>
             </select>
-            <p class="pipeline-help">{{ textProfile?.reasoningHelp }}</p>
+            <p class="pipeline-help">{{ modelText(textProfile?.reasoningHelp) }}</p>
           </template>
           <p class="pipeline-help">
-            {{ textProfile?.name }} through AI Gateway. Text steps have confirmed usage costs too; their prices appear after Gateway confirms them.
+            {{ t("pipelineEditor.properties.gatewayHelp", { model: textProfile?.name ?? "" }) }}
           </p>
           <label class="pipeline-label" for="pipeline-system-prompt"
-            >System instruction</label
+            >{{ t("pipelineEditor.properties.systemInstruction") }}</label
           ><textarea
             id="pipeline-system-prompt"
             class="pipeline-input"
@@ -931,7 +942,7 @@ watch(
             @input="text('systemPrompt', $event)" /><label
             class="pipeline-label"
             for="pipeline-text-prompt"
-            >Additional instruction</label
+            >{{ t("pipelineEditor.properties.additionalInstruction") }}</label
           ><textarea
             id="pipeline-text-prompt"
             class="pipeline-input"
@@ -943,7 +954,7 @@ watch(
           <div class="pipeline-field-grid">
             <div v-if="textTemperatureEnabled">
               <label class="pipeline-label" for="pipeline-temperature"
-                >Temperature</label
+                >{{ t("pipelineEditor.properties.temperature") }}</label
               ><input
                 id="pipeline-temperature"
                 class="pipeline-input"
@@ -958,7 +969,7 @@ watch(
             </div>
             <div>
               <label class="pipeline-label" for="pipeline-text-tokens"
-                >Output token cap</label
+                >{{ t("pipelineEditor.properties.outputTokenCap") }}</label
               ><input
                 id="pipeline-text-tokens"
                 class="pipeline-input"
@@ -973,7 +984,7 @@ watch(
         ></template>
         <template v-if="node.type === 'prompt-concatenator'"
           ><label class="pipeline-label" for="pipeline-text-separator"
-            >Separator</label
+            >{{ t("pipelineEditor.properties.separator") }}</label
           ><select
             id="pipeline-text-separator"
             class="pipeline-input"
@@ -981,19 +992,19 @@ watch(
             :disabled="disabled"
             @change="choice('separator', $event)"
           >
-            <option value="\n">New line</option>
-            <option value="\n\n">Blank line</option>
-            <option value=" ">Space</option>
-            <option value=", ">Comma</option>
-            <option value="">None</option>
+            <option value="\n">{{ t("pipelineEditor.properties.separators.newLine") }}</option>
+            <option value="\n\n">{{ t("pipelineEditor.properties.separators.blankLine") }}</option>
+            <option value=" ">{{ t("pipelineEditor.properties.separators.space") }}</option>
+            <option value=", ">{{ t("pipelineEditor.properties.separators.comma") }}</option>
+            <option value="">{{ t("pipelineEditor.properties.separators.none") }}</option>
           </select>
           <p class="pipeline-help">
-            Text is joined in the order the connections were added.
+            {{ t("pipelineEditor.properties.concatHelp") }}
           </p></template
         >
         <template v-if="node.type === 'output'"
           ><label class="pipeline-label" for="pipeline-output-format"
-            >Image format</label
+            >{{ t("pipelineEditor.properties.imageFormat") }}</label
           ><select
             id="pipeline-output-format"
             class="pipeline-input"
@@ -1001,7 +1012,7 @@ watch(
             :disabled="disabled"
             @change="choice('format', $event)"
           >
-            <option value="original">Original</option>
+            <option value="original">{{ t("pipelineEditor.properties.formatOriginal") }}</option>
             <option value="png">PNG</option>
             <option value="jpeg">JPEG</option>
             <option value="webp">WebP</option></select
@@ -1010,7 +1021,7 @@ watch(
               node.config.format === 'jpeg' || node.config.format === 'webp'
             "
             ><label class="pipeline-label" for="pipeline-output-quality"
-              >Quality · {{ node.config.quality }}%</label
+              >{{ t("pipelineEditor.properties.quality", { value: node.config.quality }) }}</label
             ><input
               id="pipeline-output-quality"
               class="pipeline-range"
@@ -1022,12 +1033,11 @@ watch(
               @input="numeric('quality', $event)"
           /></template>
           <p class="pipeline-help">
-            Outputs stay private in your Library. Download links always serve
-            their original full-size files.
+            {{ t("pipelineEditor.properties.outputHelp") }}
           </p></template
         >
         <template v-if="node.type === 'sticky-note'"
-          ><label class="pipeline-label" for="pipeline-note-text">Note</label
+          ><label class="pipeline-label" for="pipeline-note-text">{{ t("pipelineEditor.properties.note") }}</label
           ><textarea
             id="pipeline-note-text"
             class="pipeline-input"
@@ -1036,7 +1046,7 @@ watch(
             maxlength="4000"
             :disabled="disabled"
             @input="text('text', $event)"
-          /><label class="pipeline-label" for="pipeline-note-color">Color</label
+          /><label class="pipeline-label" for="pipeline-note-color">{{ t("pipelineEditor.properties.color") }}</label
           ><select
             id="pipeline-note-color"
             class="pipeline-input"
@@ -1047,8 +1057,9 @@ watch(
             <option
               v-for="value in ['amber', 'rose', 'sage', 'blue']"
               :key="value"
+              :value="value"
             >
-              {{ value }}
+              {{ t(`pipelineEditor.properties.colors.${value}`) }}
             </option>
           </select></template
         >
@@ -1065,7 +1076,7 @@ watch(
         :disabled="disabled"
         @click="emit('run')"
       >
-        <UIcon name="i-lucide-play" />Run to this step
+        <UIcon name="i-lucide-play" />{{ t("pipelineEditor.properties.runToStep") }}
       </button>
       <div>
         <button
@@ -1074,14 +1085,14 @@ watch(
           :disabled="disabled"
           @click="emit('duplicate')"
         >
-          <UIcon name="i-lucide-copy" />Duplicate</button
+          <UIcon name="i-lucide-copy" />{{ t("pipelineEditor.properties.duplicate") }}</button
         ><button
           type="button"
           class="pipeline-secondary pipeline-danger"
           :disabled="disabled"
           @click="emit('remove')"
         >
-          <UIcon name="i-lucide-trash-2" />Delete
+          <UIcon name="i-lucide-trash-2" />{{ t("common.actions.delete") }}
         </button>
       </div>
     </footer>

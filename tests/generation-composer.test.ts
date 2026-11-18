@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { buildComposerRequest, composerSources, imageName } from '../app/utils/generationComposer.ts'
+import { buildComposerRequest, ComposerValidationError, composerSources, imageName } from '../app/utils/generationComposer.ts'
+import { hasMessage } from './i18n-test-helpers.ts'
 import { IMAGE_MODEL_PROFILES, SUPPORTED_IMAGE_MODEL_IDS, createDefaultSettings } from '../schemas/image-generation.ts'
 
 const base = {
@@ -50,7 +51,19 @@ test('Same-origin batch accepts fifty independent one-output inputs, enforcing t
 test('both workspaces require a source and never borrow the other workspace selection', () => {
   assert.throws(() => buildComposerRequest({ ...base, editSource: null }), /Choose an image to edit/)
   assert.throws(() => buildComposerRequest({ ...base, mode: 'batch', batchInputs: [] }), /Choose at least one input/)
+  assert.throws(() => buildComposerRequest({ ...base, editSource: null }), composerError('generation.validation.chooseEditImage'))
+  assert.throws(() => buildComposerRequest({ ...base, mode: 'batch', batchInputs: [] }), composerError('generation.validation.chooseBatchInput'))
 })
+
+// The util stays i18n-free; the UI translates the carried key in both locales.
+function composerError(key: string) {
+  return (error: unknown) => {
+    assert.ok(error instanceof ComposerValidationError)
+    assert.equal(error.messageKey, key)
+    assert.ok(hasMessage(key, 'en') && hasMessage(key, 'hu'), `${key} must exist in en and hu`)
+    return true
+  }
+}
 
 test('all current exact-ID model profiles keep normalized settings in both workspaces', () => {
   for (const model of SUPPORTED_IMAGE_MODEL_IDS) {
@@ -74,12 +87,13 @@ test('the composer blocks stale settings, too many references, and masks unsuppo
   assert.throws(() => buildComposerRequest({ ...base, model, settings: createDefaultSettings(model), maskImage: '/images/mask.png' }), /does not support masks/)
 })
 
-test('PNG mask preflight covers all batch sources while Edit validates only its own source', () => {
+test('masked edits require a PNG mask but accept stored WebP or JPEG sources, which the server converts', () => {
   const masked = { ...base, model: 'openai/gpt-image-2' as const, settings: createDefaultSettings('openai/gpt-image-2'),
-    maskImage: '/images/mask.png', batchInputs: ['/images/first.png', '/images/second.jpg'] }
+    maskImage: '/images/mask.png', batchInputs: ['/images/first.webp', '/images/second.jpg'] }
   assert.deepEqual(buildComposerRequest(masked).inputImages, [base.editSource])
-  assert.throws(() => buildComposerRequest({ ...masked, mode: 'batch' }), /PNG/)
+  assert.deepEqual(buildComposerRequest({ ...masked, mode: 'batch' }).inputImages, ['/images/first.webp', '/images/second.jpg'])
   assert.throws(() => buildComposerRequest({ ...masked, maskImage: '/images/mask.jpg' }), /PNG/)
+  assert.throws(() => buildComposerRequest({ ...masked, maskImage: '/images/mask.jpg' }), composerError('generation.validation.maskNotPngImage'))
 })
 
 test('image names decode escaped characters without exposing malformed URL exceptions', () => {

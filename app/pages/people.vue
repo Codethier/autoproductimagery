@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import {IMAGE_MODEL_PROFILES, ImagePathSchema} from '../../schemas/image-generation'
 definePageMeta({layout: 'workspace', colorMode: 'dark'})
-useHead({title: 'People · Product Imagery'})
+const {t} = useI18n()
+useHead({title: computed(() => t('people.pageTitle'))})
 const data = useDataStore()
 const account = useAccount()
 const initialAccount = {epoch: account.epoch.value, identity: account.identity.value}

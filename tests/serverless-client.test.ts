@@ -8,6 +8,7 @@ import {compileScript, parse} from '@vue/compiler-sfc'
 import {renderToString} from '@vue/server-renderer'
 import {createFetch} from 'ofetch'
 import {fetchStatusCode, prepareServerlessRequest, serverlessFetchOptions, SERVERLESS_READ_BUDGET_MS, SERVERLESS_READ_ATTEMPT_MS, SERVERLESS_MUTATION_TIMEOUT_MS} from '../app/utils/serverlessRequests.ts'
+import {translate, useI18n} from './i18n-test-helpers.ts'
 
 const errorPage = new URL('../app/error.vue', import.meta.url).href
 const errorStateKey = '__serverlessErrorUi'
@@ -17,7 +18,7 @@ registerHooks({load(url, context, next) {
   const source = readFileSync(filename, 'utf8').replace('</script>', 'defineExpose({retry, retryPath, warmup})\n</script>')
   const {descriptor} = parse(source, {filename})
   const compiled = compileScript(descriptor, {id: filename, inlineTemplate: true})
-  return {format: 'module', shortCircuit: true, source: stripTypeScriptTypes(`import {computed} from 'vue';const clearError=value=>globalThis.${errorStateKey}.clear(value);const useHead=()=>{};${compiled.content}`)}
+  return {format: 'module', shortCircuit: true, source: stripTypeScriptTypes(`import {computed} from 'vue';const clearError=value=>globalThis.${errorStateKey}.clear(value);const useHead=()=>{};const useI18n=()=>{const locale=globalThis.${errorStateKey}.locale;if(!locale)throw new Error('i18n is not installed');return globalThis.${errorStateKey}.i18n(locale)};${compiled.content}`)}
 }})
 
 test('safe reads share a 90-second deadline across retries while preserving cancellation and the account epoch', context => {
@@ -194,4 +195,20 @@ test('the warm-up recovery screen explains the retained session and retries only
     await exposed.retry()
     assert.deepEqual(redirects, [{redirect: path === '/pipelines?run=123' ? path : '/edit'}])
   }
+})
+
+test('the recovery screen follows the active language and its pre-i18n fallback matches the English messages', async () => {
+  const {default: Page} = await import(errorPage)
+  const render = async (locale?: string) => {
+    ;(globalThis as any)[errorStateKey] = {clear: async () => undefined, locale, i18n: useI18n}
+    return renderToString(createSSRApp({render: () => h(Page, {error: {statusCode: 503, data: {workspaceWarmup: true, retryPath: '/edit'}}})}))
+  }
+  const fallback = await render()
+  assert.equal(await render('en'), fallback, 'the fallback copy must stay identical to the English locale')
+  const hungarian = await render('hu')
+  assert.ok(hungarian.includes(translate('account.recovery.warmupTitle', {}, 'hu')))
+  assert.ok(hungarian.includes(translate('common.actions.retry', {}, 'hu')))
+  assert.doesNotMatch(hungarian, /Your workspace is waking up/)
+  const generic = await renderToString(createSSRApp({render: () => h(Page, {error: {statusCode: 500}})}))
+  assert.ok(generic.includes(translate('account.recovery.failedTitle', {}, 'hu')))
 })

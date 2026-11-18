@@ -20,6 +20,7 @@ const route = useRoute()
 const router = useRouter()
 let dataStore = useDataStore()
 const toast = useToast()
+const {t} = useI18n()
 
 let images: Ref<File[]> = ref([])
 const uploading = ref(false)
@@ -53,7 +54,7 @@ let bradCrumbItems = computed(() => {
 
   folders.value.forEach((folder) => {
     if (folder === '/') {
-      l.push({label: 'Home', to: {query: {path: '/'}}})
+      l.push({label: t('library.files.home'), to: {query: {path: '/'}}})
       currentPath = '/'
     } else {
       currentPath += folder + '/'
@@ -114,7 +115,7 @@ async function loadMoreFiles() {
     additionalDirs.value.push(...page.dirs.filter(dir => !knownDirs.has(dir.name)))
     nextCursor.value = page.nextCursor
   } catch (error: any) {
-    toast.add({title: 'Could not load more files', description: error?.statusMessage ?? 'Please try again.', color: 'error'})
+    toast.add({title: t('library.files.loadMoreFailed'), description: error?.statusMessage ?? t('library.files.tryAgain'), color: 'error'})
   } finally {
     loadingMore.value = false
   }
@@ -157,8 +158,8 @@ function buildUploadBody(): FormData {
 
 async function fileFormSubmit() {
   if (images.value.length === 0 || uploading.value) return
-  const invalid = validateAssetUploads(images.value)
-  if (invalid) { toast.add({title: 'Could not upload images', description: invalid, color: 'error'}); return }
+  const invalid = validateAssetUploads(images.value, t)
+  if (invalid) { toast.add({title: t('library.files.uploadInvalid'), description: invalid, color: 'error'}); return }
   uploading.value = true
   try {
     const result = await $fetch<{ saved: string[]; failed: Array<{ filename: string; reason: string }> }>(
@@ -167,13 +168,13 @@ async function fileFormSubmit() {
     )
     if (result.saved.length > 0) {
       toast.add({
-        title: `Uploaded ${result.saved.length} file${result.saved.length === 1 ? '' : 's'}`,
+        title: t(result.saved.length === 1 ? 'library.files.uploadedOne' : 'library.files.uploadedOther', {count: result.saved.length}),
         color: 'success'
       })
     }
     if (result.failed.length > 0) {
       toast.add({
-        title: `Failed to upload ${result.failed.length} file${result.failed.length === 1 ? '' : 's'}`,
+        title: t(result.failed.length === 1 ? 'library.files.failedOne' : 'library.files.failedOther', {count: result.failed.length}),
         description: result.failed.map((f) => `${f.filename}: ${f.reason}`).join('\n'),
         color: 'error'
       })
@@ -181,7 +182,7 @@ async function fileFormSubmit() {
     images.value = []
     await items.refresh()
   } catch (err: any) {
-    toast.add({ title: 'Upload failed', description: err?.statusMessage ?? err?.message, color: 'error' })
+    toast.add({ title: t('library.files.uploadFailed'), description: err?.statusMessage ?? err?.message, color: 'error' })
   } finally {
     uploading.value = false
   }
@@ -197,10 +198,10 @@ async function createFolder() {
     await $fetch('/api/createFolder', { method: 'POST', body: { path: path.value, name } })
     newFolderName.value = ''
     await items.refresh()
-    toast.add({ title: `Folder "${name}" created`, color: 'success' })
+    toast.add({ title: t('library.files.folderCreated', {name}), color: 'success' })
   } catch (err: any) {
     toast.add({
-      title: 'Could not create folder',
+      title: t('library.files.folderCreateFailed'),
       description: err?.statusMessage ?? err?.message,
       color: 'error'
     })
@@ -225,7 +226,7 @@ function imageUrlForRelativePath(relativePath: string) {
 }
 
 async function deleteFileOrFolder(filename: string, selectedUrl?: string) {
-  const confirmed = window.confirm(`Delete "${filename}"? This cannot be undone.`)
+  const confirmed = window.confirm(t('library.files.confirmDelete', {name: filename}))
   if (!confirmed) return
   const base = path.value.endsWith('/') ? path.value.slice(0, -1) : path.value
   const pathToSubmit = `${base}/${filename}`
@@ -240,9 +241,9 @@ async function deleteFileOrFolder(filename: string, selectedUrl?: string) {
       removeDeletedSelections(`${imageUrlForRelativePath(pathToSubmit)}/`, true)
     }
     await items.refresh()
-    toast.add({ title: `Deleted "${filename}"`, color: 'success' })
+    toast.add({ title: t('library.files.deleted', {name: filename}), color: 'success' })
   } catch (err: any) {
-    toast.add({ title: 'Delete failed', description: err?.statusMessage ?? err?.message, color: 'error' })
+    toast.add({ title: t('library.files.deleteFailed'), description: err?.statusMessage ?? err?.message, color: 'error' })
   }
 }
 
@@ -312,33 +313,33 @@ onBeforeUnmount(() => window.removeEventListener('paste', handlePaste))
         class=" grid grid-cols-4 justify-items-center justify-center  gap-2 m-12 border-2 border-dashed border-gray-300 rounded-lg p-12">
       <UBreadcrumb :items="bradCrumbItems" class="col-span-4"/>
       <div class="col-span-4 flex flex-col gap-2">
-        <UFileUpload v-model="images" label="Drop your image here" accept="image/*" multiple class="w-96 min-h-48"
-                     description="Images only · up to 50 files · 25 MB per image · 100 MB total" icon="i-lucide-image"/>
+        <UFileUpload v-model="images" :label="t('library.files.dropLabel')" accept="image/*" multiple class="w-96 min-h-48"
+                     :description="t('library.files.dropDescription')" icon="i-lucide-image"/>
         <UButton :disabled="images.length === 0 || uploading" :loading="uploading"
-                 @click="fileFormSubmit" type="submit" label="Upload"/>
+                 @click="fileFormSubmit" type="submit" :label="t('common.actions.upload')"/>
         <UPopover>
-          <UButton label="Create New Folder" color="neutral" variant="subtle"/>
+          <UButton :label="t('library.files.createFolder')" color="neutral" variant="subtle"/>
 
           <template #content>
             <div class="inline-flex m-4 gap-2">
-              <UInput v-model="newFolderName" placeholder="Folder Name" class="w-full"
+              <UInput v-model="newFolderName" :placeholder="t('library.files.folderNamePlaceholder')" class="w-full"
                       @keydown.enter="createFolder()"/>
               <UButton @click="createFolder()" :disabled="!newFolderName.trim() || creatingFolder"
-                       :loading="creatingFolder" label="Save"/>
+                       :loading="creatingFolder" :label="t('common.actions.save')"/>
             </div>
           </template>
         </UPopover>
         <div class="flex gap-2">
-          <UButton v-if="props.isModelSelect" size="xs" variant="subtle" color="neutral" @click="clearModelSelection" :disabled="dataStore.models.length === 0">Clear model selection</UButton>
-          <UButton v-if="props.isImageSelect" size="xs" variant="subtle" color="neutral" @click="clearImageSelection" :disabled="dataStore.inputImages.length === 0">Clear image selection</UButton>
-          <UButton v-if="props.isMaskSelect" size="xs" variant="subtle" color="neutral" @click="clearMaskSelection" :disabled="!dataStore.maskImage">Clear mask selection</UButton>
+          <UButton v-if="props.isModelSelect" size="xs" variant="subtle" color="neutral" @click="clearModelSelection" :disabled="dataStore.models.length === 0">{{ t('library.files.clearModelSelection') }}</UButton>
+          <UButton v-if="props.isImageSelect" size="xs" variant="subtle" color="neutral" @click="clearImageSelection" :disabled="dataStore.inputImages.length === 0">{{ t('library.files.clearImageSelection') }}</UButton>
+          <UButton v-if="props.isMaskSelect" size="xs" variant="subtle" color="neutral" @click="clearMaskSelection" :disabled="!dataStore.maskImage">{{ t('library.files.clearMaskSelection') }}</UButton>
         </div>
 
       </div>
       <div v-for="dir of displayedDirs" :key="dir.name"
            class="flex justify-center items-center gap-2 flex-col  cursor-pointer hover:text-primary-500 w-full h-full">
         <UIcon @click="enterFolder(dir.name)" name="material-symbols-create-new-folder" class="size-16"></UIcon>
-        <div class="files-folder-caption"><span class="files-folder-name" :title="dir.name">{{ dir.name }}</span><span v-if="dir.itemCount !== undefined" class="files-folder-count" :aria-label="`${dir.itemCount} ${dir.itemCount === 1 ? 'item' : 'items'}`" :title="`${dir.itemCount} ${dir.itemCount === 1 ? 'item' : 'items'}`">{{ dir.itemCount }}</span></div>
+        <div class="files-folder-caption"><span class="files-folder-name" :title="dir.name">{{ dir.name }}</span><span v-if="dir.itemCount !== undefined" class="files-folder-count" :aria-label="t(dir.itemCount === 1 ? 'library.files.itemsOne' : 'library.files.itemsOther', {count: dir.itemCount})" :title="t(dir.itemCount === 1 ? 'library.files.itemsOne' : 'library.files.itemsOther', {count: dir.itemCount})">{{ dir.itemCount }}</span></div>
         <UIcon name="i-heroicons-trash" class="size-6 text-red-500 cursor-pointer"
                @click="deleteFileOrFolder(dir.name)"></UIcon>
       </div>
@@ -352,14 +353,14 @@ onBeforeUnmount(() => window.removeEventListener('paste', handlePaste))
                    @change="syncSelectToStore(file)"></UCheckbox>
         <UCheckbox v-if="props.isMaskSelect" v-model="file.selectedMask"
                    :disabled="!isPngImage(file)"
-                   :title="isPngImage(file) ? 'Use as PNG edit mask' : 'GPT Image masks must be PNG files'"
+                   :title="isPngImage(file) ? t('library.files.maskUsable') : t('library.files.maskPngOnly')"
                    @change="syncSelectToStore(file)"></UCheckbox>
         <UIcon name="i-heroicons-trash" class="size-6 text-red-500 cursor-pointer"
                @click="deleteFileOrFolder(file.name, file.url)"></UIcon>
       </div>
 
       <div v-if="nextCursor" class="col-span-4">
-        <UButton label="Load more files" :loading="loadingMore" :disabled="loadingMore" @click="loadMoreFiles"/>
+        <UButton :label="t('library.files.loadMoreFiles')" :loading="loadingMore" :disabled="loadingMore" @click="loadMoreFiles"/>
       </div>
 
     </div>

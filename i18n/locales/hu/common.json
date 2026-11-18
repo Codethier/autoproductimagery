@@ -1,0 +1,78 @@
+{
+  "common": {
+    "appName": "Termékképek",
+    "actions": {
+      "cancel": "Mégse",
+      "save": "Mentés",
+      "saving": "Mentés…",
+      "close": "Bezárás",
+      "delete": "Törlés",
+      "remove": "Eltávolítás",
+      "retry": "Újrapróbálás",
+      "confirm": "Megerősítés",
+      "edit": "Szerkesztés",
+      "download": "Letöltés",
+      "upload": "Feltöltés",
+      "search": "Keresés",
+      "back": "Vissza",
+      "next": "Tovább",
+      "apply": "Alkalmazás",
+      "reset": "Visszaállítás",
+      "refresh": "Frissítés",
+      "loadMore": "Továbbiak betöltése",
+      "copy": "Másolás",
+      "share": "Megosztás"
+    },
+    "states": {
+      "loading": "Betöltés…",
+      "yes": "Igen",
+      "no": "Nem",
+      "none": "Nincs",
+      "optional": "Nem kötelező",
+      "unknown": "Ismeretlen"
+    },
+    "language": {
+      "label": "Nyelv",
+      "en": "English",
+      "hu": "Magyar"
+    },
+    "layout": {
+      "skipToWorkspace": "Ugrás a munkaterületre",
+      "brandLabel": "Termékkép-stúdió",
+      "studio": "Stúdió",
+      "toggleNavigation": "Navigáció megnyitása vagy bezárása",
+      "mainNavigation": "Fő navigáció",
+      "nav": {
+        "edit": "Szerkesztés",
+        "sameOriginBatch": "Azonos forrású köteg",
+        "pipelines": "Munkafolyamatok",
+        "people": "Személyek",
+        "library": "Könyvtár",
+        "shared": "Velem megosztott",
+        "team": "Csapat"
+      },
+      "viewBalance": "Generálási egyenleg megtekintése",
+      "unlimited": "Korlátlan",
+      "balance": "Egyenleg",
+      "accountMenu": "Fiókmenü",
+      "organizationOwner": "Szervezet tulajdonosa",
+      "member": "Tag",
+      "actualBalance": "Tényleges egyenleg",
+      "outstanding": "Függőben",
+      "unpricedSuffix": " + árazatlan",
+      "awaitingFinalPrice": "{count} vár a végleges árra",
+      "passwordAndAccount": "Jelszó és fiók",
+      "signingOut": "Kijelentkezés…",
+      "signOut": "Kijelentkezés"
+    },
+    "saveFormat": {
+      "label": "Generált képek mentése mint",
+      "webp": "WebP (alapértelmezett)",
+      "png": "PNG (veszteségmentes)",
+      "original": "A modell eredeti formátumának megtartása",
+      "webpHelp": "Minden visszaadott kép kiváló minőségű WebP-ként kerül mentésre, akkor is, ha a modell PNG-t vagy JPEG-et ad vissza. Az átlátszóság megmarad. A maszkos GPT Image szerkesztéshez PNG forrásképek kellenek.",
+      "pngHelp": "Minden visszaadott kép veszteségmentes PNG-ként kerül mentésre, bármilyen formátumban adja vissza a modell. Az átlátszóság megmarad. Nagyobb fájlok.",
+      "originalHelp": "A képek pontosan úgy kerülnek mentésre, ahogy a modell visszaadja őket, például JPEG vagy WebP formátumban."
+    }
+  }
+}

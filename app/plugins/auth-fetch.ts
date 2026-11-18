@@ -1,6 +1,6 @@
 import {prepareServerlessRequest, SERVERLESS_MUTATION_TIMEOUT_MS} from '../utils/serverlessRequests'
 
-export default defineNuxtPlugin(() => {
+export default defineNuxtPlugin(nuxtApp => {
   if (!import.meta.client) return
 
   const router = useRouter()
@@ -24,9 +24,11 @@ export default defineNuxtPlugin(() => {
 
     try {
       const toast = useToast()
+      // Translate when the toast is shown, so it uses the current language.
+      const i18n = nuxtApp.$i18n as {t: (key: string) => string}
       toast.add({
-        title: 'Signed out',
-        description: 'Your session is no longer valid. Please sign in again.',
+        title: i18n.t('account.session.signedOut'),
+        description: i18n.t('account.session.expired'),
         color: 'warning'
       })
     } catch {}

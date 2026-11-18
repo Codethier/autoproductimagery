@@ -75,8 +75,9 @@ test('every native image profile sends text, pictures and exact settings through
     assert.deepEqual(outputs[0]!.buffer, png)
 
     const callCount = requests.length
-    inputMimeType = 'image/heic'
-    await assert.rejects(gateway.generateAnyImage(request), /does not accept image\/heic/)
+    // Convertible stored formats are converted to PNG for masked edits; others are rejected.
+    inputMimeType = 'image/avif'
+    await assert.rejects(gateway.generateAnyImage(request), /does not accept image\/avif/)
     inputMimeType = 'image/png'
     await assert.rejects(gateway.generateImageViaLanguageModel(request), /does not match the selected model profile/)
     assert.equal(requests.length, callCount, 'invalid input must be rejected before paid work')

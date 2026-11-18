@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import {formatBalanceUsd, formatUsd} from '../utils/generationPrice'
 const route = useRoute()
+const {t} = useI18n()
 const session = useAccount()
 const accountBalance = useAccountBalance()
 const data = useDataStore()
@@ -10,13 +11,13 @@ const accountOpen = ref(false)
 const signingOut = ref(false)
 provide('workspace-account-identity', session.identity)
 const nav = computed(() => [
-  {to: '/edit', label: 'Edit', icon: 'i-lucide-pencil-ruler'},
-  {to: '/same-origin-batch', label: 'Same-origin batch', icon: 'i-lucide-copy-plus'},
-  {to: '/pipelines', label: 'Pipelines', icon: 'i-lucide-workflow'},
-  {to: '/people', label: 'People', icon: 'i-lucide-contact-round'},
-  {to: '/assets', label: 'Library', icon: 'i-lucide-images'},
-  {to: '/shared', label: 'Shared with me', icon: 'i-lucide-users-round'},
-  ...(session.isOwner.value ? [{to: '/team', label: 'Team', icon: 'i-lucide-user-round-cog'}] : []),
+  {to: '/edit', label: t('common.layout.nav.edit'), icon: 'i-lucide-pencil-ruler'},
+  {to: '/same-origin-batch', label: t('common.layout.nav.sameOriginBatch'), icon: 'i-lucide-copy-plus'},
+  {to: '/pipelines', label: t('common.layout.nav.pipelines'), icon: 'i-lucide-workflow'},
+  {to: '/people', label: t('common.layout.nav.people'), icon: 'i-lucide-contact-round'},
+  {to: '/assets', label: t('common.layout.nav.library'), icon: 'i-lucide-images'},
+  {to: '/shared', label: t('common.layout.nav.shared'), icon: 'i-lucide-users-round'},
+  ...(session.isOwner.value ? [{to: '/team', label: t('common.layout.nav.team'), icon: 'i-lucide-user-round-cog'}] : []),
 ])
 const initials = computed(() => (session.account.value?.displayName || session.account.value?.username || '?').split(/\s+/).map(word => word[0]).slice(0, 2).join('').toUpperCase())
 watch(() => route.path, () => { navigationOpen.value = false; accountOpen.value = false })
@@ -42,24 +43,25 @@ async function signOut() {
 
 <template>
   <div class="imagery-workspace">
-    <a class="workspace-skip" href="#workspace-content">Skip to workspace</a>
+    <a class="workspace-skip" href="#workspace-content">{{ t('common.layout.skipToWorkspace') }}</a>
     <header class="workspace-header">
-      <NuxtLink to="/edit" class="workspace-brand" aria-label="Product imagery studio">
+      <NuxtLink to="/edit" class="workspace-brand" :aria-label="t('common.layout.brandLabel')">
         <span class="workspace-brand-mark"><UIcon name="i-lucide-aperture" /></span>
-        <span><strong>Product imagery</strong><small>{{ session.account.value?.organizationName || 'Studio' }}</small></span>
+        <span><strong>{{ t('common.appName') }}</strong><small>{{ session.account.value?.organizationName || t('common.layout.studio') }}</small></span>
       </NuxtLink>
-      <button class="workspace-mobile-toggle workspace-icon-button" type="button" :aria-expanded="navigationOpen" aria-controls="workspace-navigation" aria-label="Toggle navigation" @click="navigationOpen = !navigationOpen"><UIcon :name="navigationOpen ? 'i-lucide-x' : 'i-lucide-menu'" /></button>
-      <nav id="workspace-navigation" class="workspace-navigation" :class="{'is-open': navigationOpen}" aria-label="Main navigation">
+      <button class="workspace-mobile-toggle workspace-icon-button" type="button" :aria-expanded="navigationOpen" aria-controls="workspace-navigation" :aria-label="t('common.layout.toggleNavigation')" @click="navigationOpen = !navigationOpen"><UIcon :name="navigationOpen ? 'i-lucide-x' : 'i-lucide-menu'" /></button>
+      <nav id="workspace-navigation" class="workspace-navigation" :class="{'is-open': navigationOpen}" :aria-label="t('common.layout.mainNavigation')">
         <NuxtLink v-for="item in nav" :key="item.to" :to="item.to" class="workspace-nav-link" :class="{'is-active': route.path === item.to}" :aria-current="route.path === item.to ? 'page' : undefined"><UIcon :name="item.icon" /><span>{{ item.label }}</span></NuxtLink>
       </nav>
       <div class="workspace-account">
-        <NuxtLink to="/account" class="workspace-balance-chip" aria-label="View your generation balance"><UIcon name="i-lucide-wallet" /><span>{{ accountBalance.balance.value ? accountBalance.balance.value.unlimited ? 'Unlimited' : formatBalanceUsd(accountBalance.balance.value.actualBalanceUsd) : 'Balance' }}</span></NuxtLink>
-        <button class="workspace-account-toggle" type="button" :aria-expanded="accountOpen" aria-controls="workspace-account-menu" aria-label="Account menu" @click="accountOpen = !accountOpen"><span class="workspace-avatar">{{ initials }}</span><span class="workspace-account-name">{{ session.account.value?.displayName || session.account.value?.username }}</span><UIcon name="i-lucide-chevron-down" /></button>
+        <NuxtLink to="/account" class="workspace-balance-chip" :aria-label="t('common.layout.viewBalance')"><UIcon name="i-lucide-wallet" /><span>{{ accountBalance.balance.value ? accountBalance.balance.value.unlimited ? t('common.layout.unlimited') : formatBalanceUsd(accountBalance.balance.value.actualBalanceUsd) : t('common.layout.balance') }}</span></NuxtLink>
+        <button class="workspace-account-toggle" type="button" :aria-expanded="accountOpen" aria-controls="workspace-account-menu" :aria-label="t('common.layout.accountMenu')" @click="accountOpen = !accountOpen"><span class="workspace-avatar">{{ initials }}</span><span class="workspace-account-name">{{ session.account.value?.displayName || session.account.value?.username }}</span><UIcon name="i-lucide-chevron-down" /></button>
         <div v-if="accountOpen" id="workspace-account-menu" class="workspace-account-menu" @keydown.esc="accountOpen = false">
-          <span>{{ session.account.value?.username }} · {{ session.isOwner.value ? 'Organization owner' : 'Member' }}</span>
-          <div v-if="accountBalance.balance.value" class="workspace-balance-menu"><span>Actual balance<strong>{{ accountBalance.balance.value.unlimited ? 'Unlimited' : formatBalanceUsd(accountBalance.balance.value.actualBalanceUsd) }}</strong></span><span>Outstanding<strong>{{ formatUsd(accountBalance.balance.value.outstandingEstimateUsd) }}{{ accountBalance.balance.value.outstandingUnknownCount ? ' + unpriced' : '' }}</strong></span><small>{{ accountBalance.balance.value.outstandingCount }} awaiting final price</small></div>
-          <NuxtLink to="/account"><UIcon name="i-lucide-key-round" />Password & account</NuxtLink>
-          <button type="button" :disabled="signingOut" @click="signOut"><UIcon name="i-lucide-log-out" />{{ signingOut ? 'Signing out…' : 'Sign out' }}</button>
+          <span>{{ session.account.value?.username }} · {{ session.isOwner.value ? t('common.layout.organizationOwner') : t('common.layout.member') }}</span>
+          <div v-if="accountBalance.balance.value" class="workspace-balance-menu"><span>{{ t('common.layout.actualBalance') }}<strong>{{ accountBalance.balance.value.unlimited ? t('common.layout.unlimited') : formatBalanceUsd(accountBalance.balance.value.actualBalanceUsd) }}</strong></span><span>{{ t('common.layout.outstanding') }}<strong>{{ formatUsd(accountBalance.balance.value.outstandingEstimateUsd) }}{{ accountBalance.balance.value.outstandingUnknownCount ? t('common.layout.unpricedSuffix') : '' }}</strong></span><small>{{ t('common.layout.awaitingFinalPrice', {count: accountBalance.balance.value.outstandingCount}) }}</small></div>
+          <NuxtLink to="/account"><UIcon name="i-lucide-key-round" />{{ t('common.layout.passwordAndAccount') }}</NuxtLink>
+          <LanguageSwitcher class="workspace-menu-language" />
+          <button type="button" :disabled="signingOut" @click="signOut"><UIcon name="i-lucide-log-out" />{{ signingOut ? t('common.layout.signingOut') : t('common.layout.signOut') }}</button>
         </div>
       </div>
     </header>
@@ -69,5 +71,5 @@ async function signOut() {
 </template>
 
 <style scoped>
-.workspace-account{display:flex;align-items:center;gap:18px}.workspace-balance-chip{display:flex;align-items:center;gap:7px;white-space:nowrap;font-size:10px;color:#dfc3a0;border:1px solid var(--workspace-border);border-radius:999px;padding:7px 9px}.workspace-balance-chip .iconify{width:12px;height:12px}.workspace-balance-menu{padding:8px 9px 15px;border-bottom:1px solid var(--workspace-border);margin-bottom:5px}.workspace-balance-menu>span{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:10px;color:var(--workspace-muted);margin-bottom:9px}.workspace-balance-menu strong{font-size:11px;color:#e8c7a2;font-weight:500;overflow-wrap:anywhere}.workspace-balance-menu small{font-size:9px;color:var(--workspace-muted)}@media(max-width:1100px){.workspace-account{gap:9px}}@media(max-width:760px){.workspace-balance-chip{font-size:9px;padding:6px}.workspace-balance-chip .iconify{display:none}}
+.workspace-account{display:flex;align-items:center;gap:18px}.workspace-balance-chip{display:flex;align-items:center;gap:7px;white-space:nowrap;font-size:10px;color:#dfc3a0;border:1px solid var(--workspace-border);border-radius:999px;padding:7px 9px}.workspace-balance-chip .iconify{width:12px;height:12px}.workspace-balance-menu{padding:8px 9px 15px;border-bottom:1px solid var(--workspace-border);margin-bottom:5px}.workspace-balance-menu>span{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:10px;color:var(--workspace-muted);margin-bottom:9px}.workspace-balance-menu strong{font-size:11px;color:#e8c7a2;font-weight:500;overflow-wrap:anywhere}.workspace-menu-language{padding:8px 9px}.workspace-balance-menu small{font-size:9px;color:var(--workspace-muted)}@media(max-width:1100px){.workspace-account{gap:9px}}@media(max-width:760px){.workspace-balance-chip{font-size:9px;padding:6px}.workspace-balance-chip .iconify{display:none}}
 </style>

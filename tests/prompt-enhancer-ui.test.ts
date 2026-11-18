@@ -8,11 +8,15 @@ import {renderToString} from '@vue/server-renderer'
 import {createRenderer, createSSRApp, h, nextTick, ref} from 'vue'
 import {createPipelineNode, type PipelineNode} from '../schemas/pipelines.ts'
 import {PIPELINE_TEXT_MODEL_IDS, PromptEnhancerConfigSchema} from '../schemas/pipeline-text-models.ts'
+import {i18nTestHelpersUrl} from './i18n-test-helpers.ts'
 
 const root = new URL('../', import.meta.url)
 const properties = new URL('app/components/PipelineNodeProperties.vue', root).href
 const favourites = new URL('app/composables/useImageModelFavourites.ts', root).href
+const modelTextUrl = new URL('app/composables/useModelText.ts', root).href
 registerHooks({load(url, context, next) {
+    if (url === modelTextUrl) return {format: 'module', shortCircuit: true,
+        source: `import {createModelText} from '${new URL('app/utils/modelText.ts', root).href}';import {useI18n} from '${i18nTestHelpersUrl}';export const useModelText=()=>createModelText(useI18n());`}
     if (url === favourites) return {format: 'module', shortCircuit: true,
         source: `import {computed,ref} from 'vue';export const useImageModelFavourites=()=>({favouriteModelIds:ref([]),favouriteSet:computed(()=>new Set()),ready:ref(true),toggleFavourite(){}});`}
     if (url.startsWith(new URL('app/components/generation-settings/', root).href) && url.endsWith('.vue'))
@@ -20,7 +24,7 @@ registerHooks({load(url, context, next) {
     if (url === properties) {
         const filename = fileURLToPath(url), {descriptor} = parse(readFileSync(filename, 'utf8'), {filename})
         const compiled = compileScript(descriptor, {id: filename, inlineTemplate: true})
-        return {format: 'module', shortCircuit: true, source: stripTypeScriptTypes(`import {computed,ref,watch} from 'vue';${compiled.content}`)}
+        return {format: 'module', shortCircuit: true, source: stripTypeScriptTypes(`import {computed,ref,watch} from 'vue';import {useI18n} from '${i18nTestHelpersUrl}';${compiled.content}`)}
     }
     return next(url, context)
 }})
@@ -43,6 +47,7 @@ function registerComponents(app: any) {
     app.component('UIcon', {props: ['name'], setup: (props: any) => () => h('span', {'data-icon': props.name})})
     app.component('NuxtErrorBoundary', {setup: (_props: unknown, {slots}: any) => () => slots.default?.()})
     app.component('ModelGuidance', {setup: () => () => null})
+    app.component('SaveFormatSetting', {setup: () => () => null})
 }
 const elements = (value: MemoryNode): MemoryNode[] => [value, ...value.children.flatMap(elements)]
 const renderedText = (value: MemoryNode): string => value.text + value.children.map(renderedText).join('')

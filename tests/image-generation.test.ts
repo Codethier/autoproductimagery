@@ -339,7 +339,7 @@ test('large and tiny output charges preserve every exact accounting unit', () =>
   }
 })
 
-test('GPT mask validation applies the same PNG dimensions to every source', () => {
+test('GPT mask validation applies the PNG mask dimensions to every source of any stored format', () => {
   const mask = {
     mimeType: 'image/png',
     bytes: 1_024,
@@ -359,10 +359,14 @@ test('GPT mask validation applies the same PNG dimensions to every source', () =
     width: 1536,
     height: 1024,
   }) ?? '', /every source image/)
+  // The Gateway adapter converts non-PNG sources to PNG for masked edits.
+  for (const mimeType of ['image/jpeg', 'image/webp']) {
+    assert.equal(validateGptImageMaskPair(mask, {mimeType, bytes: 2_048, width: 1024, height: 1024}), undefined)
+  }
   assert.match(validateGptImageMaskPair(mask, {
-    mimeType: 'image\/jpeg',
+    mimeType: 'image/webp',
     bytes: 2_048,
     width: 1024,
-    height: 1024,
+    height: 1536,
   }) ?? '', /every source image/)
 })

@@ -1,9 +1,18 @@
 import {computed, watch, type Ref} from 'vue'
 import {CREDIT_EXHAUSTED_CODE, CREDIT_EXHAUSTED_MESSAGE, parseUsdUnits, type AccountBalance} from '../../schemas/account-billing'
+import {fallbackTranslator, type Translate} from './uiMessage'
 
 export const CREDIT_UNAVAILABLE_MESSAGE = 'Could not confirm your available credit. Try again before generating.'
 export const CREDIT_OUTSTANDING_MESSAGE = 'Your previous prices are still being confirmed. Wait for them to settle before another generation can use your credit.'
-export type GenerationCreditState = {identity: string; epoch: number; open: boolean; checking: boolean; reason: string}
+// The shared state keeps a reason code, never translated text, so every surface
+// renders the refusal in the viewer's current language.
+export type GenerationCreditReason = '' | 'exhausted' | 'outstanding' | 'unavailable'
+export type GenerationCreditState = {identity: string; epoch: number; open: boolean; checking: boolean; reason: GenerationCreditReason}
+const englishCreditReasons = fallbackTranslator({
+  'account.credit.exhausted': CREDIT_EXHAUSTED_MESSAGE,
+  'account.credit.outstanding': CREDIT_OUTSTANDING_MESSAGE,
+  'account.credit.unavailable': CREDIT_UNAVAILABLE_MESSAGE,
+})
 export function initialGenerationCreditState(): GenerationCreditState { return {identity: '', epoch: -1, open: false, checking: false, reason: ''} }
 
 export function generationCreditStatus(balance: AccountBalance | null): 'allowed' | 'exhausted' | 'outstanding' | 'unavailable' {
@@ -30,6 +39,7 @@ export function createGenerationCreditController(
   account: {identity: Readonly<Ref<string>>; epoch: Readonly<Ref<number>>},
   balance: {balance: Readonly<Ref<AccountBalance | null>>; refresh: (options?: {force?: boolean}) => Promise<AccountBalance | null>},
   state: Ref<GenerationCreditState>,
+  translate: Translate = englishCreditReasons,
 ) {
   const current = () => state.value.identity === account.identity.value && state.value.epoch === account.epoch.value
   const snapshot = () => ({identity: account.identity.value, epoch: account.epoch.value})
@@ -37,7 +47,7 @@ export function createGenerationCreditController(
   const bind = () => { if (!current()) state.value = {...initialGenerationCreditState(), ...snapshot()} }
   const open = computed(() => current() && state.value.open)
   const checking = computed(() => current() && state.value.checking)
-  const blockedReason = computed(() => current() ? state.value.reason : '')
+  const blockedReason = computed(() => current() && state.value.reason ? translate(`account.credit.${state.value.reason}`) : '')
   const exhausted = computed(() => generationCreditStatus(balance.balance.value) === 'exhausted')
   const outstandingBlocked = computed(() => generationCreditStatus(balance.balance.value) === 'outstanding')
   watch([account.identity, account.epoch], () => { if (!current()) state.value = initialGenerationCreditState() }, {flush: 'sync'})
@@ -45,7 +55,7 @@ export function createGenerationCreditController(
   function close() { if (current()) state.value.open = false }
   function showExhausted() {
     if (!account.identity.value) return
-    bind(); state.value.reason = CREDIT_EXHAUSTED_MESSAGE; state.value.open = true
+    bind(); state.value.reason = 'exhausted'; state.value.open = true
   }
   async function ensureCredit(): Promise<boolean> {
     if (!account.identity.value || checking.value) return false
@@ -57,11 +67,11 @@ export function createGenerationCreditController(
       if (!sameAccount(value)) return false
       const status = generationCreditStatus(fresh)
       if (status === 'exhausted') { showExhausted(); return false }
-      if (status === 'outstanding') { state.value.reason = CREDIT_OUTSTANDING_MESSAGE; return false }
-      if (status === 'unavailable') { state.value.reason = CREDIT_UNAVAILABLE_MESSAGE; return false }
+      if (status === 'outstanding') { state.value.reason = 'outstanding'; return false }
+      if (status === 'unavailable') { state.value.reason = 'unavailable'; return false }
       return true
     } catch {
-      if (sameAccount(value)) state.value.reason = CREDIT_UNAVAILABLE_MESSAGE
+      if (sameAccount(value)) state.value.reason = 'unavailable'
       return false
     } finally { if (sameAccount(value)) state.value.checking = false }
   }

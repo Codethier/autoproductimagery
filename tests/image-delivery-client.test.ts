@@ -6,6 +6,7 @@ import {renderToString} from '@vue/server-renderer'
 import {createSSRApp, h} from 'vue'
 import {transpileModule, ModuleKind, ScriptTarget} from 'typescript'
 import {imageDownloadUrl, imagePreviewUrl} from '../app/utils/imageDelivery.ts'
+import {i18nTestHelpersUrl} from './i18n-test-helpers.ts'
 
 test('image delivery preserves canonical Unicode encoding and uses bounded previews', () => {
   const stored = '/images/users/alice/Caf%C3%A9%20products/%E7%95%AB%E5%83%8F.png'
@@ -44,7 +45,8 @@ async function compileDownloadableImage() {
   const compiled = compileScript(descriptor, {id: 'image-delivery-client-test', inlineTemplate: true})
   const vueUrl = new URL('../node_modules/vue/index.mjs', import.meta.url).href
   const helperUrl = new URL('../app/utils/imageDelivery.ts', import.meta.url).href
-  const resolved = compiled.content
+  // Nuxt auto-imports useI18n; the test supplies the locale-file-backed stand-in.
+  const resolved = `import {useI18n} from ${JSON.stringify(i18nTestHelpersUrl)};\n${compiled.content}`
     .replace(/(['"])vue\1/g, JSON.stringify(vueUrl))
     .replace(/(['"])\.\.\/utils\/imageDelivery\1/g, JSON.stringify(helperUrl))
   const javascript = transpileModule(resolved, {

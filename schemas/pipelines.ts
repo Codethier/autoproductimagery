@@ -8,6 +8,8 @@ import {
   createDefaultSettings,
   getImageModelProfile,
   generationOutputCount,
+  ImageSaveFormatSchema,
+  DEFAULT_IMAGE_SAVE_FORMAT,
 } from "./image-generation";
 
 export const PIPELINE_LIMITS = {
@@ -76,6 +78,7 @@ const color = z.string().regex(/^(transparent|#[0-9a-fA-F]{6})$/);
 const aiSettings = {
   model: ImageModelIdSchema,
   settings: ImageGenerationSettingsSchema,
+  saveFormat: ImageSaveFormatSchema.default(DEFAULT_IMAGE_SAVE_FORMAT),
 };
 const generationConfig = z
   .object({
@@ -390,6 +393,7 @@ export function createPipelineNode<T extends PipelineNodeType>(
   const ai = {
     model: DEFAULT_IMAGE_MODEL_ID,
     settings: createDefaultSettings(DEFAULT_IMAGE_MODEL_ID),
+    saveFormat: DEFAULT_IMAGE_SAVE_FORMAT,
   };
   const configs: Record<PipelineNodeType, unknown> = {
     "image-input": {},

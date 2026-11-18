@@ -6,8 +6,10 @@ import test from 'node:test'
 import {compileScript, parse} from '@vue/compiler-sfc'
 import {renderToString} from '@vue/server-renderer'
 import {createSSRApp, h} from 'vue'
+import {createI18n} from 'vue-i18n'
 import {IMAGE_MODEL_PROFILES, SUPPORTED_IMAGE_MODEL_IDS, createDefaultSettings, type ImageModelId} from '../schemas/image-generation.ts'
 import {getImageModelGuidance, imageControlHelp} from '../schemas/image-model-guidance.ts'
+import {localeMessages} from './i18n-test-helpers.ts'
 
 const componentUrl = new URL('../app/components/ModelGuidance.vue', import.meta.url).href
 registerHooks({load(url, context, next) {
@@ -16,11 +18,13 @@ registerHooks({load(url, context, next) {
   const compiled = compileScript(descriptor, {id: filename, inlineTemplate: true, templateOptions: {compilerOptions: {hoistStatic: false}}})
   return {format: 'module', shortCircuit: true, source: stripTypeScriptTypes(compiled.content)}
 }})
-async function render(modelId: string, settings = createDefaultSettings(modelId as ImageModelId), context: 'generation' | 'people' | 'pipeline' = 'generation') {
+async function render(modelId: string, settings = createDefaultSettings(modelId as ImageModelId), context: 'generation' | 'people' | 'pipeline' = 'generation', locale: 'en' | 'hu' = 'en') {
   const {default: Component} = await import(componentUrl)
   const app = createSSRApp({render: () => h(Component, {modelId, settings, context})})
+  app.use(createI18n({legacy: false, locale, fallbackLocale: 'en', messages: {en: localeMessages('en'), hu: localeMessages('hu')} as any}))
   const warnings: string[] = []; app.config.warnHandler = message => warnings.push(message)
   const html = await renderToString(app); assert.deepEqual(warnings, [])
+  assert.doesNotMatch(html, /models\.(guidance|text)/, 'no raw message keys')
   return html
 }
 
@@ -87,4 +91,23 @@ test('output guidance uses only settings belonging to the selected model', () =>
   assert.match(getImageModelGuidance('openai/gpt-image-2')!.transparency, /not available.*in this app/)
   assert.match(imageControlHelp('bfl/flux-pro-1.1-ultra', 'imagePromptStrength')!, /does not select an area to edit/)
   assert.equal(imageControlHelp('bfl/flux-2-pro', 'imagePromptStrength'), undefined)
+})
+
+test('guidance renders curated Hungarian prose, headings and interpolated counts for hu', async () => {
+  const id = 'openai/gpt-image-2.5-sunburst', settings = createDefaultSettings(id)
+  assert.ok('numberOfImages' in settings); settings.numberOfImages = 3
+  const html = await render(id, settings, 'pipeline', 'hu')
+  assert.match(html, /aria-label="GPT Image 2\.5 Sunburst – útmutató"/)
+  assert.match(html, /Szerkesztési maszk · az átlátszó területek változnak/)
+  assert.match(html, /Hogyan használd ezt a modellt/)
+  assert.match(html, /Háttér → Átlátszó/)
+  assert.match(html, /legfeljebb 16 képet fogad/, 'reference count is interpolated into the translated template')
+  assert.match(html, /feladatonként 3 kimeneti kép készül/, 'output count is interpolated into the translated template')
+  assert.match(html, /Kösd a forrást a képbemenetre/)
+  assert.doesNotMatch(html, /Edit mask|How to use this model|output images per job|pictures in one job/)
+  const people = await render(id, undefined, 'people', 'hu')
+  assert.match(people, /A Személyek generátor kérésenként legfeljebb 4 képet fogad/)
+  const catalog = await render('bfl/flux-pro-1.0-fill', undefined, 'generation', 'hu')
+  assert.match(catalog, /Kitöltőmaszk · a fehér cserél, a fekete megtart/)
+  assert.match(catalog, /feladatonként 1 kimeneti kép készül/)
 })

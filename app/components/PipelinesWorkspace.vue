@@ -31,8 +31,12 @@ import {pipelineNodeUsesCredit, pipelineRetryUsesCredit, pipelineRerunUsesCredit
 import {
   PIPELINE_TEMPLATES,
   pipelineNodeIcon,
+  pipelineNodeLabel,
+  pipelineTemplateText,
   type PipelineTemplate,
+  type PipelineTranslate,
 } from "../utils/pipelineTemplates";
+import type { Ref } from "vue";
 import {
   copyPipeline,
   createPipelineHistory,
@@ -50,6 +54,28 @@ const account = useAccount(),
   generationCredit = useGenerationCredit(),
   requestFetch = useRequestFetch(),
   route = useRoute();
+const { t, locale } = useI18n();
+const translate: PipelineTranslate = (key, params) => t(key, params ?? {});
+type UiMessage = { key: string; params?: Record<string, unknown> };
+// Messages kept in refs are stored as translated text (callers and child
+// components read strings), and re-translated when the language changes as
+// long as the ref still shows the message this component wrote.
+const localizedMessages = new Map<Ref<string>, UiMessage & { text: string }>();
+function say(target: Ref<string>, value: UiMessage) {
+  const text = t(value.key, value.params ?? {});
+  localizedMessages.set(target, { ...value, text });
+  target.value = text;
+}
+watch(locale, () => {
+  for (const [target, entry] of localizedMessages) {
+    if (target.value !== entry.text) {
+      localizedMessages.delete(target);
+      continue;
+    }
+    entry.text = t(entry.key, entry.params ?? {});
+    target.value = entry.text;
+  }
+});
 const pipelines = ref<PipelineDTO[]>([]),
   nextCursor = ref<string | null>(null),
   search = ref(""),
@@ -66,7 +92,7 @@ const errorMessage = ref(""),
   notice = ref("");
 const pipeline = ref<PipelineDTO | null>(null),
   definition = ref<PipelineDefinition>({ version: 1, nodes: [], edges: [] });
-const name = ref("Untitled pipeline"),
+const name = ref(t("pipelines.untitled")),
   description = ref(""),
   editing = ref(false),
   metadataOpen = ref(false);
@@ -173,8 +199,8 @@ function applyRunResponse(response: RunResponse) {
   if (activeRun.value?.id !== response.run.id) runWakeNotice.value = '';
   activeRun.value = response.run;
   if (!isRunActive.value || response.workerWake === 'accepted') runWakeNotice.value = '';
-  else if (response.workerWake === 'unavailable') runWakeNotice.value = 'Your run is saved, but processing could not be reached yet. It may still be starting after being idle. Refresh progress if it does not start.';
-  else if (response.workerWake === 'not-configured') runWakeNotice.value = 'Your run is saved, but background processing is not configured for this workspace. Ask an organization owner to check its setup.';
+  else if (response.workerWake === 'unavailable') say(runWakeNotice, {key: 'pipelines.run.wakeUnavailable'});
+  else if (response.workerWake === 'not-configured') say(runWakeNotice, {key: 'pipelines.run.wakeNotConfigured'});
 }
 const runIssues = computed(() => [
   ...pipelineRunIssues(definition.value, runTarget.value ?? undefined),
@@ -184,7 +210,7 @@ const runIssues = computed(() => [
     const selectedModel = node.config.model;
     const profile = IMAGE_MODEL_PROFILES[selectedModel];
     if (profile.requiresMask && node.type !== "generate-image")
-      return [`${node.label}: choose a model that does not require a mask.`];
+      return [t("pipelines.run.issueMaskModel", { label: node.label })];
     if (
       models.value.length &&
       !models.value.some(
@@ -192,7 +218,7 @@ const runIssues = computed(() => [
           value.id === selectedModel && value.catalogStatus !== "unavailable",
       )
     )
-      return [`${node.label}: the selected image model is unavailable.`];
+      return [t("pipelines.run.issueModelUnavailable", { label: node.label })];
     return [];
   }),
 ]);
@@ -207,9 +233,9 @@ const creditBlockReason = computed(() => {
     value.actualBalanceUsd.startsWith("-") ||
     parseUsdUnits(value.actualBalanceUsd) === 0n
   )
-    return "Your available credit is used up. Ask an organization owner to add credit.";
+    return t("pipelines.run.creditExhausted");
   if (value.generationBlockedByOutstanding ?? value.outstandingCount > 0)
-    return "Your previous charges need to settle before another run can use your credit.";
+    return t("pipelines.run.creditOutstanding");
   return "";
 });
 const canStart = computed(
@@ -275,15 +301,13 @@ function statusCode(error: unknown) {
     (error as { status?: number })?.status
   );
 }
-function message(error: unknown, fallback: string) {
+function message(error: unknown, fallbackKey: string): UiMessage {
   const code = statusCode(error);
-  if (code === 429)
-    return "The queue is full. Wait for existing work to finish, then try again.";
+  if (code === 429) return { key: "pipelines.errors.queueFull" };
   if (code === 403 || code === 404)
-    return "This pipeline or one of its pictures is no longer available to your account.";
-  if (code === 409)
-    return "This pipeline changed in another tab. Reload the saved version before continuing.";
-  return fallback;
+    return { key: "pipelines.errors.unavailable" };
+  if (code === 409) return { key: "pipelines.errors.conflict" };
+  return { key: fallbackKey };
 }
 function stopRequests() {
   revision += 1;
@@ -304,8 +328,7 @@ async function loadModels() {
     if (current(value)) models.value = response.items;
   } catch {
     if (current(value))
-      notice.value =
-        "Image models could not load. Reopen the pipeline to refresh their availability.";
+      say(notice, { key: "pipelines.notices.modelsFailed" });
   }
 }
 async function loadPipelines(more = false) {
@@ -339,10 +362,7 @@ async function loadPipelines(more = false) {
     nextCursor.value = response.nextCursor;
   } catch (error) {
     if (current(value) && number === listNumber)
-      errorMessage.value = message(
-        error,
-        "Could not load your pipelines. Try again.",
-      );
+      say(errorMessage, message(error, "pipelines.errors.loadList"));
   } finally {
     if (current(value) && number === listNumber) {
       loading.value = false;
@@ -389,7 +409,7 @@ async function openPipeline(id: string) {
       );
   } catch (error) {
     if (current(value) && number === detailNumber)
-      errorMessage.value = message(error, "Could not open this pipeline.");
+      say(errorMessage, message(error, "pipelines.errors.open"));
   } finally {
     if (current(value) && number === detailNumber) editorLoading.value = false;
   }
@@ -399,9 +419,10 @@ function useTemplate(template: PipelineTemplate) {
   detailNumber += 1;
   saving.value = false;
   pipeline.value = null;
-  name.value = template.id === "blank" ? "Untitled pipeline" : template.name;
-  description.value = template.id === "blank" ? "" : template.description;
-  definition.value = template.definition();
+  const text = pipelineTemplateText(template, translate);
+  name.value = template.id === "blank" ? t("pipelines.untitled") : text.name;
+  description.value = template.id === "blank" ? "" : text.description;
+  definition.value = template.definition(translate);
   savedFingerprint.value = "";
   history.reset(definition.value);
   historyVersion.value += 1;
@@ -427,6 +448,7 @@ function addNode(type: PipelineNodeType, position: CanvasPoint) {
     `node_${crypto.randomUUID().replaceAll("-", "")}`,
     position,
   );
+  node.label = pipelineNodeLabel(type, translate);
   commit({ ...definition.value, nodes: [...definition.value.nodes, node] });
   selectedId.value = node.id;
   selectedEdgeId.value = null;
@@ -472,7 +494,10 @@ function duplicateNode(id: string) {
   if (!node || definition.value.nodes.length >= PIPELINE_LIMITS.nodes) return;
   const duplicate = copyPipeline(node);
   duplicate.id = `node_${crypto.randomUUID().replaceAll("-", "")}`;
-  duplicate.label = `${node.label.slice(0, 94)} copy`;
+  const suffixLength = t("pipelines.editor.duplicateLabel", { label: "" }).length;
+  duplicate.label = t("pipelines.editor.duplicateLabel", {
+    label: node.label.slice(0, Math.max(1, 100 - suffixLength)),
+  }).slice(0, 100);
   duplicate.position = clampCanvasPoint({
     x: node.position.x + 70,
     y: node.position.y + 80,
@@ -486,7 +511,10 @@ function duplicateNode(id: string) {
 function copyNode() {
   if (selectedNode.value) {
     copiedNode.value = copyPipeline(selectedNode.value);
-    notice.value = `${selectedNode.value.label} copied. Paste to add another copy.`;
+    say(notice, {
+      key: "pipelines.notices.copied",
+      params: { label: selectedNode.value.label },
+    });
   }
 }
 function pasteNode() {
@@ -521,7 +549,7 @@ function disconnectNode(id: string) {
     ),
   });
   selectedEdgeId.value = null;
-  notice.value = `Disconnected ${node.label}`;
+  say(notice, { key: "pipelines.notices.disconnected", params: { label: node.label } });
 }
 function connect(
   sourceId: string,
@@ -545,7 +573,7 @@ function connect(
     ) ||
     (port.type !== "media" && port.type !== sourcePort)
   ) {
-    notice.value = "Connect image to image, or text to text.";
+    say(notice, { key: "pipelines.notices.typeMismatch" });
     return;
   }
   const existing = definition.value.edges.find(
@@ -567,12 +595,14 @@ function connect(
       edge.targetPort !== targetPort,
   );
   if (createsPipelineCycle(edges, sourceId, targetId)) {
-    notice.value =
-      "That connection would create a loop. Choose a later step instead.";
+    say(notice, { key: "pipelines.notices.cycle" });
     return;
   }
   if (edges.length >= PIPELINE_LIMITS.edges) {
-    notice.value = `A pipeline can have up to ${PIPELINE_LIMITS.edges} connections.`;
+    say(notice, {
+      key: "pipelines.notices.edgeLimit",
+      params: { count: PIPELINE_LIMITS.edges },
+    });
     return;
   }
   edges = [
@@ -634,8 +664,7 @@ async function save(): Promise<PipelineDTO | null> {
   try {
     parsed = SavePipelineSchema.parse(copyPipeline(body.value));
   } catch (error) {
-    saveError.value =
-      "Check the pipeline name, connections and node settings before saving.";
+    say(saveError, { key: "pipelines.errors.invalidSave" });
     return null;
   }
   const value = snapshot(),
@@ -667,10 +696,7 @@ async function save(): Promise<PipelineDTO | null> {
     } catch (error) {
       if (current(value) && editor === editorVersion) {
         conflict.value = statusCode(error) === 409;
-        saveError.value = message(
-          error,
-          "Could not save this pipeline. Your changes remain in this tab.",
-        );
+        say(saveError, message(error, "pipelines.errors.save"));
       }
       return null;
     } finally {
@@ -714,7 +740,7 @@ async function duplicatePipeline() {
     }
   } catch (error) {
     if (current(value))
-      saveError.value = message(error, "Could not duplicate this pipeline.");
+      say(saveError, message(error, "pipelines.errors.duplicate"));
   } finally {
     if (current(value)) creating.value = false;
   }
@@ -733,7 +759,7 @@ async function removePipeline() {
     }
   } catch (error) {
     if (current(value))
-      saveError.value = message(error, "Could not delete the pipeline.");
+      say(saveError, message(error, "pipelines.errors.delete"));
   } finally {
     if (current(value)) deleting.value = false;
   }
@@ -767,7 +793,7 @@ function leaveEditor() {
 function exportPipeline() {
   const parsed = SavePipelineSchema.safeParse(copyPipeline(body.value));
   if (!parsed.success) {
-    saveError.value = "Check the pipeline before exporting it.";
+    say(saveError, { key: "pipelines.errors.invalidExport" });
     return;
   }
   const blob = new Blob([JSON.stringify(parsed.data, null, 2)], {
@@ -786,7 +812,7 @@ async function importPipeline(event: Event) {
   if (!file) return;
   const value = snapshot();
   if (file.size > 1_000_000) {
-    errorMessage.value = "Choose a pipeline JSON file smaller than 1 MB.";
+    say(errorMessage, { key: "pipelines.errors.importTooLarge" });
     return;
   }
   try {
@@ -806,13 +832,11 @@ async function importPipeline(event: Event) {
     selectedId.value = null;
     selectedEdgeId.value = null;
     conflict.value = false;
-    notice.value =
-      "Imported as a new private draft. Picture references still require access in your account.";
+    say(notice, { key: "pipelines.notices.imported" });
     void nextTick(() => canvasComponent.value?.fit());
   } catch {
     if (current(value))
-      errorMessage.value =
-        "This is not a valid pipeline export. Check its node settings and connections.";
+      say(errorMessage, { key: "pipelines.errors.importInvalid" });
   }
 }
 function openPicker(
@@ -937,10 +961,7 @@ async function startRun() {
     if (!current(value)) return;
     if (await generationCredit.handleError(error)) { if (current(value)) runError.value = ''; return; }
     if (current(value))
-      runError.value = message(
-        error,
-        "Could not start the run. Retry uses the same request key so accepted work is not duplicated.",
-      );
+      say(runError, message(error, "pipelines.errors.start"));
   } finally {
     if (current(value)) starting.value = false;
   }
@@ -984,10 +1005,7 @@ async function refreshRun(poll = false) {
     }
   } catch (error) {
     if (current(value) && activeRun.value?.id === id && number === runNumber)
-      runError.value = message(
-        error,
-        "Could not refresh this run. Background work continues; try checking again.",
-      );
+      say(runError, message(error, "pipelines.errors.refresh"));
   } finally {
     if (current(value) && number === runNumber) {
       runRefreshing.value = false;
@@ -1018,10 +1036,7 @@ async function cancelRun() {
     }
   } catch (error) {
     if (current(value))
-      runError.value = message(
-        error,
-        "Could not request cancellation. Refresh the run before trying again.",
-      );
+      say(runError, message(error, "pipelines.errors.cancel"));
   } finally {
     if (current(value)) {
       runMutating.value = false;
@@ -1059,10 +1074,7 @@ async function retryRun(stepIds: string[]) {
     if (!current(value)) return;
     if (await generationCredit.handleError(error)) { if (current(value)) runError.value = ''; return; }
     if (current(value))
-      runError.value = message(
-        error,
-        "Could not retry these steps. Refresh the saved run before trying again.",
-      );
+      say(runError, message(error, "pipelines.errors.retry"));
   } finally {
     if (current(value)) {
       runMutating.value = false;
@@ -1103,9 +1115,9 @@ async function rerunJob(itemId: string) {
   } catch (error) {
     if (!current(value)) return;
     if (await generationCredit.handleError(error)) { if (current(value)) runError.value = ''; return; }
-    if (current(value)) runError.value = statusCode(error) === 409
-      ? 'This job cannot be requeued yet. Refresh progress and wait for outstanding prices to settle before trying again.'
-      : message(error, 'Could not rerun this job. Refresh progress before trying again; accepted work may already be queued.');
+    if (current(value)) say(runError, statusCode(error) === 409
+      ? {key: 'pipelines.errors.rerunBlocked'}
+      : message(error, 'pipelines.errors.rerun'));
   } finally {
     if (current(value)) { runMutating.value = false; schedulePoll(); }
   }
@@ -1142,7 +1154,7 @@ async function loadRuns(more = false) {
     }
   } catch (error) {
     if (current(value))
-      runError.value = message(error, "Could not load saved runs.");
+      say(runError, message(error, "pipelines.errors.loadRuns"));
   } finally {
     if (current(value)) historyLoading.value = false;
   }
@@ -1170,13 +1182,18 @@ async function openRun(id: string) {
     }
   } catch (error) {
     if (current(value) && number === runNumber)
-      runError.value = message(error, "Could not open this saved run.");
+      say(runError, message(error, "pipelines.errors.openRun"));
   } finally {
     if (current(value) && number === runNumber) {
       runRefreshing.value = false;
       schedulePoll();
     }
   }
+}
+function runStatusText(status: string) {
+  const key = `pipelines.history.status.${status.replace(/-([a-z])/g, (_match, letter: string) => letter.toUpperCase())}`;
+  const text = t(key);
+  return text && text !== key ? text : status.replaceAll("-", " ");
 }
 function closeRun() {
   prepareVersion += 1;
@@ -1360,7 +1377,7 @@ watch(
     runNumber += 1;
     pipeline.value = null;
     definition.value = { version: 1, nodes: [], edges: [] };
-    name.value = "Untitled pipeline";
+    name.value = t("pipelines.untitled");
     description.value = "";
     savedFingerprint.value = "";
     history.reset(definition.value);
@@ -1426,41 +1443,38 @@ onBeforeUnmount(() => {
       class="pipeline-hidden-input"
       type="file"
       accept="application/json,.json"
-      aria-label="Import pipeline JSON"
+      :aria-label="t('pipelines.library.importLabel')"
       @change="importPipeline"
     />
     <section v-if="!editing" class="pipeline-library">
       <header>
         <div>
-          <span class="pipeline-eyebrow">Build once. Create again.</span>
-          <h1>Pipelines</h1>
-          <p>
-            Turn a sequence of ideas into a repeatable image workflow. Run one
-            picture or an entire collection.
-          </p>
+          <span class="pipeline-eyebrow">{{ t("pipelines.library.eyebrow") }}</span>
+          <h1>{{ t("pipelines.library.title") }}</h1>
+          <p>{{ t("pipelines.library.intro") }}</p>
         </div>
         <div class="pipeline-library-actions">
           <button type="button" class="pipeline-secondary" @click="openRuns">
-            <UIcon name="i-lucide-history" />Saved runs</button
+            <UIcon name="i-lucide-history" />{{ t("pipelines.library.savedRuns") }}</button
           ><button
             type="button"
             class="pipeline-secondary"
             @click="importInput?.click()"
           >
-            <UIcon name="i-lucide-upload" />Import JSON</button
+            <UIcon name="i-lucide-upload" />{{ t("pipelines.library.importJson") }}</button
           ><button
             type="button"
             class="pipeline-primary"
             @click="useTemplate(PIPELINE_TEMPLATES[0]!)"
           >
-            <UIcon name="i-lucide-plus" />New pipeline
+            <UIcon name="i-lucide-plus" />{{ t("pipelines.library.newPipeline") }}
           </button>
         </div>
       </header>
       <section class="pipeline-template-section">
         <div class="pipeline-section-heading">
-          <h2>A starting point</h2>
-          <span>Templates are editable private copies</span>
+          <h2>{{ t("pipelines.library.templatesTitle") }}</h2>
+          <span>{{ t("pipelines.library.templatesHint") }}</span>
         </div>
         <div class="pipeline-template-grid">
           <button
@@ -1474,10 +1488,10 @@ onBeforeUnmount(() => {
               ><UIcon :name="template.icon" /></span
             ><span class="pipeline-template-trail"
               ><i /><i /><i /><UIcon name="i-lucide-arrow-right" /></span
-            ><strong>{{ template.name }}</strong>
-            <p>{{ template.description }}</p>
+            ><strong>{{ t(template.nameKey) }}</strong>
+            <p>{{ t(template.descriptionKey) }}</p>
             <span class="pipeline-template-open"
-              >Use template <UIcon name="i-lucide-arrow-up-right"
+              >{{ t("pipelines.library.useTemplate") }} <UIcon name="i-lucide-arrow-up-right"
             /></span>
           </button>
         </div>
@@ -1485,7 +1499,7 @@ onBeforeUnmount(() => {
       <section class="pipeline-personal-section">
         <div class="pipeline-section-heading">
           <h2>
-            Your pipelines
+            {{ t("pipelines.library.yourPipelines") }}
             <span v-if="pipelines.length"
               >{{ pipelines.length }}{{ nextCursor ? "+" : "" }}</span
             >
@@ -1493,8 +1507,8 @@ onBeforeUnmount(() => {
           <div class="pipeline-search">
             <UIcon name="i-lucide-search" /><input
               v-model="search"
-              aria-label="Search saved pipelines"
-              placeholder="Search pipelines…"
+              :aria-label="t('pipelines.library.searchLabel')"
+              :placeholder="t('pipelines.library.searchPlaceholder')"
             />
           </div>
         </div>
@@ -1503,11 +1517,17 @@ onBeforeUnmount(() => {
           class="pipeline-status"
           role="status"
         >
-          {{ editorLoading ? "Opening pipeline…" : "Loading pipelines…" }}
+          {{
+            editorLoading
+              ? t("pipelines.library.opening")
+              : t("pipelines.library.loading")
+          }}
         </p>
         <p v-if="errorMessage" class="pipeline-error" role="alert">
           {{ errorMessage }}
-          <button type="button" @click="loadPipelines()">Try again</button>
+          <button type="button" @click="loadPipelines()">
+            {{ t("common.actions.retry") }}
+          </button>
         </p>
         <div class="pipeline-saved-grid">
           <button
@@ -1531,12 +1551,22 @@ onBeforeUnmount(() => {
             <p>
               {{
                 item.description ||
-                `${item.definition.nodes.length} steps · private workflow`
+                t(
+                  item.definition.nodes.length === 1
+                    ? "pipelines.library.stepsOne"
+                    : "pipelines.library.stepsOther",
+                  { count: item.definition.nodes.length },
+                )
               }}
             </p>
             <footer>
-              <span>Revision {{ item.revision }}</span
-              ><span>Open editor<UIcon name="i-lucide-arrow-up-right" /></span>
+              <span>{{
+                t("pipelines.library.revision", { revision: item.revision })
+              }}</span
+              ><span
+                >{{ t("pipelines.library.openEditor")
+                }}<UIcon name="i-lucide-arrow-up-right"
+              /></span>
             </footer>
           </button>
         </div>
@@ -1547,14 +1577,16 @@ onBeforeUnmount(() => {
           <UIcon name="i-lucide-workflow" />
           <h3>
             {{
-              keyword ? "No matching pipelines" : "Your own process starts here"
+              keyword
+                ? t("pipelines.library.emptyMatchTitle")
+                : t("pipelines.library.emptyTitle")
             }}
           </h3>
           <p>
             {{
               keyword
-                ? "Try another name or description."
-                : "Choose a template or build a workflow from scratch."
+                ? t("pipelines.library.emptyMatchHint")
+                : t("pipelines.library.emptyHint")
             }}
           </p>
         </div>
@@ -1565,16 +1597,24 @@ onBeforeUnmount(() => {
           :disabled="loadingMore"
           @click="loadPipelines(true)"
         >
-          {{ loadingMore ? "Loading…" : "Load more pipelines" }}
+          {{
+            loadingMore
+              ? t("common.states.loading")
+              : t("pipelines.library.loadMore")
+          }}
         </button>
       </section>
     </section>
-    <section v-else class="pipeline-editor" aria-label="Pipeline editor">
+    <section
+      v-else
+      class="pipeline-editor"
+      :aria-label="t('pipelines.editor.label')"
+    >
       <header class="pipeline-editor-toolbar">
         <button
           type="button"
           class="pipeline-icon"
-          aria-label="Back to pipelines"
+          :aria-label="t('pipelines.editor.back')"
           @click="back"
         >
           <UIcon name="i-lucide-arrow-left" />
@@ -1583,14 +1623,18 @@ onBeforeUnmount(() => {
           <input
             v-model="name"
             maxlength="100"
-            aria-label="Pipeline name"
-          /><span v-if="conflict" class="pipeline-conflict">Save conflict</span
+            :aria-label="t('pipelines.editor.nameLabel')"
+          /><span v-if="conflict" class="pipeline-conflict">{{
+            t("pipelines.editor.saveConflict")
+          }}</span
           ><span v-else>{{
             saving
-              ? "Saving…"
+              ? t("common.actions.saving")
               : dirty
-                ? "Unsaved changes"
-                : `Saved · revision ${pipeline?.revision ?? 1}`
+                ? t("pipelines.editor.unsaved")
+                : t("pipelines.editor.saved", {
+                    revision: pipeline?.revision ?? 1,
+                  })
           }}</span>
         </div>
         <div class="pipeline-toolbar-history">
@@ -1598,7 +1642,7 @@ onBeforeUnmount(() => {
             type="button"
             class="pipeline-icon"
             :disabled="!canUndo"
-            aria-label="Undo pipeline change"
+            :aria-label="t('pipelines.editor.undo')"
             @click="undo"
           >
             <UIcon name="i-lucide-undo-2" /></button
@@ -1606,7 +1650,7 @@ onBeforeUnmount(() => {
             type="button"
             class="pipeline-icon"
             :disabled="!canRedo"
-            aria-label="Redo pipeline change"
+            :aria-label="t('pipelines.editor.redo')"
             @click="redo"
           >
             <UIcon name="i-lucide-redo-2" />
@@ -1618,11 +1662,11 @@ onBeforeUnmount(() => {
             class="pipeline-secondary pipeline-toolbar-saved-runs"
             @click="openRuns"
           >
-            <UIcon name="i-lucide-history" />Runs</button
+            <UIcon name="i-lucide-history" />{{ t("pipelines.editor.runs") }}</button
           ><button
             type="button"
             class="pipeline-icon"
-            aria-label="Pipeline settings and export"
+            :aria-label="t('pipelines.editor.settingsLabel')"
             :aria-expanded="metadataOpen"
             @click="metadataOpen = !metadataOpen"
           >
@@ -1633,14 +1677,14 @@ onBeforeUnmount(() => {
             :disabled="saving || !dirty || conflict"
             @click="save"
           >
-            <UIcon name="i-lucide-save" />Save</button
+            <UIcon name="i-lucide-save" />{{ t("common.actions.save") }}</button
           ><button
             type="button"
             class="pipeline-primary"
             :disabled="starting || saving || conflict"
             @click="prepareRun()"
           >
-            <UIcon name="i-lucide-play" />Run pipeline
+            <UIcon name="i-lucide-play" />{{ t("pipelines.editor.runPipeline") }}
           </button>
         </div>
       </header>
@@ -1656,12 +1700,12 @@ onBeforeUnmount(() => {
           type="button"
           @click="openPipeline(pipeline.id)"
         >
-          Reload saved version</button
+          {{ t("pipelines.editor.reloadSaved") }}</button
         ><button
           v-else
           type="button"
           class="pipeline-icon"
-          aria-label="Dismiss editor notice"
+          :aria-label="t('pipelines.editor.dismissNotice')"
           @click="
             notice = '';
             saveError = '';
@@ -1711,19 +1755,24 @@ onBeforeUnmount(() => {
       </div>
       <footer class="pipeline-editor-footer">
         <span
-          ><i class="pipeline-dot-image" />Image
-          <i class="pipeline-dot-text" />Text
-          <small
-            >{{ definition.nodes.length }} /
-            {{ PIPELINE_LIMITS.nodes }} steps</small
-          ></span
+          ><i class="pipeline-dot-image" />{{ t("pipelines.editor.legendImage") }}
+          <i class="pipeline-dot-text" />{{ t("pipelines.editor.legendText") }}
+          <small>{{
+            t("pipelines.editor.stepCount", {
+              count: definition.nodes.length,
+              limit: PIPELINE_LIMITS.nodes,
+            })
+          }}</small></span
         >
         <div>
           <button v-if="selectedNode" type="button" @click="copyNode">
-            <UIcon name="i-lucide-copy" />Copy step</button
+            <UIcon name="i-lucide-copy" />{{ t("pipelines.editor.copyStep") }}</button
           ><button v-if="copiedNode" type="button" @click="pasteNode">
-            <UIcon name="i-lucide-clipboard-paste" />Paste step</button
-          ><span>Delete · disconnect <small>Ctrl/⌘ Z · undo · Ctrl/⌘ S · save</small></span>
+            <UIcon name="i-lucide-clipboard-paste" />{{ t("pipelines.editor.pasteStep") }}</button
+          ><span
+            >{{ t("pipelines.editor.shortcuts") }}
+            <small>{{ t("pipelines.editor.shortcutsDetail") }}</small></span
+          >
         </div>
       </footer>
     </section>
@@ -1740,30 +1789,30 @@ onBeforeUnmount(() => {
         @keydown.esc.stop="metadataOpen = false"
       >
         <header>
-          <h2 id="pipeline-settings-title">Pipeline settings</h2>
+          <h2 id="pipeline-settings-title">
+            {{ t("pipelines.settings.title") }}
+          </h2>
           <button
             type="button"
             class="pipeline-icon"
-            aria-label="Close pipeline settings"
+            :aria-label="t('pipelines.settings.close')"
             @click="metadataOpen = false"
           >
             <UIcon name="i-lucide-x" />
           </button>
         </header>
-        <label class="pipeline-label" for="pipeline-description"
-          >Description</label
+        <label class="pipeline-label" for="pipeline-description">{{
+          t("pipelines.settings.description")
+        }}</label
         ><textarea
           id="pipeline-description"
           v-model="description"
           rows="5"
           maxlength="4000"
           class="pipeline-input"
-          placeholder="What does this workflow create?"
+          :placeholder="t('pipelines.settings.descriptionPlaceholder')"
         />
-        <p class="pipeline-help">
-          Your pipeline is private. JSON exports contain settings and private
-          picture references, without image bytes or credentials.
-        </p>
+        <p class="pipeline-help">{{ t("pipelines.settings.privacy") }}</p>
         <div class="pipeline-settings-actions">
           <button
             id="pipeline-settings-runs"
@@ -1774,7 +1823,7 @@ onBeforeUnmount(() => {
               openRuns();
             "
           >
-            <UIcon name="i-lucide-history" />Saved runs
+            <UIcon name="i-lucide-history" />{{ t("pipelines.library.savedRuns") }}
           </button>
           <button
             type="button"
@@ -1785,13 +1834,13 @@ onBeforeUnmount(() => {
               metadataOpen = false;
             "
           >
-            <UIcon name="i-lucide-copy-plus" />Duplicate pipeline</button
+            <UIcon name="i-lucide-copy-plus" />{{ t("pipelines.settings.duplicate") }}</button
           ><button
             type="button"
             class="pipeline-secondary"
             @click="exportPipeline"
           >
-            <UIcon name="i-lucide-download" />Export JSON</button
+            <UIcon name="i-lucide-download" />{{ t("pipelines.settings.exportJson") }}</button
           ><button
             type="button"
             class="pipeline-secondary"
@@ -1800,7 +1849,7 @@ onBeforeUnmount(() => {
               metadataOpen = false;
             "
           >
-            <UIcon name="i-lucide-upload" />Import JSON</button
+            <UIcon name="i-lucide-upload" />{{ t("pipelines.library.importJson") }}</button
           ><button
             v-if="pipeline"
             type="button"
@@ -1810,7 +1859,7 @@ onBeforeUnmount(() => {
               deleteOpen = true;
             "
           >
-            <UIcon name="i-lucide-trash-2" />Delete pipeline
+            <UIcon name="i-lucide-trash-2" />{{ t("pipelines.settings.delete") }}
           </button>
         </div>
       </section>
@@ -1824,28 +1873,32 @@ onBeforeUnmount(() => {
         class="pipeline-picker-dialog"
         role="dialog"
         aria-modal="true"
-        aria-label="Choose pipeline pictures"
+        :aria-label="t('pipelines.picker.label')"
       >
         <header>
           <div>
             <h2>
               {{
                 peopleOnlyPicker
-                  ? "Choose People pictures"
+                  ? t("pipelines.picker.peopleTitle")
                   : picker.field === "batch"
-                  ? "Choose batch pictures"
-                  : "Choose reference pictures"
+                  ? t("pipelines.picker.batchTitle")
+                  : t("pipelines.picker.referenceTitle")
               }}
             </h2>
             <p>
-              {{ pickerUrls.length }} / {{ picker.limit }} selected · images
-              only
+              {{
+                t("pipelines.picker.selected", {
+                  count: pickerUrls.length,
+                  limit: picker.limit,
+                })
+              }}
             </p>
           </div>
           <button
             type="button"
             class="pipeline-icon"
-            aria-label="Close picture picker"
+            :aria-label="t('pipelines.picker.close')"
             @click="
               picker = null;
               pickerUrls = [];
@@ -1857,7 +1910,7 @@ onBeforeUnmount(() => {
         <div
           class="pipeline-picker-tabs"
           role="tablist"
-          aria-label="Picture source"
+          :aria-label="t('pipelines.picker.source')"
           @keydown="pickerTabKey"
         >
           <button
@@ -1870,7 +1923,7 @@ onBeforeUnmount(() => {
             aria-controls="pipeline-picker-content"
             @click="pickerTab = 'library'"
           >
-            Library & uploads</button
+            {{ t("pipelines.picker.libraryTab") }}</button
           ><button
             id="pipeline-people-tab"
             type="button"
@@ -1880,7 +1933,7 @@ onBeforeUnmount(() => {
             aria-controls="pipeline-picker-content"
             @click="pickerTab = 'people'"
           >
-            People
+            {{ t("pipelines.picker.peopleTab") }}
           </button>
         </div>
         <div
@@ -1902,7 +1955,7 @@ onBeforeUnmount(() => {
             :selection-cap="
               picker.field === 'batch' ? PIPELINE_LIMITS.batchImages : 20
             "
-            title="Choose pictures"
+            :title="t('pipelines.picker.browserTitle')"
             @confirm="confirmFiles"
           /><PeopleBrowser
             v-else
@@ -1924,14 +1977,19 @@ onBeforeUnmount(() => {
             class="pipeline-secondary"
             @click="pickerUrls = []"
           >
-            Clear selection</button
+            {{ t("pipelines.picker.clear") }}</button
           ><button
             type="button"
             class="pipeline-primary"
             @click="confirmPicker(pickerUrls)"
           >
-            Use {{ pickerUrls.length }} picture{{
-              pickerUrls.length === 1 ? "" : "s"
+            {{
+              t(
+                pickerUrls.length === 1
+                  ? "pipelines.picker.useOne"
+                  : "pipelines.picker.useOther",
+                { count: pickerUrls.length },
+              )
             }}
           </button>
         </footer>
@@ -1948,39 +2006,42 @@ onBeforeUnmount(() => {
         aria-modal="true"
         :aria-label="
           runMode === 'prepare'
-            ? 'Run pipeline'
+            ? t('pipelines.run.dialogPrepare')
             : runMode === 'history'
-              ? 'Saved pipeline runs'
-              : 'Pipeline run results'
+              ? t('pipelines.run.dialogHistory')
+              : t('pipelines.run.dialogResults')
         "
       >
         <section v-if="runMode === 'prepare'" class="pipeline-run-prepare">
           <header>
             <div>
               <span class="pipeline-eyebrow">{{
-                runTarget ? "Test this branch" : "Create a collection"
+                runTarget
+                  ? t("pipelines.run.eyebrowBranch")
+                  : t("pipelines.run.eyebrowCollection")
               }}</span>
               <h2>
                 {{
                   runTarget
-                    ? `Run to ${definition.nodes.find((node) => node.id === runTarget)?.label}`
-                    : "Run pipeline"
+                    ? t("pipelines.run.runTo", {
+                        label: definition.nodes.find(
+                          (node) => node.id === runTarget,
+                        )?.label,
+                      })
+                    : t("pipelines.run.title")
                 }}
               </h2>
             </div>
             <button
               type="button"
               class="pipeline-icon"
-              aria-label="Close run setup"
+              :aria-label="t('pipelines.run.closeSetup')"
               @click="closeRun"
             >
               <UIcon name="i-lucide-x" />
             </button>
           </header>
-          <p class="pipeline-help">
-            Supply the inputs used by this workflow. Every batch picture gets an
-            independent run through the same connected steps.
-          </p>
+          <p class="pipeline-help">{{ t("pipelines.run.help") }}</p>
           <div class="pipeline-run-steps">
             <span v-for="node in executionNodes" :key="node.id"
               ><UIcon :name="pipelineNodeIcon(node.type)" />{{
@@ -1989,8 +2050,9 @@ onBeforeUnmount(() => {
             >
           </div>
           <section v-if="imageInputs.length" class="pipeline-run-input-section">
-            <label class="pipeline-label" for="pipeline-batch-input"
-              >Batch input</label
+            <label class="pipeline-label" for="pipeline-batch-input">{{
+              t("pipelines.run.batchInput")
+            }}</label
             ><select
               id="pipeline-batch-input"
               v-model="batchInput"
@@ -2010,13 +2072,19 @@ onBeforeUnmount(() => {
               <div>
                 <strong>{{
                   batchImages.length
-                    ? `${batchImages.length} pictures selected`
-                    : "One picture or a whole collection"
+                    ? t(
+                        batchImages.length === 1
+                          ? "pipelines.run.batchSelectedOne"
+                          : "pipelines.run.batchSelectedOther",
+                        { count: batchImages.length },
+                      )
+                    : t("pipelines.run.batchEmpty")
                 }}</strong
-                ><small
-                  >Up to {{ PIPELINE_LIMITS.batchImages }} images · Library,
-                  uploads or People</small
-                >
+                ><small>{{
+                  t("pipelines.run.batchLimit", {
+                    count: PIPELINE_LIMITS.batchImages,
+                  })
+                }}</small>
               </div>
               <button
                 type="button"
@@ -2031,7 +2099,7 @@ onBeforeUnmount(() => {
                   )
                 "
               >
-                <UIcon name="i-lucide-images" />Choose pictures
+                <UIcon name="i-lucide-images" />{{ t("pipelines.run.choosePictures") }}
               </button>
             </div>
             <div v-if="batchImages.length" class="pipeline-batch-thumbnails">
@@ -2039,7 +2107,11 @@ onBeforeUnmount(() => {
                 v-for="url in batchImages"
                 :key="url"
                 type="button"
-                :aria-label="'Remove ' + url.split('/').at(-1)"
+                :aria-label="
+                  t('pipelines.run.removePicture', {
+                    name: url.split('/').at(-1),
+                  })
+                "
                 :disabled="starting"
                 @click="
                   batchImages = batchImages.filter((value) => value !== url)
@@ -2047,14 +2119,14 @@ onBeforeUnmount(() => {
               >
                 <img
                   :src="imagePreviewUrl(url, 160)"
-                  alt="Selected batch picture"
+                  :alt="t('pipelines.run.selectedAlt')"
                   loading="lazy"
                   decoding="async"
                 /><UIcon name="i-lucide-x" />
               </button>
             </div>
             <p v-else class="pipeline-help">
-              Choose pictures, or use the input’s default picture if one is set.
+              {{ t("pipelines.run.defaultHint") }}
             </p>
           </section>
           <section
@@ -2068,7 +2140,7 @@ onBeforeUnmount(() => {
                 :for="`pipeline-run-text-${node.id}`"
                 >{{ node.label }}
                 <span>{{
-                  node.config.required ? "Required" : "Optional"
+                  node.config.required ? t("pipelines.run.required") : t("pipelines.run.optional")
                 }}</span></label
               ><textarea
                 :id="`pipeline-run-text-${node.id}`"
@@ -2083,7 +2155,7 @@ onBeforeUnmount(() => {
               ><label class="pipeline-label"
                 >{{ node.label }}
                 <span>{{
-                  node.config.required ? "Required" : "Optional"
+                  node.config.required ? t("pipelines.run.required") : t("pipelines.run.optional")
                 }}</span></label
               ><button
                 type="button"
@@ -2098,7 +2170,7 @@ onBeforeUnmount(() => {
                   )
                 "
               >
-                <UIcon name="i-lucide-image-plus" />Choose picture</button
+                <UIcon name="i-lucide-image-plus" />{{ t("pipelines.run.choosePicture") }}</button
               ><img
                 v-if="runInputs[node.id]"
                 class="pipeline-run-single-input"
@@ -2108,7 +2180,7 @@ onBeforeUnmount(() => {
             /></template>
           </section>
           <div v-if="runIssues.length" class="pipeline-run-issues" role="alert">
-            <strong>Finish the workflow first</strong>
+            <strong>{{ t("pipelines.run.issuesTitle") }}</strong>
             <ul>
               <li v-for="issue in runIssues" :key="issue">{{ issue }}</li>
             </ul>
@@ -2122,23 +2194,24 @@ onBeforeUnmount(() => {
           </p>
           <footer>
             <div>
-              <strong
-                >{{ batchImages.length || 1 }} independent input{{
-                  (batchImages.length || 1) === 1 ? "" : "s"
-                }}</strong
-              ><span
-                >Available credit:
-                {{
-                  balance.balance.value
+              <strong>{{
+                t(
+                  (batchImages.length || 1) === 1
+                    ? "pipelines.run.inputsOne"
+                    : "pipelines.run.inputsOther",
+                  { count: batchImages.length || 1 },
+                )
+              }}</strong
+              ><span>{{
+                t("pipelines.run.availableCredit", {
+                  amount: balance.balance.value
                     ? balance.balance.value.unlimited
-                      ? "Unlimited"
+                      ? t("pipelines.run.unlimited")
                       : formatBalanceUsd(balance.balance.value.actualBalanceUsd)
-                    : "loading…"
-                }}</span
-              ><small
-                >Exact costs appear after confirmation. Accepted runs continue
-                in the background.</small
-              >
+                    : t("pipelines.run.creditLoading"),
+                })
+              }}</span
+              ><small>{{ t("pipelines.run.costHint") }}</small>
             </div>
             <button
               type="button"
@@ -2148,7 +2221,9 @@ onBeforeUnmount(() => {
             >
               <UIcon
                 :name="starting ? 'i-lucide-loader-circle' : 'i-lucide-play'"
-              />{{ starting ? "Starting…" : "Start run" }}
+              />{{
+                starting ? t("pipelines.run.starting") : t("pipelines.run.start")
+              }}
             </button>
           </footer>
         </section>
@@ -2170,16 +2245,16 @@ onBeforeUnmount(() => {
         <section v-else-if="runMode === 'history'" class="pipeline-run-history">
           <header>
             <div>
-              <span class="pipeline-eyebrow">Your activity</span>
-              <h2>Saved runs</h2>
-              <p>
-                Open any run to inspect each input, step and confirmed cost.
-              </p>
+              <span class="pipeline-eyebrow">{{
+                t("pipelines.history.eyebrow")
+              }}</span>
+              <h2>{{ t("pipelines.history.title") }}</h2>
+              <p>{{ t("pipelines.history.intro") }}</p>
             </div>
             <button
               type="button"
               class="pipeline-icon"
-              aria-label="Close saved runs"
+              :aria-label="t('pipelines.history.close')"
               @click="closeRun"
             >
               <UIcon name="i-lucide-x" />
@@ -2189,7 +2264,7 @@ onBeforeUnmount(() => {
             {{ runError }}
           </p>
           <p v-if="historyLoading" class="pipeline-status" role="status">
-            Loading runs…
+            {{ t("pipelines.history.loading") }}
           </p>
           <button
             v-for="item in runHistory"
@@ -2200,24 +2275,33 @@ onBeforeUnmount(() => {
           >
             <UIcon name="i-lucide-workflow" /><span
               ><strong>{{ item.name }}</strong
-              ><small
-                >Revision {{ item.revision }} · {{ item.summary.total }} inputs
-                · {{ new Date(item.createdAt).toLocaleString() }}</small
-              ></span
+              ><small>{{
+                t(
+                  item.summary.total === 1
+                    ? "pipelines.history.summaryOne"
+                    : "pipelines.history.summaryOther",
+                  {
+                    revision: item.revision,
+                    count: item.summary.total,
+                    date: new Date(item.createdAt).toLocaleString(locale),
+                  },
+                )
+              }}</small></span
             ><span
               ><strong>{{
                 formatUsd(item.summary.confirmedCostUsd) || "$0.00"
               }}</strong
-              ><small
-                >{{ item.status.replaceAll("-", " ")
-                }}{{
-                  item.summary.outstandingCount ? " · cost outstanding" : ""
-                }}</small
-              ></span
+              ><small>{{
+                item.summary.outstandingCount
+                  ? t("pipelines.history.statusOutstanding", {
+                      status: runStatusText(item.status),
+                    })
+                  : runStatusText(item.status)
+              }}</small></span
             ><UIcon name="i-lucide-chevron-right" />
           </button>
           <p v-if="!historyLoading && !runHistory.length" class="pipeline-help">
-            Your first run will appear here.
+            {{ t("pipelines.history.empty") }}
           </p>
           <button
             v-if="runCursor"
@@ -2226,7 +2310,7 @@ onBeforeUnmount(() => {
             :disabled="historyLoading"
             @click="loadRuns(true)"
           >
-            Load more runs
+            {{ t("pipelines.history.loadMore") }}
           </button>
         </section>
       </section>
@@ -2248,13 +2332,15 @@ onBeforeUnmount(() => {
         <header>
           <h2 id="pipeline-confirm-title">
             {{
-              deleteOpen ? "Delete this pipeline?" : "Leave unsaved changes?"
+              deleteOpen
+                ? t("pipelines.confirm.deleteTitle")
+                : t("pipelines.confirm.discardTitle")
             }}
           </h2>
           <button
             type="button"
             class="pipeline-icon"
-            aria-label="Close confirmation"
+            :aria-label="t('pipelines.confirm.close')"
             @click="
               deleteOpen = false;
               discardOpen = false;
@@ -2266,8 +2352,8 @@ onBeforeUnmount(() => {
         <p class="pipeline-help">
           {{
             deleteOpen
-              ? "Saved runs, image files and existing charges are preserved. The pipeline will be removed from your list."
-              : "Your last saved version is preserved. Changes still in this tab will be discarded."
+              ? t("pipelines.confirm.deleteBody")
+              : t("pipelines.confirm.discardBody")
           }}
         </p>
         <footer>
@@ -2279,7 +2365,7 @@ onBeforeUnmount(() => {
               discardOpen = false;
             "
           >
-            Keep editing</button
+            {{ t("pipelines.confirm.keepEditing") }}</button
           ><button
             type="button"
             class="pipeline-primary"
@@ -2288,10 +2374,10 @@ onBeforeUnmount(() => {
           >
             {{
               deleting
-                ? "Deleting…"
+                ? t("pipelines.confirm.deleting")
                 : deleteOpen
-                  ? "Delete pipeline"
-                  : "Discard changes"
+                  ? t("pipelines.confirm.delete")
+                  : t("pipelines.confirm.discard")
             }}
           </button>
         </footer>

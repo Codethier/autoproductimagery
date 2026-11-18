@@ -8,5 +8,6 @@
   </div>
 </template>
 <script setup lang="ts">
-useHead({htmlAttrs: {class: 'dark'}})
+const {locale} = useI18n()
+useHead({htmlAttrs: {class: 'dark', lang: locale}})
 </script>

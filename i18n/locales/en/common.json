@@ -1,0 +1,78 @@
+{
+  "common": {
+    "appName": "Product imagery",
+    "actions": {
+      "cancel": "Cancel",
+      "save": "Save",
+      "saving": "Saving…",
+      "close": "Close",
+      "delete": "Delete",
+      "remove": "Remove",
+      "retry": "Try again",
+      "confirm": "Confirm",
+      "edit": "Edit",
+      "download": "Download",
+      "upload": "Upload",
+      "search": "Search",
+      "back": "Back",
+      "next": "Next",
+      "apply": "Apply",
+      "reset": "Reset",
+      "refresh": "Refresh",
+      "loadMore": "Load more",
+      "copy": "Copy",
+      "share": "Share"
+    },
+    "states": {
+      "loading": "Loading…",
+      "yes": "Yes",
+      "no": "No",
+      "none": "None",
+      "optional": "Optional",
+      "unknown": "Unknown"
+    },
+    "language": {
+      "label": "Language",
+      "en": "English",
+      "hu": "Magyar"
+    },
+    "layout": {
+      "skipToWorkspace": "Skip to workspace",
+      "brandLabel": "Product imagery studio",
+      "studio": "Studio",
+      "toggleNavigation": "Toggle navigation",
+      "mainNavigation": "Main navigation",
+      "nav": {
+        "edit": "Edit",
+        "sameOriginBatch": "Same-origin batch",
+        "pipelines": "Pipelines",
+        "people": "People",
+        "library": "Library",
+        "shared": "Shared with me",
+        "team": "Team"
+      },
+      "viewBalance": "View your generation balance",
+      "unlimited": "Unlimited",
+      "balance": "Balance",
+      "accountMenu": "Account menu",
+      "organizationOwner": "Organization owner",
+      "member": "Member",
+      "actualBalance": "Actual balance",
+      "outstanding": "Outstanding",
+      "unpricedSuffix": " + unpriced",
+      "awaitingFinalPrice": "{count} awaiting final price",
+      "passwordAndAccount": "Password & account",
+      "signingOut": "Signing out…",
+      "signOut": "Sign out"
+    },
+    "saveFormat": {
+      "label": "Save generated images as",
+      "webp": "WebP (default)",
+      "png": "PNG (lossless)",
+      "original": "Keep the model's original format",
+      "webpHelp": "Every returned image is stored as a high-quality WebP, even when the model returns PNG or JPEG. Transparency is kept. GPT Image masked edits need PNG sources.",
+      "pngHelp": "Every returned image is stored as a lossless PNG, whatever format the model returns. Transparency is kept. Larger files.",
+      "originalHelp": "Images are stored exactly as the model returns them, for example JPEG or WebP."
+    }
+  }
+}

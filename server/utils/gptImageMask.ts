@@ -24,9 +24,9 @@ export function validateGptImageMaskPair(mask: ImageDescriptor, source?: ImageDe
     if (mask.bytes > 25 * 1024 * 1024) return 'GPT Image masks must be 25 MB or smaller.'
     if (mask.hasAlpha !== true) return 'GPT Image masks must include an alpha channel.'
     if (!source) return 'A mask requires a source image.'
-    if (source.mimeType !== mask.mimeType) {
-        return 'The GPT Image mask and every source image must have the same file format. Use PNG sources with a PNG mask.'
-    }
+    // GPT Image requires the mask and its sources in one format. The Gateway
+    // adapter converts every non-PNG source to PNG for masked edits, so stored
+    // WebP or JPEG sources stay usable; only their pixel dimensions must match.
     if (!mask.width || !mask.height || !source.width || !source.height) {
         return 'The mask and every source image must have readable dimensions.'
     }
